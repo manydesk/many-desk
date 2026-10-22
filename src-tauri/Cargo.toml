@@ -1,0 +1,72 @@
+[package]
+name = "manydesk"
+version = "0.12.0"
+edition = "2021"
+description = "Decentralized peer-to-peer remote desktop"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+k256 = { version = "0.13", features = ["schnorr"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+arboard = { version = "3", default-features = false }
+sys-locale = "0.3"
+gethostname = "0.5"
+# MDP, the native protocol (src/mdp): QUIC over hole-punched UDP, pinned self-signed certs.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+if-addrs = "0.13"
+# Native media (src/media): capture + H.264.
+bytes = "1"
+openh264 = "0.9"
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+base64 = "0.22"
+
+# Linux: WebKitGTK has no WebRTC; legacy WebRTC peers go through webrtc-rs (src/linux/),
+# X11 capture uses SHM, input uses XTEST.
+[target.'cfg(target_os = "linux")'.dependencies]
+webrtc = "0.21"
+rtc = "0.21"
+async-trait = "0.1"
+x11rb = { version = "0.13", features = ["shm", "xtest", "xfixes", "randr"] }
+libc = "0.2"
+
+# macOS: ScreenCaptureKit → VideoToolbox (hardware H.264), zero-copy (src/media/mac.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-video-toolbox = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-core-foundation = "0.3"
+dispatch2 = "0.3"
+block2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_System_Console"] }
+# Media Foundation hardware H.264 (src/media/win.rs)
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Variant"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

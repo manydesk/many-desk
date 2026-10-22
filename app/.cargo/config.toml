@@ -1,0 +1,6 @@
+# Windows (mingw) builds: OpenH264 is C++; link libstdc++ statically so the exe needs no
+# runtime DLLs. scripts/build-tauri-win.sh adds the library search path.
+[env]
+CXXSTDLIB_x86_64_pc_windows_gnu = "static=stdc++"
+# libopus (audiopus_sys "static") is built with CMake; its bundled sources predate CMake 4.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
