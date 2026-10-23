@@ -67,16 +67,22 @@ pub struct Quality {
     /// how long to stay put after stepping down; doubles when a step up didn't hold
     calm: Duration,
     last_up: Option<Instant>,
+    /// extra downscale while the host can't encode fast enough (CPU, e.g. a VM without a
+    /// GPU encoder): fewer pixels is what makes each frame cheaper, unlike fewer frames
+    cpu_scale: f64,
+    cpu_bad: u32,
+    cpu_good: u32,
     prev: Option<(u64, Instant)>,
     applied: Option<(f64, f64, u32)>,
 }
 
 const CALM: Duration = Duration::from_secs(10);
+const CPU_SCALE_MAX: f64 = 2.5;
 const CALM_MAX: Duration = Duration::from_secs(60);
 
 impl Quality {
     pub fn new() -> Self {
-        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, prev: None, applied: None }
+        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_scale: 1.0, cpu_bad: 0, cpu_good: 0, prev: None, applied: None }
     }
 
     pub fn set_mode(&mut self, m: Mode) {
@@ -97,7 +103,7 @@ impl Quality {
         let (ls, lfps, lbr) = if auto { LEVELS[self.level] } else { (1.0, q.fps, 1.0) };
         let (sw, sh) = (src.0 as f64, src.1 as f64);
         let fit = self.view.map(|(w, h)| (sw / w).max(sh / h).max(1.0)).unwrap_or(1.0);
-        let scale = (fit * q.extra * ls).max(1.0);
+        let scale = (fit * q.extra * ls * self.cpu_scale).max(1.0);
         let fps = (q.fps * if auto { 2.0 } else { 1.0 }).min(lfps);
         let pixels = (sw / scale) * (sh / scale);
         let bitrate = (q.max_br * lbr).min((pixels * fps * q.bpp * lbr).max(q.min_br)) as u32;
@@ -123,13 +129,40 @@ impl Quality {
         if prev.is_none() {
             return false;
         }
-        let limited = matches!(video["qualityLimitationReason"].as_str(), Some("cpu") | Some("bandwidth"));
-        if limited {
-            self.bad += 1;
-            self.good = 0;
+        let reason = video["qualityLimitationReason"].as_str().unwrap_or("none");
+        // CPU: shrink the picture on its own scale (quickly), grow it back slowly.
+        let mut cpu_changed = false;
+        if reason == "cpu" {
+            self.cpu_good = 0;
+            self.cpu_bad += 1;
+            if self.cpu_bad >= 2 && self.cpu_scale < CPU_SCALE_MAX {
+                self.cpu_scale = (self.cpu_scale * 1.25).min(CPU_SCALE_MAX);
+                // each further step needs fresh evidence (the 2 s stats still hold the
+                // slow frames from before this step)
+                self.cpu_bad = 0;
+                cpu_changed = true;
+            }
         } else {
-            self.good += 1;
-            self.bad = 0;
+            self.cpu_bad = 0;
+            self.cpu_good += 1;
+            if self.cpu_good >= 10 && self.cpu_scale > 1.0 {
+                self.cpu_scale = (self.cpu_scale / 1.25).max(1.0);
+                self.cpu_good = 0;
+                cpu_changed = true;
+            }
+        }
+        // the level ladder answers the network
+        // (while the CPU is the limit, it stays put: more frames would only make it worse)
+        match reason {
+            "bandwidth" => {
+                self.bad += 1;
+                self.good = 0;
+            }
+            "cpu" => self.good = 0,
+            _ => {
+                self.good += 1;
+                self.bad = 0;
+            }
         }
         let mut level = self.level;
         if self.bad >= 2 && level < LEVELS.len() - 1 {
@@ -138,7 +171,7 @@ impl Quality {
             // between two levels on a link that sits right in between).
             self.calm = if self.last_up.is_some_and(|t| now.duration_since(t) < Duration::from_secs(30)) { (self.calm * 2).min(CALM_MAX) } else { CALM };
             self.calm_until = Some(now + self.calm);
-        } else if self.good >= 3 && level > 0 && self.calm_until.is_none_or(|t| now > t) {
+        } else if self.good >= 3 && level > 0 && self.cpu_scale == 1.0 && self.calm_until.is_none_or(|t| now > t) {
             // Step up only with clear spare bandwidth (BBR's window over the RTT): the
             // level above needs up to about twice the bits.
             let avail = if rtt_ms > 0.0 { cwnd * 8.0 / (rtt_ms / 1000.0) } else { f64::MAX };
@@ -154,7 +187,7 @@ impl Quality {
             self.good = 0;
             return true;
         }
-        false
+        cpu_changed
     }
 }
 
@@ -179,6 +212,27 @@ mod tests {
             q.tick(&stats(f, if i % 3 == 0 { "bandwidth" } else { "none" }), 30.0, 1e6);
         }
         assert!(q.level <= start, "level went from {start} to {}", q.level);
+    }
+
+    #[test]
+    fn a_slow_encoder_gets_fewer_pixels_quickly() {
+        let mut q = Quality::new();
+        q.set_view(3024.0, 1898.0);
+        let mut f = 0;
+        q.params((3024, 1898));
+        for _ in 0..6 {
+            f += 10;
+            q.tick(&stats(f, "cpu"), 1.0, 1e9);
+        }
+        let (scale, fps, _) = q.params((3024, 1898)).expect("changed");
+        assert!(scale >= 1.5, "scale {scale}");
+        assert_eq!(fps, 30.0, "a CPU limit shouldn't touch the frame-rate ladder");
+        // and back once the host keeps up
+        for _ in 0..60 {
+            f += 60;
+            q.tick(&stats(f, "none"), 1.0, 1e9);
+        }
+        assert_eq!(q.cpu_scale, 1.0);
     }
 
     #[test]

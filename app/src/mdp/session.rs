@@ -83,6 +83,8 @@ pub struct Session {
     tunnel_ok: AtomicBool,
     /// tunnel connections open now (both sides)
     pub tunnels: AtomicUsize,
+    /// host: when the keyframe now on its way started (requests meanwhile are ignored)
+    key_in_flight: Mutex<Option<Instant>>,
     frames_in: AtomicU64,
     bytes_in: AtomicU64,
     /// host: the viewer draws the pointer itself (position/shape on the control stream)
@@ -196,7 +198,21 @@ struct QuicSink {
     conn: quinn::Connection,
     /// frames sent but not yet all delivered: sequence → when sending started
     pending: Arc<Mutex<BTreeMap<u32, Instant>>>,
+    /// when the encoder last got the go-ahead (see `congested`)
+    last_go: Mutex<Instant>,
 }
+
+/// However backed up the path looks, a frame goes at least this often: the picture never
+/// freezes (a wrong backlog reading, a very slow link) — it just updates slowly.
+const MIN_FRAME_GAP: Duration = Duration::from_millis(500);
+/// A frame not delivered within this is given up (its stream reset), so one stuck frame
+/// can't keep the path "backed up" forever.
+const FRAME_GIVE_UP: Duration = Duration::from_secs(3);
+/// A delta is given up only after it had time to go out at this rate (bits/s), so a big
+/// frame on a slow link is not mistaken for a stuck one. Keyframes are never given up.
+const GIVE_UP_RATE: f64 = 200_000.0;
+/// How long a keyframe on its way blocks further keyframe requests.
+const KEY_WAIT: Duration = Duration::from_secs(10);
 
 /// How long the oldest frame may be on its way beyond one round trip before the path
 /// counts as backed up (then frames are skipped at the encoder).
@@ -221,20 +237,20 @@ impl Sink for QuicSink {
         // Jitter (Wi-Fi) delays single frames by about a round trip; only a backlog beyond
         // that and BACKLOG means the path can't keep up.
         let back = backlog(&self.pending, &self.conn) > BACKLOG.max(self.conn.rtt());
-        if chan {
-            crate::perf::tick("cong-channel");
+        let mut last = self.last_go.lock().unwrap();
+        if (chan || back) && last.elapsed() < MIN_FRAME_GAP {
+            crate::perf::tick(if chan { "cong-channel" } else { "cong-backlog" });
+            return true;
         }
-        if back {
-            crate::perf::tick("cong-backlog");
-        }
-        chan || back
+        *last = Instant::now();
+        false
     }
 }
 
 fn start_video_sender(me: Arc<Session>, conn: quinn::Connection, video: Arc<Video>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EncodedFrame>(2);
     let pending: Arc<Mutex<BTreeMap<u32, Instant>>> = Default::default();
-    let sink: Arc<dyn Sink> = Arc::new(QuicSink { tx, conn: conn.clone(), pending: pending.clone() });
+    let sink: Arc<dyn Sink> = Arc::new(QuicSink { tx, conn: conn.clone(), pending: pending.clone(), last_go: Mutex::new(Instant::now()) });
     *me.sink.lock().unwrap() = Some(sink.clone());
     video.start(sink);
     // MANYDESK_PERF: what actually goes out on the wire (QUIC, all streams), per second.
@@ -286,22 +302,38 @@ fn start_video_sender(me: Arc<Session>, conn: quinn::Connection, video: Arc<Vide
             head[5..9].copy_from_slice(&seq.to_be_bytes());
             pending.lock().unwrap().insert(seq, Instant::now());
             let (inf, nk, my) = (pending.clone(), newest_key.clone(), seq);
+            let key = f.key;
+            if key {
+                *me.key_in_flight.lock().unwrap() = Some(Instant::now());
+            }
+            let give_up = FRAME_GIVE_UP.max(Duration::from_secs_f64(f.data.len() as f64 * 8.0 / GIVE_UP_RATE));
+            let me2 = me.clone();
             crate::rt::spawn(async move {
-                let mut ok = s.write_all(&head).await.is_ok();
-                for chunk in f.data.chunks(64 * 1024) {
-                    if !ok {
-                        break;
+                let send = async {
+                    let mut ok = s.write_all(&head).await.is_ok();
+                    for chunk in f.data.chunks(64 * 1024) {
+                        if !ok {
+                            break;
+                        }
+                        if nk.load(Ordering::Relaxed) > my {
+                            let _ = s.reset(0u32.into()); // superseded by a newer keyframe
+                            ok = false;
+                            break;
+                        }
+                        ok = s.write_all(chunk).await.is_ok();
                     }
-                    if nk.load(Ordering::Relaxed) > my {
-                        let _ = s.reset(0u32.into()); // superseded by a newer keyframe
-                        ok = false;
-                        break;
+                    if ok {
+                        let _ = s.finish();
+                        let _ = s.stopped().await;
                     }
-                    ok = s.write_all(chunk).await.is_ok();
-                }
-                if ok {
-                    let _ = s.finish();
-                    let _ = s.stopped().await;
+                };
+                if key {
+                    send.await;
+                    *me2.key_in_flight.lock().unwrap() = None;
+                } else if tokio::time::timeout(give_up, send).await.is_err() {
+                    // never delivered: give it up (the viewer resyncs on the next keyframe)
+                    crate::perf::tick("host-frame-given-up");
+                    let _ = s.reset(0u32.into());
                 }
                 inf.lock().unwrap().remove(&my);
             });
@@ -481,8 +513,13 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
         while let Ok(d) = c.read_datagram().await {
             match d.first() {
                 Some(&DGRAM_KEYFRAME) => {
-                    if let Some(v) = rx_me.video.lock().unwrap().as_ref() {
-                        v.request_keyframe();
+                    // One keyframe at a time: on a slow link it can take seconds to arrive,
+                    // and a new one would reset it before it does — no picture ever.
+                    let busy = rx_me.key_in_flight.lock().unwrap().is_some_and(|t| t.elapsed() < KEY_WAIT);
+                    if !busy {
+                        if let Some(v) = rx_me.video.lock().unwrap().as_ref() {
+                            v.request_keyframe();
+                        }
                     }
                 }
                 Some(&DGRAM_AUDIO) => (rx_me.media)(Media::Audio(d[1..].to_vec())),
@@ -555,6 +592,7 @@ impl Session {
             closed: AtomicBool::new(false),
             tunnel_ok: AtomicBool::new(false),
             tunnels: AtomicUsize::new(0),
+            key_in_flight: Mutex::new(None),
             frames_in: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             cursor_apart: AtomicBool::new(false),

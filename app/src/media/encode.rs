@@ -352,12 +352,19 @@ impl Video {
                 },
             };
             crate::perf::add("sw-encode", te.elapsed());
+            // Test hook: MANYDESK_SIM_CPU=<ms per megapixel> — a slow machine (a VM without a
+            // GPU encoder): each frame costs that much more, in proportion to its pixels.
+            if let Some(ms) = std::env::var("MANYDESK_SIM_CPU").ok().and_then(|v| v.parse::<f64>().ok()) {
+                std::thread::sleep(Duration::from_secs_f64(ms / 1000.0 * (dw * dh) as f64 / 1e6));
+            }
             for (data, key) in frames {
                 if data.is_empty() {
                     continue;
                 }
                 let ok = sink.push(EncodedFrame { data: Bytes::from(data), key, duration: interval });
-                self.record(ok, dw, dh, t0.elapsed() > interval, implementation, hardware);
+                // "slow" only well past its slot: a little over is fine, and counting it would
+                // shrink the picture further than the frame rate needs
+                self.record(ok, dw, dh, t0.elapsed() > interval.mul_f64(1.5), implementation, hardware);
             }
             sleep_rest(t0, interval);
         }

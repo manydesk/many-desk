@@ -585,6 +585,23 @@ impl Core {
                 }
             }
             "test:fm" => self.test_fm(v["tab"].as_u64().unwrap_or(0) as u32, v["step"].as_u64().unwrap_or(0)),
+            "test:type" => {
+                let key = v["tab"].as_u64().unwrap_or(0) as u32;
+                if v["step"] == "run" {
+                    self.send_combo(key, &["MetaLeft", "KeyR"]);
+                } else {
+                    for c in v["line"].as_str().unwrap_or("").chars() {
+                        let Some((code, shift)) = us_key(c) else { continue };
+                        if shift {
+                            self.send_combo(key, &["ShiftLeft", code]);
+                        } else {
+                            self.send_combo(key, &[code]);
+                        }
+                    }
+                    self.send_combo(key, &["Enter"]);
+                    eprintln!("[testtype] typed {} chars", v["line"].as_str().unwrap_or("").len());
+                }
+            }
             "test:tun" => {
                 let (key, spec) = (v["tab"].as_u64().unwrap_or(0) as u32, v["spec"].as_str().unwrap_or("").to_string());
                 let (h, p) = spec.split_once(':').unwrap_or(("127.0.0.1", "0"));
@@ -1397,6 +1414,17 @@ impl Core {
                     // Test hook: MANYDESK_TESTFM=1 runs the file manager through its paces.
                     if std::env::var_os("MANYDESK_TESTFM").is_some() {
                         test_fm_later(self.tabs[i].key, 0, 3);
+                    }
+                    // Test hook: MANYDESK_TESTTYPE=<line> (Windows host): Win+R, types the line
+                    // with physical keys (US layout, works on any host version), Enter.
+                    if let Ok(line) = std::env::var("MANYDESK_TESTTYPE") {
+                        let key = self.tabs[i].key;
+                        crate::rt::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            bus::emit("test:type", json!({ "tab": key, "step": "run" }));
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            bus::emit("test:type", json!({ "tab": key, "step": "type", "line": line }));
+                        });
                     }
                     // Test hook: MANYDESK_TESTTUN=host:port opens a tunnel 127.0.0.1:0->that.
                     if let Ok(spec) = std::env::var("MANYDESK_TESTTUN") {
@@ -2315,6 +2343,51 @@ fn reason_text(r: &str) -> String {
         "noroute-turn" => t("conn.noRouteTurn"),
         other => tf("conn.failed", &[("e", other)]),
     }
+}
+
+/// Test hook helper: the US-layout key (KeyboardEvent.code) and Shift for an ASCII char.
+fn us_key(c: char) -> Option<(&'static str, bool)> {
+    const LETTERS: [&str; 26] = ["KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ"];
+    const DIGITS: [&str; 10] = ["Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9"];
+    Some(match c {
+        'a'..='z' => (LETTERS[(c as u8 - b'a') as usize], false),
+        'A'..='Z' => (LETTERS[(c as u8 - b'A') as usize], true),
+        '0'..='9' => (DIGITS[(c as u8 - b'0') as usize], false),
+        ' ' => ("Space", false),
+        '-' => ("Minus", false),
+        '_' => ("Minus", true),
+        '=' => ("Equal", false),
+        '+' => ("Equal", true),
+        '[' => ("BracketLeft", false),
+        '{' => ("BracketLeft", true),
+        ']' => ("BracketRight", false),
+        '}' => ("BracketRight", true),
+        '\\' => ("Backslash", false),
+        '|' => ("Backslash", true),
+        ';' => ("Semicolon", false),
+        ':' => ("Semicolon", true),
+        '\'' => ("Quote", false),
+        '"' => ("Quote", true),
+        ',' => ("Comma", false),
+        '<' => ("Comma", true),
+        '.' => ("Period", false),
+        '>' => ("Period", true),
+        '/' => ("Slash", false),
+        '?' => ("Slash", true),
+        '`' => ("Backquote", false),
+        '~' => ("Backquote", true),
+        '!' => ("Digit1", true),
+        '@' => ("Digit2", true),
+        '#' => ("Digit3", true),
+        '$' => ("Digit4", true),
+        '%' => ("Digit5", true),
+        '^' => ("Digit6", true),
+        '&' => ("Digit7", true),
+        '*' => ("Digit8", true),
+        '(' => ("Digit9", true),
+        ')' => ("Digit0", true),
+        _ => return None,
+    })
 }
 
 fn test_fm_later(key: u32, step: u64, secs: u64) {
