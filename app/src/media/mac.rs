@@ -191,6 +191,18 @@ fn refine_qp(bitrate: u32) -> i32 {
 /// Normal frames are never finer than this: no bits on detail the refinement brings once
 /// the screen stops (scrolling: about half the traffic; motion quality measured the same).
 const MIN_QP: i32 = 24;
+
+/// MIN_QP for a bitrate: with bits to spare (a fast path), moving content may come out
+/// finer too — the cap only saves traffic where traffic is short.
+fn min_qp(bitrate: u32) -> i32 {
+    if bitrate >= 15_000_000 {
+        18
+    } else if bitrate >= 6_000_000 {
+        22
+    } else {
+        MIN_QP
+    }
+}
 /// sourceFrameRefcon of a refinement frame (for the perf log).
 const REFINE_TAG: usize = 1;
 
@@ -236,7 +248,7 @@ impl Encoder {
             // Only this frame: wait for it, then lift the cap again.
             VTCompressionSessionCompleteFrames(self.session, CMTime { value: 0, timescale: 0, flags: CMTimeFlags::empty(), epoch: 0 });
             set(self.session, kVTCompressionPropertyKey_MaxAllowedFrameQP, cf_i32(51), true);
-            set(self.session, kVTCompressionPropertyKey_MinAllowedFrameQP, cf_i32(MIN_QP), true);
+            set(self.session, kVTCompressionPropertyKey_MinAllowedFrameQP, cf_i32(min_qp(self.params.map(|p| p.bitrate).unwrap_or(0))), true);
         }
         if !props.is_null() {
             CFRelease(props);
@@ -344,6 +356,7 @@ impl Encoder {
         }
         let s = self.session;
         set(s, unsafe { kVTCompressionPropertyKey_AverageBitRate }, cf_i32(p.bitrate as i32), true);
+        set(s, unsafe { kVTCompressionPropertyKey_MinAllowedFrameQP }, cf_i32(min_qp(p.bitrate)), true);
         set(s, unsafe { kVTCompressionPropertyKey_ExpectedFrameRate }, cf_f64(p.fps), true);
         // Hard cap: 1.5× the average over one second (bytes, seconds).
         unsafe {

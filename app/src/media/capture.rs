@@ -167,14 +167,18 @@ pub struct SynthSource {
     buf: Vec<u8>,
     n: usize,
     t0: Instant,
+    w: usize,
+    h: usize,
 }
 
 impl SynthSource {
-    const W: usize = 1920;
-    const H: usize = 1080;
-
+    /// MANYDESK_SYNTH=WxH picks the size (default 1920x1080).
     fn new() -> Self {
-        let (w, h) = (Self::W, Self::H);
+        let size = std::env::var("MANYDESK_SYNTH").ok().and_then(|v| {
+            let (a, b) = v.split_once('x')?;
+            Some((a.parse::<usize>().ok()?.clamp(320, 3840) & !1, b.parse::<usize>().ok()?.clamp(240, 2160) & !1))
+        });
+        let (w, h) = size.unwrap_or((1920, 1080));
         let mut base = vec![255u8; w * h * 4];
         for y in 0..h {
             for x in 0..w {
@@ -187,11 +191,11 @@ impl SynthSource {
                 base[i..i + 4].copy_from_slice(&[shade, shade, shade, 255]);
             }
         }
-        SynthSource { buf: base.clone(), base, n: 0, t0: Instant::now() }
+        SynthSource { buf: base.clone(), base, n: 0, t0: Instant::now(), w, h }
     }
 
     fn grab(&mut self) -> Option<Frame<'_>> {
-        let (w, h) = (Self::W, Self::H);
+        let (w, h) = (self.w, self.h);
         // repaint where the block was, then draw it at its new place (moves 30 px/frame)
         self.buf.copy_from_slice(&self.base);
         self.n += 1;
@@ -418,28 +422,199 @@ impl Drop for RecorderSource {
 }
 
 /// BGRA/RGBA → I420 at (dw, dh), nearest-neighbour scaled (BT.601 limited range).
+/// BGRA/RGBA → I420 at `dw`×`dh` (BT.601, limited range). Scaling averages every source
+/// pixel a destination pixel covers (an area filter) — picking one of them instead, as
+/// before, dropped thin text strokes and left the rest jagged. Chroma is the 2×2 average.
+/// Bands of rows run in parallel: the encoder is single-threaded, the other cores idle.
 pub fn to_i420(f: &Frame<'_>, dw: usize, dh: usize, out: &mut Vec<u8>) {
     let (cw, ch) = (dw / 2, dh / 2);
     out.resize(dw * dh + 2 * cw * ch, 0);
     let (y_plane, uv) = out.split_at_mut(dw * dh);
     let (u_plane, v_plane) = uv.split_at_mut(cw * ch);
-    let (ri, bi) = if f.bgra { (2, 0) } else { (0, 2) };
-    let xs: Vec<usize> = (0..dw).map(|x| (x * f.width / dw).min(f.width - 1) * 4).collect();
-    for y in 0..dh {
-        let row = &f.data[(y * f.height / dh).min(f.height - 1) * f.stride..];
-        let yrow = &mut y_plane[y * dw..(y + 1) * dw];
-        for (x, &sx) in xs.iter().enumerate() {
-            let (r, g, b) = (row[sx + ri] as i32, row[sx + 1] as i32, row[sx + bi] as i32);
-            yrow[x] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+    let span = |d: usize, dn: usize, sn: usize| {
+        let a = (d * sn / dn).min(sn - 1);
+        let b = ((d + 1) * sn / dn).clamp(a + 1, sn);
+        (a, b)
+    };
+    let cols: Vec<(usize, usize)> = (0..dw).map(|x| span(x, dw, f.width)).collect();
+    // below 2×: every column 1–2 pixels wide. (byte offset, weight of that pixel, weight of
+    // the next): a 1-px last column reads the pair ending on it, so 8 bytes stay in the row.
+    let narrow = cols.iter().all(|&(a, b)| b - a <= 2) && f.width >= 2;
+    let pairs: Vec<(usize, u32, u32)> = cols
+        .iter()
+        .map(|&(a, b)| if a + 1 >= f.width { ((f.width - 2) * 4, 0, 1) } else { (a * 4, 1, (b - a == 2) as u32) })
+        .collect();
+    let rows: Vec<(usize, usize)> = (0..dh).map(|y| span(y, dh, f.height)).collect();
+    let job = Job { f, dw, cw, cols: &cols, pairs: &pairs, rows: &rows, narrow, one_to_one: dw == f.width && dh == f.height };
+    // bands of whole chroma rows (pairs of luma rows)
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8).min(ch.max(1));
+    let band = ch.div_ceil(threads).max(1); // chroma rows per band
+    if threads == 1 {
+        job.run(0, dh, y_plane, u_plane, v_plane);
+        return;
+    }
+    std::thread::scope(|sc| {
+        let ys = y_plane.chunks_mut(band * 2 * dw);
+        let us = u_plane.chunks_mut(band * cw);
+        let vs = v_plane.chunks_mut(band * cw);
+        for (k, ((yb, ub), vb)) in ys.zip(us).zip(vs).enumerate() {
+            let (y0, y1) = (k * band * 2, ((k + 1) * band * 2).min(dh));
+            let job = &job;
+            sc.spawn(move || job.run(y0, y1, yb, ub, vb));
         }
-        if y % 2 == 0 && y / 2 < ch {
-            let cy = y / 2;
-            for cx in 0..cw {
-                let sx = xs[cx * 2];
-                let (r, g, b) = (row[sx + ri] as i32, row[sx + 1] as i32, row[sx + bi] as i32);
-                u_plane[cy * cw + cx] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
-                v_plane[cy * cw + cx] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+    });
+}
+
+struct Job<'a, 'b> {
+    f: &'a Frame<'b>,
+    dw: usize,
+    cw: usize,
+    cols: &'a [(usize, usize)],
+    pairs: &'a [(usize, u32, u32)],
+    rows: &'a [(usize, usize)],
+    narrow: bool,
+    one_to_one: bool,
+}
+
+impl Job<'_, '_> {
+    /// Destination rows `y0..y1` (y0 even) into their slices of the planes.
+    fn run(&self, y0: usize, y1: usize, y_plane: &mut [u8], u_plane: &mut [u8], v_plane: &mut [u8]) {
+        let (f, dw, cw) = (self.f, self.dw, self.cw);
+        let (ri, bi) = if f.bgra { (2, 0) } else { (0, 2) };
+        let luma = |r: u32, g: u32, b: u32| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+        let chroma = |r: i32, g: i32, b: i32| ((((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8, (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8);
+        // two destination rows of RGB (averaged), for the 2×2 chroma
+        let mut sums = vec![[0u32; 3]; dw * 2];
+        for y in y0..y1 {
+            let (s0, s1) = self.rows[y];
+            let acc = &mut sums[(y % 2) * dw..(y % 2 + 1) * dw];
+            let yrow = &mut y_plane[(y - y0) * dw..(y - y0 + 1) * dw];
+            if self.one_to_one {
+                let row = &f.data[y * f.stride..y * f.stride + f.width * 4];
+                for ((a, yv), p) in acc.iter_mut().zip(yrow.iter_mut()).zip(row.chunks_exact(4)) {
+                    let (r, g, b) = (p[ri] as u32, p[1] as u32, p[bi] as u32);
+                    *a = [r, g, b];
+                    *yv = luma(r, g, b);
+                }
+            } else {
+                acc.fill([0; 3]);
+                // source rows in order (cache friendly), each added into the columns it feeds
+                for sy in s0..s1 {
+                    let row = &f.data[sy * f.stride..sy * f.stride + f.width * 4];
+                    if self.narrow {
+                        // one or two source pixels per column, summed without a branch
+                        for (a, &(o, w0, w1)) in acc.iter_mut().zip(self.pairs.iter()) {
+                            let p = &row[o..o + 8];
+                            a[0] += w0 * p[ri] as u32 + w1 * p[4 + ri] as u32;
+                            a[1] += w0 * p[1] as u32 + w1 * p[5] as u32;
+                            a[2] += w0 * p[bi] as u32 + w1 * p[4 + bi] as u32;
+                        }
+                    } else {
+                        for (a, &(x0, x1)) in acc.iter_mut().zip(self.cols.iter()) {
+                            for p in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                                a[0] += p[ri] as u32;
+                                a[1] += p[1] as u32;
+                                a[2] += p[bi] as u32;
+                            }
+                        }
+                    }
+                }
+                let n_rows = (s1 - s0) as u32;
+                for ((a, yv), &(x0, x1)) in acc.iter_mut().zip(yrow.iter_mut()).zip(self.cols.iter()) {
+                    let n = n_rows * (x1 - x0) as u32;
+                    if n > 1 {
+                        // ×(65536/n) and a shift instead of three divisions
+                        let k = (65536 + n / 2) / n;
+                        *a = [(a[0] * k + 32768) >> 16, (a[1] * k + 32768) >> 16, (a[2] * k + 32768) >> 16];
+                    }
+                    *yv = luma(a[0], a[1], a[2]);
+                }
+            }
+            if y % 2 == 1 {
+                let cy = (y - y0) / 2;
+                for cx in 0..cw {
+                    let mut t = [0u32; 3];
+                    for (row, col) in [(0, 2 * cx), (0, 2 * cx + 1), (1, 2 * cx), (1, 2 * cx + 1)] {
+                        let p = sums[row * dw + col];
+                        t[0] += p[0];
+                        t[1] += p[1];
+                        t[2] += p[2];
+                    }
+                    let (u, v) = chroma(((t[0] + 2) / 4) as i32, ((t[1] + 2) / 4) as i32, ((t[2] + 2) / 4) as i32);
+                    u_plane[cy * cw + cx] = u;
+                    v_plane[cy * cw + cx] = v;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    fn frame(w: usize, h: usize, px: impl Fn(usize, usize) -> [u8; 4]) -> Vec<u8> {
+        let mut v = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                v[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&px(x, y));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn flat_colour_is_exact_at_any_scale() {
+        let data = frame(64, 48, |_, _| [200, 100, 50, 255]); // BGRA
+        let f = Frame { data: &data, width: 64, height: 48, stride: 256, bgra: true };
+        for (dw, dh) in [(64, 48), (32, 24), (40, 30)] {
+            let mut out = Vec::new();
+            to_i420(&f, dw, dh, &mut out);
+            let y = out[0];
+            assert!(out[..dw * dh].iter().all(|&v| v == y), "{dw}x{dh}");
+        }
+    }
+
+    #[test]
+    fn the_last_column_is_its_own_pixel() {
+        // a red right edge, 15 px wide → 10 (spans of 1 and 2): the last column stays red
+        let data = frame(15, 4, |x, _| if x == 14 { [0, 0, 255, 255] } else { [255, 255, 255, 255] });
+        let f = Frame { data: &data, width: 15, height: 4, stride: 60, bgra: true };
+        let mut out = Vec::new();
+        to_i420(&f, 10, 4, &mut out);
+        // it covers the last white pixel and the red one: their average
+        assert!((140..180).contains(&out[9]), "last column: average of white and red, got {}", out[9]);
+        assert!(out[0] > 230);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_to_i420() {
+        let (w, h) = (3024, 1964);
+        let data = frame(w, h, |x, y| [(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8, 255]);
+        let f = Frame { data: &data, width: w, height: h, stride: w * 4, bgra: true };
+        let mut out = Vec::new();
+        for (dw, dh) in [(3024, 1964), (2598, 1688), (2078, 1350), (1512, 982)] {
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                to_i420(&f, dw, dh, &mut out);
+            }
+            println!("{dw}x{dh}: {:.1} ms", t.elapsed().as_secs_f64() * 100.0);
+        }
+    }
+
+    #[test]
+    fn a_thin_line_survives_downscaling() {
+        // white with a 1-px black vertical line every 4th column, halved: nearest-neighbour
+        // either lost the line entirely or kept it full black depending on the phase;
+        // the area filter keeps it as a half-grey line everywhere.
+        let data = frame(64, 16, |x, _| if x % 4 == 1 { [0, 0, 0, 255] } else { [255, 255, 255, 255] });
+        let f = Frame { data: &data, width: 64, height: 16, stride: 256, bgra: true };
+        let mut out = Vec::new();
+        to_i420(&f, 32, 8, &mut out);
+        let row = &out[..32];
+        let (white, grey) = (row[1], row[0]);
+        assert!(white > 230, "white {white}");
+        assert!((100..160).contains(&grey), "line kept as grey: {grey}");
     }
 }

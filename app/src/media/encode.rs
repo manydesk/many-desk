@@ -57,6 +57,10 @@ struct Stats {
     /// encode than their slot — counted, so one stray event doesn't lower the quality
     skips: Vec<Instant>,
     slows: Vec<Instant>,
+    /// software path: frames done well inside their slot (room to grow the picture), and
+    /// how many frames were timed at all
+    fast: Vec<Instant>,
+    timed: Vec<Instant>,
     implementation: &'static str,
     hardware: bool,
 }
@@ -119,6 +123,10 @@ impl Video {
         s.window.retain(|t| now.duration_since(*t) < two);
         s.skips.retain(|t| now.duration_since(*t) < two);
         s.slows.retain(|t| now.duration_since(*t) < two);
+        s.fast.retain(|t| now.duration_since(*t) < two);
+        s.timed.retain(|t| now.duration_since(*t) < two);
+        // share of frames with room to spare (1 when nothing is timed: hardware encoders)
+        let fast_share = if s.timed.is_empty() { 1.0 } else { s.fast.len() as f64 / s.timed.len() as f64 };
         let recent = |t: Option<Instant>| t.is_some_and(|t| now.duration_since(t) < two);
         // Limited only when it keeps happening: a fifth or more of the frames in the last
         // two seconds (a Wi-Fi hiccup skips a frame or two and must not cost resolution).
@@ -133,7 +141,7 @@ impl Video {
         json!({
             "framesEncoded": s.frames, "frameWidth": s.width, "frameHeight": s.height,
             "framesPerSecond": s.window.len() as f64 / 2.0, "encoderImplementation": s.implementation,
-            "powerEfficientEncoder": s.hardware, "qualityLimitationReason": reason,
+            "powerEfficientEncoder": s.hardware, "qualityLimitationReason": reason, "fastShare": fast_share,
         })
     }
 
@@ -195,6 +203,16 @@ impl Video {
     /// One encoded frame handed to the sink (ok) or dropped by it.
     /// A frame not encoded because the path was backed up: counts as bandwidth-limited for
     /// the quality loop, without forcing a keyframe.
+    /// Software path: how long a frame took against its slot.
+    fn timing(&self, took: Duration, slot: Duration) {
+        let mut st = self.stats.lock().unwrap();
+        let now = Instant::now();
+        st.timed.push(now);
+        if took < slot.mul_f64(0.6) {
+            st.fast.push(now);
+        }
+    }
+
     pub(crate) fn skipped(&self) {
         crate::perf::tick("host-skipped");
         self.stats.lock().unwrap().skips.push(Instant::now());
@@ -365,6 +383,7 @@ impl Video {
                 // "slow" only well past its slot: a little over is fine, and counting it would
                 // shrink the picture further than the frame rate needs
                 self.record(ok, dw, dh, t0.elapsed() > interval.mul_f64(1.5), implementation, hardware);
+                self.timing(t0.elapsed(), interval);
             }
             sleep_rest(t0, interval);
         }
