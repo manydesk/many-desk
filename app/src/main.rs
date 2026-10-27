@@ -77,6 +77,7 @@ fn main() -> eframe::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     rt::handle(); // start the runtime before anything spawns
     platform::keep_responsive();
+    perf::start_watchdog();
     let rx = bus::init();
     // Some GL drivers (VMs, old GPUs, X11 without a compositor) have no surface with
     // alpha: then the app runs opaque and the host overlay is off (see the retry below).
@@ -105,9 +106,40 @@ fn main() -> eframe::Result<()> {
     if transparent && r.as_ref().is_err_and(|e| format!("{e:?}").contains("NoGlutinConfigs")) {
         // winit's event loop cannot be created twice in one process: start over opaque.
         if let Ok(exe) = std::env::current_exe() {
+            // This process stays (the service watches it) but its windows would sit there
+            // never answering a message — and a hung top-level window stalls everyone who
+            // sends to all windows: display and full-screen changes froze other apps.
+            #[cfg(windows)]
+            drop_dead_windows();
             let status = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("MANYDESK_OPAQUE", "1").status();
             std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
         }
     }
     r
+}
+
+/// Destroys the windows a failed event loop left on this thread, without running winit's
+/// window procedure on its freed state.
+#[cfg(windows)]
+fn drop_dead_windows() {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, DestroyWindow, EnumThreadWindows, GetClassNameW, SetWindowLongPtrW, GWLP_WNDPROC};
+    unsafe extern "system" fn each(h: HWND, out: LPARAM) -> BOOL {
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(h, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        // the input method's own windows go with the thread's last window
+        if !String::from_utf16_lossy(&class[..n]).contains("IME") {
+            (*(out as *mut Vec<HWND>)).push(h);
+        }
+        1
+    }
+    let mut found: Vec<HWND> = Vec::new();
+    unsafe {
+        EnumThreadWindows(GetCurrentThreadId(), Some(each), &mut found as *mut Vec<HWND> as LPARAM);
+        for h in found {
+            SetWindowLongPtrW(h, GWLP_WNDPROC, DefWindowProcW as usize as isize);
+            DestroyWindow(h);
+        }
+    }
 }

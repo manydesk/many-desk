@@ -3,7 +3,8 @@
 // macOS/Windows through the small native helpers (native/InputHelper.swift,
 // native/win/inputhelper_windows.go, JSON lines on stdin), Linux/X11 through XTEST.
 use std::io::Write;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -36,7 +37,10 @@ pub fn overlay_rect(s: &Screen) -> (f32, f32, f32, f32) {
 }
 
 pub struct Input {
-    child: Mutex<Option<(Child, ChildStdin)>>,
+    /// The helper, and the queue its writer thread feeds into its stdin: a helper that
+    /// stops reading (stuck in SendInput on a secure desktop, say) must not stop the UI
+    /// thread with it — a full queue drops input instead.
+    child: Mutex<Option<(Child, SyncSender<String>)>>,
     /// what the helper last said about privacy-mode blocking (it answers each "block")
     blocked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_os = "linux")]
@@ -116,8 +120,20 @@ impl Input {
                             }
                         });
                     }
-                    if let Some(stdin) = c.stdin.take() {
-                        *child = Some((c, stdin));
+                    if let Some(mut stdin) = c.stdin.take() {
+                        let (tx, rx) = sync_channel::<String>(512);
+                        std::thread::Builder::new()
+                            .name("input-writer".into())
+                            .spawn(move || {
+                                // ends when the queue is dropped, and the helper with its stdin
+                                for line in rx {
+                                    if writeln!(stdin, "{line}").is_err() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .ok();
+                        *child = Some((c, tx));
                     }
                 }
                 Err(e) => eprintln!("[input] helper failed to start: {e}"),
@@ -128,9 +144,19 @@ impl Input {
     pub fn stop(&self) {
         self.send(&json!({ "t": "release" }));
         self.blocked.store(false, std::sync::atomic::Ordering::Relaxed);
-        if let Some((mut c, stdin)) = self.child.lock().unwrap().take() {
-            drop(stdin);
-            let _ = c.wait();
+        if let Some((mut c, tx)) = self.child.lock().unwrap().take() {
+            drop(tx);
+            // the helper quits when its stdin closes; one that hangs is killed
+            std::thread::spawn(move || {
+                for _ in 0..30 {
+                    if !matches!(c.try_wait(), Ok(None)) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let _ = c.kill();
+                let _ = c.wait();
+            });
         }
     }
 
@@ -140,8 +166,8 @@ impl Input {
             x.handle(cmd);
             return;
         }
-        if let Some((_, stdin)) = self.child.lock().unwrap().as_mut() {
-            let _ = writeln!(stdin, "{cmd}");
+        if let Some((_, tx)) = self.child.lock().unwrap().as_ref() {
+            let _ = tx.try_send(cmd.to_string());
         }
     }
 

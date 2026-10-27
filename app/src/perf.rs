@@ -69,3 +69,94 @@ pub fn stamp(side: &str, seq: u32) {
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0);
     eprintln!("[lat] {side} {seq} {ms:.1}");
 }
+
+// ---- stall watchdog ----
+//
+// The UI thread beats once per pass (`beat`); a watchdog thread reports when it stops for
+// over half a second ("[stall] UI thread blocked 1.8 s"), always — a frozen window is
+// worth a log line. With MANYDESK_STALLDUMP=<dir> it also samples the process during the
+// stall (macOS `sample`), so the main thread's stack shows what it was stuck in.
+
+static BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+pub fn beat() {
+    BEAT.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What the UI thread is doing now, named in stall reports ("os" = outside our code:
+/// painting, the swap, window messages).
+static PHASE: std::sync::Mutex<&'static str> = std::sync::Mutex::new("start");
+
+pub fn phase(p: &'static str) {
+    if let Ok(mut g) = PHASE.lock() {
+        *g = p;
+    }
+}
+
+fn current_phase() -> &'static str {
+    PHASE.lock().map(|g| *g).unwrap_or("?")
+}
+
+pub fn start_watchdog() {
+    #[cfg_attr(not(target_os = "macos"), allow(unused))]
+    let dump = std::env::var("MANYDESK_STALLDUMP").ok();
+    std::thread::Builder::new()
+        .name("watchdog".into())
+        .spawn(move || {
+            // An idle UI thread draws nothing and doesn't beat, so the watchdog wakes it
+            // (a repaint request) and only counts it stuck when that goes unanswered.
+            let mut asked: Option<u64> = None; // oldest wake-up not answered yet
+            let mut reported = false;
+            #[cfg_attr(not(target_os = "macos"), allow(unused))]
+            let mut dumps = 0;
+            let mut seen: Vec<&'static str> = Vec::new();
+            loop {
+                let now = now_ms();
+                let last = BEAT.load(std::sync::atomic::Ordering::Relaxed);
+                // nothing to watch before the first frame (or in a process whose window
+                // never came up, like the one that restarts itself opaque)
+                if last == 0 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                match asked {
+                    Some(at) if last >= at => {
+                        if reported {
+                            eprintln!("[stall] UI thread back after {:.1} s (phases: {})", (last - at) as f64 / 1000.0, seen.join(", "));
+                        }
+                        asked = None;
+                        reported = false;
+                        seen.clear();
+                    }
+                    Some(at) if now - at > 700 && !reported => {
+                        reported = true;
+                        eprintln!("[stall] UI thread not responding for {:.1} s (in {})", (now - at) as f64 / 1000.0, current_phase());
+                        #[cfg(target_os = "macos")]
+                        if let (Some(dir), true) = (&dump, dumps < 10) {
+                            dumps += 1;
+                            let file = format!("{dir}/stall-{}-{at}.txt", std::process::id());
+                            let _ = std::process::Command::new("/usr/bin/sample").args([&std::process::id().to_string(), "1", "-file", &file]).output();
+                            eprintln!("[stall] sampled into {file}");
+                        }
+                    }
+                    _ => {}
+                }
+                if reported {
+                    let p = current_phase();
+                    if !seen.contains(&p) {
+                        seen.push(p);
+                    }
+                }
+                if asked.is_none() {
+                    asked = Some(now);
+                    crate::bus::wake();
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        })
+        .ok();
+}

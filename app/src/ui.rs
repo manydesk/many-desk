@@ -72,6 +72,10 @@ pub struct App {
     /// started with --background: minimize on the first frame
     minimize_once: bool,
     update_started: bool,
+    /// Settings → startup: (starts with the system, service installed), looked up off the
+    /// UI thread (Windows asks `reg` and the service manager), and when it was.
+    startup: Arc<Mutex<(bool, bool)>>,
+    startup_checked: Option<Instant>,
     /// update check: None = idle, Some(None) = checking, Some(Some(..)) = result text + ok
     update: std::sync::Arc<Mutex<Option<(String, Option<bool>)>>>,
 }
@@ -168,6 +172,8 @@ impl App {
             covered: Vec::new(),
             minimize_once: std::env::args().any(|a| a == "--background"),
             update_started: false,
+            startup: Default::default(),
+            startup_checked: None,
             update: Default::default(),
         }
     }
@@ -181,11 +187,15 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::perf::beat();
+        crate::perf::phase("logic");
         // Test hook: MANYDESK_MINIMIZE=1 minimizes the window once it is up (hidden host).
         if ctx.cumulative_pass_nr() == 3 && std::env::var_os("MANYDESK_MINIMIZE").is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
+        crate::perf::phase("core.tick");
         self.core.tick(&self.rx);
+        crate::perf::phase("logic");
         // Test hook: accept requests even while the window is hidden (no ui pass then).
         if self.core.pending.is_some() && std::env::var_os("MANYDESK_AUTOACCEPT").is_some() {
             // tests may ask for every permission (restart, privacy, tunnel included)
@@ -198,11 +208,13 @@ impl eframe::App for App {
         if !self.core.tabs.is_empty() || !self.core.hosts.is_empty() || self.core.pending.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+        crate::perf::phase("os");
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         crate::perf::tick("uiframe");
+        crate::perf::phase("ui");
         if self.minimize_once {
             self.minimize_once = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -228,16 +240,19 @@ impl eframe::App for App {
                 self.host_chat = None;
             }
         }
+        crate::perf::phase(if active.is_some() { "ui.session" } else { "ui.home" });
         match active {
             Some(k) => self.session_view(ui, k),
             None => self.home(ui),
         }
+        crate::perf::phase("ui.overlays");
         self.request_window(&ctx);
         self.host_stack(&ctx);
         self.pointer_overlay(&ctx);
         self.privacy_cover(&ctx);
         self.act_dialog(&ctx);
         self.toasts(&ctx);
+        crate::perf::phase("os");
     }
 }
 
@@ -1075,23 +1090,39 @@ impl App {
     fn startup_panel(&mut self, ui: &mut Ui) {
         th::panel(ui, |ui| {
             th::h3(ui, &t("start.title"));
-            let mut on = crate::platform::system::autostart_enabled();
+            if self.startup_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+                self.startup_checked = Some(Instant::now());
+                let (state, ctx) = (self.startup.clone(), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    #[cfg(windows)]
+                    let svc = crate::platform::service::installed();
+                    #[cfg(not(windows))]
+                    let svc = false;
+                    *state.lock().unwrap() = (crate::platform::system::autostart_enabled(), svc);
+                    ctx.request_repaint();
+                });
+            }
+            let (mut on, _installed) = *self.startup.lock().unwrap();
             if th::checkbox(ui, &mut on, &t("start.autostart")).changed() {
-                if let Err(e) = crate::platform::system::set_autostart(on) {
-                    self.core.toast(e, true);
+                match crate::platform::system::set_autostart(on) {
+                    Ok(()) => self.startup.lock().unwrap().0 = on,
+                    Err(e) => self.core.toast(e, true),
                 }
             }
             th::hint(ui, &t("start.autostartHint"));
             #[cfg(windows)]
             {
                 ui.add_space(10.0);
-                let installed = crate::platform::service::installed();
+                let installed = _installed;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     if installed {
                         if th::btn(ui, &t("start.svcRemove"), Btn::Normal).clicked() {
                             match crate::platform::service::uninstall() {
-                                Ok(()) => self.core.toast(t("start.svcRemoved"), false),
+                                Ok(()) => {
+                                    self.startup.lock().unwrap().1 = false;
+                                    self.core.toast(t("start.svcRemoved"), false)
+                                }
                                 Err(e) => self.core.toast(e, true),
                             }
                         }
@@ -1099,7 +1130,10 @@ impl App {
                         ui.label(text(t("start.svcOn"), 13.0, W::Regular, th::MUTED));
                     } else if th::btn(ui, &t("start.svcInstall"), Btn::Primary).clicked() {
                         match crate::platform::service::install() {
-                            Ok(()) => self.core.toast(t("start.svcInstalled"), false),
+                            Ok(()) => {
+                                self.startup.lock().unwrap().1 = true;
+                                self.core.toast(t("start.svcInstalled"), false)
+                            }
                             Err(e) => self.core.toast(e, true),
                         }
                     }

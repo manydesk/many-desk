@@ -1426,6 +1426,30 @@ impl Core {
                             bus::emit("test:type", json!({ "tab": key, "step": "type", "line": line }));
                         });
                     }
+                    // Test hook: MANYDESK_TESTSTRESS=<secs>: 60 pointer moves a second (a small
+                    // circle mid-screen, no clicks) and every 500 ms a probe the host's UI thread
+                    // answers ("[probe] host answered in N ms") — host responsiveness under input.
+                    if let Some(secs) = std::env::var("MANYDESK_TESTSTRESS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                        let sid = self.tabs[i].sid;
+                        let reg = self.sessions.clone();
+                        crate::rt::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            let Some(s) = sid.and_then(|id| reg.lock().unwrap().get(&id).cloned()) else { return };
+                            let t0 = Instant::now();
+                            let mut n = 0u64;
+                            while t0.elapsed() < Duration::from_secs(secs) {
+                                let a = n as f64 * 0.1;
+                                let _ = s.send_text(false, &json!({ "t": "move", "x": 0.5 + 0.05 * a.cos(), "y": 0.5 + 0.05 * a.sin() }).to_string()).await;
+                                if n % 30 == 0 {
+                                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                                    let _ = s.send_text(false, &json!({ "t": "fls", "rid": format!("probe-{now}"), "path": "" }).to_string()).await;
+                                }
+                                n += 1;
+                                tokio::time::sleep(Duration::from_millis(16)).await;
+                            }
+                            eprintln!("[stress] sent {n} moves");
+                        });
+                    }
                     // Test hook: MANYDESK_TESTTUN=host:port opens a tunnel 127.0.0.1:0->that.
                     if let Ok(spec) = std::env::var("MANYDESK_TESTTUN") {
                         let key = self.tabs[i].key;
@@ -1988,6 +2012,11 @@ impl Core {
         let f = &mut self.tabs[i].fm;
         match m["t"].as_str() {
             Some("fls") => {
+                if let Some(t) = rid.strip_prefix("probe-").and_then(|ms| ms.parse::<u128>().ok()) {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                    eprintln!("[probe] host answered in {} ms", now.saturating_sub(t));
+                    return;
+                }
                 f.remote = Pane::from_reply(m);
             }
             Some("ferr") => {

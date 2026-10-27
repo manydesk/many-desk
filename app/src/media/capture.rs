@@ -356,44 +356,71 @@ unsafe impl Sync for Hub {}
 
 static HUBS: std::sync::Mutex<Vec<(u32, Arc<Hub>)>> = std::sync::Mutex::new(Vec::new());
 
-pub struct RecorderSource {
-    hub: Arc<Hub>,
-    id: u32,
-    seen: u64,
-    last: Option<Arc<xcap::Frame>>,
-}
-
-impl RecorderSource {
-    fn open(screen: Option<&Screen>) -> Result<Self, String> {
-        let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
-        let m = screen
-            .and_then(|s| monitors.iter().find(|m| m.id().ok() == Some(s.id)))
-            .or_else(|| monitors.first())
-            .ok_or("no monitor")?;
-        let id = m.id().map_err(|e| e.to_string())?;
-        let mut hubs = HUBS.lock().unwrap();
-        if let Some((_, hub)) = hubs.iter().find(|h| h.0 == id) {
-            hub.users.fetch_add(1, Ordering::SeqCst);
-            return Ok(RecorderSource { hub: hub.clone(), id, seen: 0, last: None });
-        }
+impl Hub {
+    fn start(m: &xcap::Monitor) -> Result<Arc<Hub>, String> {
         let (rec, rx) = m.video_recorder().map_err(|e| e.to_string())?;
         rec.start().map_err(|e| e.to_string())?;
         let hub = Arc::new(Hub { rec, latest: Default::default(), cond: Default::default(), users: 1.into() });
         let h = Arc::downgrade(&hub);
         std::thread::Builder::new()
             .name("capture-hub".into())
-            .spawn(move || {
-                while let Ok(f) = rx.recv() {
-                    let Some(h) = h.upgrade() else { break };
-                    let mut l = h.latest.lock().unwrap();
-                    l.0 += 1;
-                    l.1 = Some(Arc::new(f));
-                    h.cond.notify_all();
-                }
+            .spawn(move || loop {
+                // xcap keeps a sender itself, so the channel never closes: look up now and
+                // then whether anyone still uses the hub.
+                let f = rx.recv_timeout(Duration::from_secs(1));
+                let Some(h) = h.upgrade() else { break };
+                let Ok(f) = f else { continue };
+                let mut l = h.latest.lock().unwrap();
+                l.0 += 1;
+                l.1 = Some(Arc::new(f));
+                h.cond.notify_all();
             })
             .map_err(|e| e.to_string())?;
+        Ok(hub)
+    }
+}
+
+fn monitor(id: Option<u32>) -> Result<xcap::Monitor, String> {
+    let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
+    let i = id.and_then(|id| monitors.iter().position(|m| m.id().ok() == Some(id))).unwrap_or(0);
+    monitors.into_iter().nth(i).ok_or_else(|| "no monitor".into())
+}
+
+pub struct RecorderSource {
+    hub: Arc<Hub>,
+    id: u32,
+    seen: u64,
+    last: Option<Arc<xcap::Frame>>,
+    /// When a frame last came, and when the recorder was last checked on and restarted.
+    fresh: Instant,
+    checked: Instant,
+    restarted: Instant,
+    /// How long a still screen goes before the next check: doubles with each restart, so a
+    /// screenshot that never quite matches the recorder cannot keep restarting it.
+    backoff: Duration,
+}
+
+impl RecorderSource {
+    fn open(screen: Option<&Screen>) -> Result<Self, String> {
+        let m = monitor(screen.map(|s| s.id))?;
+        let id = m.id().map_err(|e| e.to_string())?;
+        let hub = Self::join(&m, id, None)?;
+        let now = Instant::now();
+        Ok(RecorderSource { hub, id, seen: 0, last: None, fresh: now, checked: now, restarted: now, backoff: STALE })
+    }
+
+    /// The hub for monitor `id`: the running one, or a new one. `dead` is a hub found not
+    /// delivering — it is replaced rather than joined.
+    fn join(m: &xcap::Monitor, id: u32, dead: Option<&Arc<Hub>>) -> Result<Arc<Hub>, String> {
+        let mut hubs = HUBS.lock().unwrap();
+        if let Some((_, hub)) = hubs.iter().find(|h| h.0 == id && !dead.is_some_and(|d| Arc::ptr_eq(d, &h.1))) {
+            hub.users.fetch_add(1, Ordering::SeqCst);
+            return Ok(hub.clone());
+        }
+        let hub = Hub::start(m)?;
+        hubs.retain(|h| h.0 != id);
         hubs.push((id, hub.clone()));
-        Ok(RecorderSource { hub, id, seen: 0, last: None })
+        Ok(hub)
     }
 
     fn grab(&mut self, wait: Duration) -> Option<Frame<'_>> {
@@ -403,25 +430,101 @@ impl RecorderSource {
         if l.0 != self.seen {
             self.seen = l.0;
             self.last = l.1.clone();
+            self.fresh = Instant::now();
+            if self.restarted.elapsed() > Duration::from_secs(60) {
+                self.backoff = STALE;
+            }
         }
         drop(l);
+        // Windows only: elsewhere a screenshot may mean a portal prompt.
+        if cfg!(windows) && self.fresh.elapsed() > self.backoff && self.checked.elapsed() > self.backoff {
+            self.checked = Instant::now();
+            self.check();
+        }
         let f = self.last.as_ref()?;
         Some(Frame { data: &f.raw, width: f.width as usize, height: f.height as usize, stride: f.width as usize * 4, bgra: false })
+    }
+
+    /// No frame for a while: a still screen, or a recorder that stopped. Windows ends the
+    /// desktop duplication on every desktop switch (UAC prompt, lock screen, Ctrl+Alt+Del,
+    /// a resolution change) and xcap's worker then quits silently — the picture froze for
+    /// good. A one-off screenshot tells the two apart; a stopped recorder is started again.
+    fn check(&mut self) {
+        let Ok(m) = monitor(Some(self.id)) else { return };
+        let shot = m.capture_image().ok();
+        let why = match (&self.last, &shot) {
+            (None, _) => Some("no frame yet".to_string()),
+            (Some(_), None) => None, // the secure desktop: nothing to capture yet
+            (Some(f), Some(shot)) => differs(f, shot),
+        };
+        let Some(why) = why else { return };
+        // A change may just be on its way through the recorder.
+        let l = self.hub.latest.lock().unwrap();
+        let (l, _) = self.hub.cond.wait_timeout_while(l, Duration::from_millis(400), |l| l.0 == self.seen).unwrap();
+        if l.0 != self.seen {
+            return;
+        }
+        drop(l);
+        match Self::join(&m, self.id, Some(&self.hub)) {
+            Ok(hub) => {
+                eprintln!("[capture] recorder stopped delivering ({why}); started again");
+                let old = std::mem::replace(&mut self.hub, hub);
+                release(old, self.id);
+                self.seen = 0;
+                // A new recorder sends nothing until the screen changes: until then the
+                // screenshot is the picture.
+                if let Some(shot) = shot {
+                    self.last = Some(Arc::new(xcap::Frame::new(shot.width(), shot.height(), shot.into_raw())));
+                    self.fresh = Instant::now();
+                }
+                self.restarted = Instant::now();
+                self.backoff = (self.backoff * 2).min(Duration::from_secs(120));
+            }
+            Err(e) => eprintln!("[capture] recorder restart failed: {e}"),
+        }
+    }
+}
+
+/// How long without a frame before the recorder is checked on.
+const STALE: Duration = Duration::from_millis(1500);
+
+/// What a screenshot shows that the last recorded frame does not (a size change,
+/// or more than a few sampled pixels off — the two paths may round colours differently).
+fn differs(f: &xcap::Frame, shot: &image::RgbaImage) -> Option<String> {
+    if f.width != shot.width() || f.height != shot.height() {
+        return Some(format!("size {}x{} -> {}x{}", f.width, f.height, shot.width(), shot.height()));
+    }
+    let (a, b) = (&f.raw[..], shot.as_raw());
+    let n = a.len().min(b.len()) / 4;
+    let step = (n / 20_000).max(1);
+    let (mut seen, mut off) = (0usize, 0usize);
+    for i in (0..n).step_by(step) {
+        seen += 1;
+        let (p, q) = (&a[i * 4..i * 4 + 3], &b[i * 4..i * 4 + 3]);
+        if p.iter().zip(q).any(|(x, y)| x.abs_diff(*y) > 24) {
+            off += 1;
+        }
+    }
+    (off * 200 > seen).then(|| format!("{off} of {seen} pixels")) // over 0.5 %
+}
+
+/// One user less; the last one stops the recorder.
+fn release(hub: Arc<Hub>, id: u32) {
+    // Under the registry lock, so a session opening right now cannot join a stopping hub.
+    let mut hubs = HUBS.lock().unwrap();
+    if hub.users.fetch_sub(1, Ordering::SeqCst) == 1 {
+        hubs.retain(|h| h.0 != id || !Arc::ptr_eq(&h.1, &hub));
+        let _ = hub.rec.stop();
     }
 }
 
 impl Drop for RecorderSource {
     fn drop(&mut self) {
-        // Under the registry lock, so a session opening right now cannot join a stopping hub.
-        let mut hubs = HUBS.lock().unwrap();
-        if self.hub.users.fetch_sub(1, Ordering::SeqCst) == 1 {
-            hubs.retain(|h| h.0 != self.id || !Arc::ptr_eq(&h.1, &self.hub));
-            let _ = self.hub.rec.stop();
-        }
+        let hub = self.hub.clone();
+        release(hub, self.id);
     }
 }
 
-/// BGRA/RGBA → I420 at (dw, dh), nearest-neighbour scaled (BT.601 limited range).
 /// BGRA/RGBA → I420 at `dw`×`dh` (BT.601, limited range). Scaling averages every source
 /// pixel a destination pixel covers (an area filter) — picking one of them instead, as
 /// before, dropped thin text strokes and left the rest jagged. Chroma is the 2×2 average.

@@ -192,24 +192,30 @@ impl Core {
         self.hosts.iter().any(|h| h.sid == Some(sid) && h.state == HostState::Live && h.perms.clipboard && (!files || h.perms.files))
     }
 
-    /// A clipboard batch arrived complete: put it on this computer's clipboard.
+    /// A clipboard batch arrived complete: put it on this computer's clipboard (off the UI
+    /// thread — decoding a big picture takes a while).
     pub(super) fn clip_received(&mut self, batch: &str) {
-        let Some(dir) = clip_dir(batch) else { return };
-        prune(&dir);
-        let Ok(mut c) = arboard::Clipboard::new() else { return };
-        quiet(2500);
-        if batch.starts_with("clip-img-") {
-            let Some(png) = std::fs::read_dir(&dir).ok().and_then(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).next()) else { return };
-            if let Ok(img) = image::open(&png) {
-                let rgba = img.to_rgba8();
-                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-                let _ = c.set_image(arboard::ImageData { width: w, height: h, bytes: rgba.into_raw().into() });
-            }
-        } else {
-            let entries: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
-            if !entries.is_empty() {
-                let _ = c.set().file_list(&entries);
-            }
+        let batch = batch.to_string();
+        std::thread::spawn(move || put_received(&batch));
+    }
+}
+
+fn put_received(batch: &str) {
+    let Some(dir) = clip_dir(batch) else { return };
+    prune(&dir);
+    let Ok(mut c) = arboard::Clipboard::new() else { return };
+    quiet(2500);
+    if batch.starts_with("clip-img-") {
+        let Some(png) = std::fs::read_dir(&dir).ok().and_then(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).next()) else { return };
+        if let Ok(img) = image::open(&png) {
+            let rgba = img.to_rgba8();
+            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+            let _ = c.set_image(arboard::ImageData { width: w, height: h, bytes: rgba.into_raw().into() });
+        }
+    } else {
+        let entries: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
+        if !entries.is_empty() {
+            let _ = c.set().file_list(&entries);
         }
     }
 }
