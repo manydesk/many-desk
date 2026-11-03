@@ -309,7 +309,7 @@ impl eframe::App for App {
         }
         if !self.update_started {
             self.update_started = true;
-            if self.core.store.autoupdate && !std::env::args().any(|a| a == "--background") {
+            if self.core.store.autoupdate && !cfg!(mobile) && !std::env::args().any(|a| a == "--background") {
                 self.check_update(false);
             }
         }
@@ -979,7 +979,9 @@ impl App {
     }
 
     fn page_share(&mut self, ui: &mut Ui) {
-        self.page_title(ui, "nav.share");
+        if !compact(ui.ctx()) {
+            self.page_title(ui, "nav.share");
+        }
         if cfg!(any(target_os = "macos", target_os = "android")) {
             let perms = self.core.perms;
             th::panel(ui, |ui| {
@@ -1472,7 +1474,10 @@ impl App {
     }
 
     fn page_settings(&mut self, ui: &mut Ui) {
-        self.page_title(ui, "nav.settings");
+        // a phone: the app bar already says where this is
+        if !compact(ui.ctx()) {
+            self.page_title(ui, "nav.settings");
+        }
         th::panel(ui, |ui| {
             th::h3(ui, &t("set.lang"));
             let mut choice = self.core.store.lang.clone();
@@ -1489,7 +1494,11 @@ impl App {
                 i18n::set(&choice);
             }
         });
-        self.startup_panel(ui);
+        // starting with the system and the self-update are a desktop's (a phone's app
+        // store updates the app)
+        if !cfg!(mobile) {
+            self.startup_panel(ui);
+        }
         self.security_panels(ui);
         th::panel(ui, |ui| {
             th::h3(ui, &t("diag.title"));
@@ -3202,8 +3211,8 @@ impl App {
         let Some(d) = self.fm_dialog.as_mut() else { return };
         let mut close = false;
         let mut submit = false;
-        let modal = egui::Modal::new(Id::unique("fm-dialog")).frame(egui::Frame::new().fill(th::SURFACE).stroke(Stroke::new(1.0, th::BORDER)).corner_radius(12).shadow(th::shadow_lg()).inner_margin(Margin::same(22))).show(ctx, |ui| {
-            ui.set_width(340.0);
+        let modal = dialog_modal(ctx, "fm-dialog").frame(egui::Frame::new().fill(th::SURFACE).stroke(Stroke::new(1.0, th::BORDER)).corner_radius(12).shadow(th::shadow_lg()).inner_margin(Margin::same(22))).show(ctx, |ui| {
+            ui.set_width(dialog_width(ui.ctx(), 340.0));
             let (title, name) = match d {
                 FmDialog::Mkdir { name, .. } => (t("fm.newFolder"), Some(name)),
                 FmDialog::Rename { name, .. } => (t("fm.rename"), Some(name)),
@@ -3638,18 +3647,39 @@ impl App {
             return;
         }
         let mut open = None;
-        egui::Area::new(Id::unique("toasts")).anchor(Align2::CENTER_TOP, Vec2::new(0.0, 104.0)).order(egui::Order::Tooltip).interactable(true).show(ctx, |ui| {
+        // A phone: Android's own toast look (AnyDesk mobile shows these) — a dark rounded
+        // pill low on the screen, above the navigation bar and the session's menu button,
+        // as wide as the text needs (long text wraps). A desktop: a bar under the title.
+        let narrow = compact(ctx);
+        let max_w = 520.0f32.min(ctx.content_rect().width() - 32.0);
+        #[cfg(mobile)]
+        let bottom = crate::phone::insets().1;
+        #[cfg(not(mobile))]
+        let bottom = 0.0;
+        let area = egui::Area::new(Id::unique("toasts")).order(egui::Order::Tooltip).interactable(true);
+        let area = if narrow {
+            area.anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -(bottom + if self.core.active.is_some() { 104.0 } else { 32.0 })))
+        } else {
+            area.anchor(Align2::CENTER_TOP, Vec2::new(0.0, 104.0))
+        };
+        area.show(ctx, |ui| {
+            ui.set_max_width(max_w);
             ui.vertical_centered(|ui| {
                 for toast in &self.core.toasts {
+                    let fill = match (toast.error, narrow) {
+                        (true, _) => th::DANGER,
+                        (false, true) => Color32::from_rgba_unmultiplied(40, 40, 40, 235),
+                        (false, false) => th::TOAST,
+                    };
                     egui::Frame::new()
-                        .fill(if toast.error { th::DANGER } else { th::TOAST })
-                        .corner_radius(8)
+                        .fill(fill)
+                        .corner_radius(if narrow { 22 } else { 8 })
                         .shadow(th::shadow_lg())
-                        .inner_margin(Margin::symmetric(16, 10))
+                        .inner_margin(if narrow { Margin::symmetric(18, 12) } else { Margin::symmetric(16, 10) })
                         .show(ui, |ui| {
-                            ui.set_max_width(520.0 - 32.0);
-                            ui.horizontal(|ui| {
-                                ui.label(text(&toast.text, 13.5, W::Regular, Color32::WHITE));
+                            ui.set_max_width(max_w - 36.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add(egui::Label::new(text(&toast.text, if narrow { 14.0 } else { 13.5 }, W::Regular, Color32::WHITE)).wrap());
                                 if let Some(p) = &toast.path {
                                     let link = ui.add(egui::Label::new(text(t("file.open"), 13.5, W::Semibold, Color32::WHITE).underline()).sense(Sense::click()));
                                     if link.clicked() {
@@ -3788,6 +3818,26 @@ struct Pip {
 /// the picture at about the stage's pixel size, give or take a pixel or two of rounding:
 /// stretching it by those would resample every pixel and blur all the text, so near 1:1
 /// it is drawn 1:1 — and always on whole pixels.
+/// A dialog: centered on a desktop; on a phone near the top, so the keyboard that comes up
+/// for its fields leaves them in sight (AnyDesk's dialogs move above the keyboard).
+pub fn dialog_modal(ctx: &egui::Context, name: &str) -> egui::Modal {
+    let id = Id::unique(name);
+    let modal = egui::Modal::new(id);
+    if !compact(ctx) {
+        return modal;
+    }
+    #[cfg(mobile)]
+    let top = crate::phone::insets().0 + 16.0;
+    #[cfg(not(mobile))]
+    let top = 16.0;
+    modal.area(egui::Modal::default_area(id.with("area")).anchor(Align2::CENTER_TOP, Vec2::new(0.0, top)))
+}
+
+/// A dialog's width: as asked, but inside a phone's screen.
+pub fn dialog_width(ctx: &egui::Context, want: f32) -> f32 {
+    want.min(ctx.content_rect().width() - 32.0 - 44.0)
+}
+
 /// The chat column: beside the session on a desktop, the whole width on a phone.
 fn chat_width(ctx: &egui::Context) -> f32 {
     if compact(ctx) {

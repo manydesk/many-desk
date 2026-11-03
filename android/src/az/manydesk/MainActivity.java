@@ -35,8 +35,21 @@ public class MainActivity extends NativeActivity {
         System.loadLibrary("manydesk");
     }
 
+    /** The UI's event loop (winit) can start only once per process. */
+    static boolean started;
+
     @Override
     protected void onCreate(Bundle state) {
+        if (started) {
+            // A new window for a process that outlived its old one (it kept a session or
+            // the screen sharing going): start over in a fresh process (RestartActivity).
+            super.onCreate(state);
+            startActivity(new Intent(this, RestartActivity.class).putExtra("pid", android.os.Process.myPid())
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
+            android.os.Process.killProcess(android.os.Process.myPid());
+            return;
+        }
+        started = true;
         Bridge.activity = this;
         reportDisplay();
         if (Build.VERSION.SDK_INT >= 33) {
@@ -56,6 +69,13 @@ public class MainActivity extends NativeActivity {
                     in.getSystemWindowInsetLeft(), in.getSystemWindowInsetRight());
             return v.onApplyWindowInsets(in);
         });
+    }
+
+    /** Back at the top level: ManyDesk goes to the background like AnyDesk does, and its
+     *  sessions keep going (finishing the window would end the UI for good, see started). */
+    @Override
+    public void onBackPressed() {
+        moveTaskToBack(true);
     }
 
     @Override

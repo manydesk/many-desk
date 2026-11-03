@@ -235,10 +235,10 @@ impl App {
         let Some(d) = self.act_dialog.as_mut() else { return };
         let mut close = false;
         let mut submit = false;
-        let modal = egui::Modal::new(Id::unique("act-dialog"))
+        let modal = super::dialog_modal(ctx, "act-dialog")
             .frame(egui::Frame::new().fill(th::SURFACE).stroke(Stroke::new(1.0, th::BORDER)).corner_radius(12).shadow(th::shadow_lg()).inner_margin(Margin::same(22)))
             .show(ctx, |ui| {
-                ui.set_width(380.0);
+                ui.set_width(super::dialog_width(ui.ctx(), 380.0));
                 match d {
                     ActDialog::Restart { .. } => {
                         th::h3(ui, &t("act.restart"));

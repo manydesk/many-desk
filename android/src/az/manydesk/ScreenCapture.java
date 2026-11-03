@@ -42,10 +42,10 @@ public class ScreenCapture extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int id) {
         NotificationManager nm = getSystemService(NotificationManager.class);
-        nm.createNotificationChannel(new NotificationChannel("share", "Screen sharing", NotificationManager.IMPORTANCE_LOW));
+        nm.createNotificationChannel(new NotificationChannel("share", Bridge.text("n.shareChannel", "Screen sharing"), NotificationManager.IMPORTANCE_LOW));
         Notification n = new Notification.Builder(this, "share")
                 .setContentTitle("ManyDesk")
-                .setContentText("Your screen is being shared")
+                .setContentText(Bridge.text("n.shareText", "Your screen is being shared"))
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setOngoing(true)
                 .build();

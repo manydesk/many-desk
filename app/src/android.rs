@@ -133,6 +133,19 @@ pub fn input_ready() -> bool {
     with_bridge(|env, c| env.call_static_method(c, "inputReady", "()Z", &[]).ok()?.z().ok()).unwrap_or(false)
 }
 
+/// The texts Android shows for ManyDesk (notifications), in the app's language.
+fn push_texts() {
+    let kv: Vec<String> = ["n.reqChannel", "n.reqText", "n.shareChannel", "n.shareText"].iter().flat_map(|k| [k.to_string(), crate::i18n::t(k)]).collect();
+    with_bridge(move |env, c| {
+        let arr = env.new_object_array(kv.len() as i32, "java/lang/String", JObject::null()).ok()?;
+        for (i, s) in kv.iter().enumerate() {
+            let js = env.new_string(s).ok()?;
+            env.set_object_array_element(&arr, i as i32, js).ok()?;
+        }
+        env.call_static_method(c, "setTexts", "([Ljava/lang/String;)V", &[JValue::Object(&arr)]).ok().map(|_| ())
+    });
+}
+
 /// Someone asks to connect: while ManyDesk is out of sight a notification says so (a tap
 /// opens the app with the request); gone once the request is answered. `None`: nothing waits.
 pub fn notify_request(name: Option<&str>) {
@@ -142,6 +155,7 @@ pub fn notify_request(name: Option<&str>) {
         return;
     }
     *shown = name.map(str::to_string);
+    push_texts();
     let name = name.map(str::to_string);
     with_bridge(move |env, c| {
         let s = match &name {
@@ -312,6 +326,7 @@ impl ScreenSource {
     pub fn open(_screen: Option<&Screen>) -> Result<Self, String> {
         let mut users = CAPTURE.users.lock().unwrap();
         if *users == 0 {
+            push_texts();
             with_bridge(|env, c| env.call_static_method(c, "startCapture", "()V", &[]).ok().map(|_| ()));
         }
         *users += 1;

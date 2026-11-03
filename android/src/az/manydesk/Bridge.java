@@ -16,6 +16,23 @@ public final class Bridge {
     static volatile MainActivity activity;
 
     static native void nativeDisplay(int width, int height, float density);
+
+    /** Texts the system shows for ManyDesk (notifications), in the app's language: set by
+     *  the Rust side (android.rs, push_texts) before they are needed. */
+    private static final java.util.HashMap<String, String> texts = new java.util.HashMap<>();
+
+    public static void setTexts(String[] kv) {
+        synchronized (texts) {
+            for (int i = 0; i + 1 < kv.length; i += 2) texts.put(kv[i], kv[i + 1]);
+        }
+    }
+
+    static String text(String key, String fallback) {
+        synchronized (texts) {
+            String s = texts.get(key);
+            return s == null || s.isEmpty() ? fallback : s;
+        }
+    }
     static native void nativeInsets(int top, int bottom, int left, int right);
 
     // ------------------------------------------------------------ clipboard ---
@@ -129,14 +146,14 @@ public final class Bridge {
             nm.cancel(2);
             return;
         }
-        nm.createNotificationChannel(new android.app.NotificationChannel("requests", "Connection requests",
+        nm.createNotificationChannel(new android.app.NotificationChannel("requests", text("n.reqChannel", "Connection requests"),
                 android.app.NotificationManager.IMPORTANCE_HIGH));
         Intent open = new Intent(a, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         android.app.PendingIntent pi = android.app.PendingIntent.getActivity(a, 0, open,
                 android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
         android.app.Notification n = new android.app.Notification.Builder(a, "requests")
                 .setContentTitle(name)
-                .setContentText("wants to connect to this phone — tap to answer")
+                .setContentText(text("n.reqText", "wants to connect to this phone — tap to answer"))
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .setCategory(android.app.Notification.CATEGORY_CALL)
                 .setContentIntent(pi)

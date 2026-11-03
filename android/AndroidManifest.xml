@@ -52,6 +52,15 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
+        <!-- Reopens ManyDesk in a fresh process (see MainActivity.started). -->
+        <activity
+            android:name=".RestartActivity"
+            android:process=":restart"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity="az.manydesk.restart"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <!-- Remote control of this phone: taps, swipes, keys and text from the viewer. -->
         <service
             android:name=".InputService"

@@ -381,7 +381,13 @@
    "mob.axOffHint": "Parametrlər → Əlçatanlıq → Quraşdırılmış tətbiqlər → «ManyDesk remote control»-u yandırın. Seçim bozdursa (Samsung, Xiaomi): Tətbiq məlumatı → ⋮ → «Məhdud parametrlərə icazə ver», sonra təkrar yandırın.",
    "mob.axOn": "Yandır",
    "mob.appInfo": "Tətbiq məlumatı",
-   "board.close": "Lövhəni bağla"
+   "board.close": "Lövhəni bağla",
+   "n.reqChannel": "Qoşulma sorğuları",
+   "n.reqText": "bu telefona qoşulmaq istəyir — cavab vermək üçün toxunun",
+   "n.shareChannel": "Ekran paylaşımı",
+   "n.shareText": "Ekranınız paylaşılır",
+   "toast.copied": "Kopyalandı",
+   "toast.saved": "Yadda saxlanıldı"
   },
   "en": {
    "home": "Home",
@@ -758,7 +764,13 @@
    "mob.axOffHint": "Settings → Accessibility → Installed apps → turn on “ManyDesk remote control”. Greyed out (Samsung, Xiaomi)? App info → ⋮ → “Allow restricted settings”, then turn it on again.",
    "mob.axOn": "Turn on",
    "mob.appInfo": "App info",
-   "board.close": "Close the whiteboard"
+   "board.close": "Close the whiteboard",
+   "n.reqChannel": "Connection requests",
+   "n.reqText": "wants to connect to this phone — tap to answer",
+   "n.shareChannel": "Screen sharing",
+   "n.shareText": "Your screen is being shared",
+   "toast.copied": "Copied",
+   "toast.saved": "Saved"
   },
   "ru": {
    "home": "Главная",
@@ -1135,7 +1147,13 @@
    "mob.axOffHint": "Настройки → Спец. возможности → Установленные приложения → включите «ManyDesk remote control». Пункт неактивен (Samsung, Xiaomi)? О приложении → ⋮ → «Разрешить ограниченные настройки», затем включите снова.",
    "mob.axOn": "Включить",
    "mob.appInfo": "О приложении",
-   "board.close": "Закрыть доску"
+   "board.close": "Закрыть доску",
+   "n.reqChannel": "Запросы на подключение",
+   "n.reqText": "хочет подключиться к этому телефону — нажмите, чтобы ответить",
+   "n.shareChannel": "Показ экрана",
+   "n.shareText": "Ваш экран транслируется",
+   "toast.copied": "Скопировано",
+   "toast.saved": "Сохранено"
   },
   "tr": {
    "home": "Ana sayfa",
@@ -1512,7 +1530,13 @@
    "mob.axOffHint": "Ayarlar → Erişilebilirlik → Yüklü uygulamalar → «ManyDesk remote control»ü açın. Gri mi (Samsung, Xiaomi)? Uygulama bilgisi → ⋮ → «Kısıtlı ayarlara izin ver», sonra tekrar açın.",
    "mob.axOn": "Aç",
    "mob.appInfo": "Uygulama bilgisi",
-   "board.close": "Tahtayı kapat"
+   "board.close": "Tahtayı kapat",
+   "n.reqChannel": "Bağlantı istekleri",
+   "n.reqText": "bu telefona bağlanmak istiyor — yanıtlamak için dokunun",
+   "n.shareChannel": "Ekran paylaşımı",
+   "n.shareText": "Ekranınız paylaşılıyor",
+   "toast.copied": "Kopyalandı",
+   "toast.saved": "Kaydedildi"
   }
  }
 }

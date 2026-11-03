@@ -1692,7 +1692,7 @@ impl Core {
                     self.sessions.lock().unwrap().remove(&sid);
                     if was_live {
                         let label = self.tabs[i].label.clone();
-                        self.toast(format!("{label}: {reason}"), false);
+                        self.toast(format!("{label}: {}", reason_text(&reason)), false);
                     }
                     if self.capture_tab == Some(self.tabs[i].key) {
                         self.set_capture(None);
