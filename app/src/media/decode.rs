@@ -1,13 +1,34 @@
 // Viewer video: H.264 access units → RGBA for the GPU texture. Hardware first —
-// VideoToolbox (macOS), Media Foundation with DXVA (Windows), VA-API through GStreamer
-// (Linux) — and OpenH264 in software when there is none or it keeps failing.
+// VideoToolbox (macOS, iOS), Media Foundation with DXVA (Windows), VA-API through
+// GStreamer (Linux) — and OpenH264 in software when there is none or it keeps failing
+// (and on Android, for now).
 use openh264::decoder::Decoder as H264Decoder;
 use openh264::formats::YUVSource;
 
 #[cfg(target_os = "linux")]
 use super::gstdec::GstDecoder as HwDecoder;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use super::vtdec::VtDecoder as HwDecoder;
+#[cfg(target_os = "android")]
+use NoHardware as HwDecoder;
+
+/// Android: no hardware path yet (MediaCodec), OpenH264 does it.
+#[cfg(target_os = "android")]
+struct NoHardware;
+
+#[cfg(target_os = "android")]
+impl NoHardware {
+    fn new() -> Result<Self, String> {
+        Err("not on Android yet".into())
+    }
+    fn name(&self) -> &'static str {
+        "none"
+    }
+    fn reset(&mut self) {}
+    fn decode(&mut self, _au: &[u8]) -> Result<Option<(&[u8], usize, usize)>, String> {
+        Err("none".into())
+    }
+}
 #[cfg(windows)]
 use super::windec::MfDecoder as HwDecoder;
 

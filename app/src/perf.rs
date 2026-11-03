@@ -77,6 +77,17 @@ pub fn stamp(side: &str, seq: u32) {
 // worth a log line. With MANYDESK_STALLDUMP=<dir> it also samples the process during the
 // stall (macOS `sample`), so the main thread's stack shows what it was stuck in.
 
+/// Startup steps with the time since the first one (MANYDESK_PERF), once each.
+pub fn startup(step: &'static str) {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let t0 = *T0.get_or_init(std::time::Instant::now);
+    if std::env::var_os("MANYDESK_PERF").is_none() || SEEN.lock().map(|mut s| s.contains(&step) || { s.push(step); false }).unwrap_or(true) {
+        return;
+    }
+    eprintln!("[startup] {step} after {} ms", t0.elapsed().as_millis());
+}
+
 static BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -85,6 +96,12 @@ fn now_ms() -> u64 {
 
 pub fn beat() {
     BEAT.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long since the UI thread last ran the app (ms).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn since_beat_ms() -> u64 {
+    now_ms().saturating_sub(BEAT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// What the UI thread is doing now, named in stall reports ("os" = outside our code:
@@ -108,7 +125,9 @@ pub fn start_watchdog() {
         .name("watchdog".into())
         .spawn(move || {
             // An idle UI thread draws nothing and doesn't beat, so the watchdog wakes it
-            // (a repaint request) and only counts it stuck when that goes unanswered.
+            // (a repaint request) and only counts it stuck when that goes unanswered. Only
+            // after 2 s without a frame: waking it more often kept idle windows repainting
+            // ten times a second (battery on phones).
             let mut asked: Option<u64> = None; // oldest wake-up not answered yet
             let mut reported = false;
             #[cfg_attr(not(target_os = "macos"), allow(unused))]
@@ -151,7 +170,7 @@ pub fn start_watchdog() {
                         seen.push(p);
                     }
                 }
-                if asked.is_none() {
+                if asked.is_none() && now.saturating_sub(last) >= 2000 {
                     asked = Some(now);
                     crate::bus::wake();
                 }

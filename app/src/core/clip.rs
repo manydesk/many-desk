@@ -4,7 +4,7 @@
 // (Ctrl+V / Cmd+V then pastes them there). Text stays on the control stream ("clip").
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::*;
@@ -13,15 +13,28 @@ use super::*;
 const MAX_FILES_BYTES: u64 = 256 << 20;
 const MAX_FILES: usize = 2000;
 /// A picture bigger than this (RGBA) is not sent.
+#[cfg_attr(mobile, allow(dead_code))] // pictures and files: desktops only
 const MAX_IMAGE_BYTES: usize = 64 << 20;
 
 /// Set by the core: some live session shares the clipboard (pictures and files are only
 /// looked at then — reading a big picture every poll is not free).
 pub static CLIP_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Until this time (ms since 1970) clipboard changes are ours (set from the other side)
-/// and are not sent back.
+/// and are not sent back — only where the clipboard has no change count (Linux, pictures
+/// and files; text is told apart by OURS.text).
+#[cfg_attr(any(mobile, target_os = "macos", windows), allow(dead_code))]
 static QUIET_UNTIL: AtomicU64 = AtomicU64::new(0);
 
+/// What this side put on the clipboard itself, from the other side: the watcher does not
+/// send it back. `seq`: the clipboard's change count right after (macOS, Windows).
+struct Ours {
+    text: Option<String>,
+    seq: Option<u64>,
+}
+
+static OURS: Mutex<Ours> = Mutex::new(Ours { text: None, seq: None });
+
+#[cfg_attr(any(mobile, target_os = "macos", windows), allow(dead_code))]
 fn quiet(ms: u64) {
     QUIET_UNTIL.store(rv::now_ms() as u64 + ms, Ordering::SeqCst);
 }
@@ -30,10 +43,50 @@ fn is_quiet() -> bool {
     (rv::now_ms() as u64) < QUIET_UNTIL.load(Ordering::SeqCst)
 }
 
+/// The clipboard's change count: it is read only after a change. Polling the contents
+/// themselves keeps the clipboard open on Windows, where another app's copy or paste then
+/// fails now and then, and on macOS reading it counts as a paste.
+#[cfg(target_os = "macos")]
+fn change_count() -> Option<u64> {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    objc2::rc::autoreleasepool(|_| {
+        let class = AnyClass::get(c"NSPasteboard")?;
+        let pb: *mut AnyObject = unsafe { msg_send![class, generalPasteboard] };
+        if pb.is_null() {
+            return None;
+        }
+        let n: isize = unsafe { msg_send![pb, changeCount] };
+        Some(n as u64)
+    })
+}
+
+#[cfg(windows)]
+fn change_count() -> Option<u64> {
+    // 0: no access to this desktop's clipboard (then the contents are polled)
+    let n = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    (n != 0).then_some(n as u64)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn change_count() -> Option<u64> {
+    None
+}
+
+#[cfg(mobile)]
 pub fn set_text(text: &str) {
+    let mut ours = OURS.lock().unwrap();
+    crate::phone::set_clipboard_text(text);
+    ours.text = Some(text.to_string());
+}
+
+#[cfg(not(mobile))]
+pub fn set_text(text: &str) {
+    let mut ours = OURS.lock().unwrap();
     if let Ok(mut c) = arboard::Clipboard::new() {
-        quiet(1500);
-        let _ = c.set_text(text.to_string());
+        if c.set_text(text.to_string()).is_ok() {
+            *ours = Ours { text: Some(text.to_string()), seq: change_count() };
+        }
     }
 }
 
@@ -53,6 +106,7 @@ pub fn clip_dir(batch: &str) -> Option<PathBuf> {
 }
 
 /// Keeps the three newest received batches, removes the rest.
+#[cfg_attr(mobile, allow(dead_code))] // pictures and files: desktops only
 fn prune(keep: &Path) {
     let Ok(rd) = std::fs::read_dir(clip_root()) else { return };
     let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = rd.filter_map(|e| e.ok()).filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).filter(|(_, p)| p != keep).collect();
@@ -63,21 +117,54 @@ fn prune(keep: &Path) {
     }
 }
 
-/// Polls the clipboard (no portable change notification) and reports changes.
+/// Phones: text only (android.rs: ClipboardManager, ios.rs: UIPasteboard).
+#[cfg(mobile)]
+pub fn start_watch() {
+    std::thread::Builder::new()
+        .name("clipboard".into())
+        .spawn(|| {
+            let mut last = crate::phone::clipboard_text().unwrap_or_default();
+            loop {
+                std::thread::sleep(Duration::from_millis(700));
+                let Some(t) = crate::phone::clipboard_text() else { continue };
+                if t != last {
+                    last = t.clone();
+                    if OURS.lock().unwrap().text.as_ref() != Some(&t) {
+                        bus::emit("clip", json!({ "text": t }));
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+/// Watches the clipboard (no portable change notification): its change count where there
+/// is one, else the contents, and reports changes.
+#[cfg(not(mobile))]
 pub fn start_watch() {
     std::thread::Builder::new()
         .name("clipboard".into())
         .spawn(|| {
             let Ok(mut c) = arboard::Clipboard::new() else { return };
+            let mut seen = change_count();
             let mut last_text = c.get_text().unwrap_or_default();
             let mut last_files: Vec<PathBuf> = c.get().file_list().unwrap_or_default();
             let mut last_img: Option<u64> = None;
             let mut tick = 0u32;
             loop {
-                std::thread::sleep(Duration::from_millis(700));
+                std::thread::sleep(Duration::from_millis(500));
                 tick += 1;
-                let quiet = is_quiet();
                 let active = CLIP_ACTIVE.load(Ordering::Relaxed);
+                let now = change_count();
+                if now.is_some() && now == seen {
+                    continue;
+                }
+                seen = now;
+                let (ours_text, echo) = {
+                    let ours = OURS.lock().unwrap();
+                    (ours.text.clone(), now.is_some() && ours.seq == now)
+                };
+                let quiet = echo || is_quiet();
                 // files first: a copied file also puts its name on the clipboard as text
                 let files = if active { c.get().file_list().unwrap_or_default() } else { Vec::new() };
                 if !files.is_empty() {
@@ -96,14 +183,14 @@ pub fn start_watch() {
                     if t != last_text {
                         last_text = t.clone();
                         last_img = None;
-                        if !quiet {
+                        if !echo && ours_text.as_ref() != Some(&t) {
                             bus::emit("clip", json!({ "text": t }));
                         }
                     }
                     continue;
                 }
-                // a picture: looked at every ~2 s
-                if !active || tick % 3 != 0 {
+                // a picture: after a change, or (no change count) every ~1.5 s
+                if !active || (now.is_none() && tick % 3 != 0) {
                     continue;
                 }
                 let Ok(img) = c.get_image() else { continue };
@@ -126,6 +213,7 @@ pub fn start_watch() {
 }
 
 /// A cheap fingerprint: size and a sample of the pixels.
+#[cfg_attr(mobile, allow(dead_code))] // pictures and files: desktops only
 fn signature(w: usize, h: usize, px: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hs = std::collections::hash_map::DefaultHasher::new();
@@ -200,22 +288,34 @@ impl Core {
     }
 }
 
+#[cfg(mobile)]
+fn put_received(_batch: &str) {}
+
+#[cfg(not(mobile))]
 fn put_received(batch: &str) {
     let Some(dir) = clip_dir(batch) else { return };
     prune(&dir);
     let Ok(mut c) = arboard::Clipboard::new() else { return };
-    quiet(2500);
-    if batch.starts_with("clip-img-") {
+    // decoded before taking OURS: the watcher waits on it
+    let img = if batch.starts_with("clip-img-") {
         let Some(png) = std::fs::read_dir(&dir).ok().and_then(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).next()) else { return };
-        if let Ok(img) = image::open(&png) {
-            let rgba = img.to_rgba8();
-            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-            let _ = c.set_image(arboard::ImageData { width: w, height: h, bytes: rgba.into_raw().into() });
-        }
+        let Ok(img) = image::open(&png) else { return };
+        Some(img.to_rgba8())
+    } else {
+        None
+    };
+    let mut ours = OURS.lock().unwrap();
+    let set = if let Some(rgba) = img {
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        c.set_image(arboard::ImageData { width: w, height: h, bytes: rgba.into_raw().into() }).is_ok()
     } else {
         let entries: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
-        if !entries.is_empty() {
-            let _ = c.set().file_list(&entries);
+        !entries.is_empty() && c.set().file_list(&entries).is_ok()
+    };
+    if set {
+        *ours = Ours { text: None, seq: change_count() };
+        if ours.seq.is_none() {
+            quiet(2500);
         }
     }
 }

@@ -129,6 +129,7 @@ mac() {
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>Voice chat with the other side of a session.</string>
+  <key>NSCameraUsageDescription</key><string>Show your camera to the other side of a session when you turn it on.</string>
   <key>NSScreenCaptureUsageDescription</key><string>Show this screen to the people you let connect.</string>
 </dict></plist>
 EOF

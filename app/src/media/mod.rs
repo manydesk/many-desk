@@ -1,4 +1,5 @@
 // Native media: screen capture, H.264 encoding (host) and decoding (viewer).
+pub mod camera;
 pub mod capture;
 pub mod decode;
 pub mod encode;
@@ -6,7 +7,7 @@ pub mod encode;
 pub mod mac;
 #[cfg(windows)]
 mod win;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod vtdec;
 #[cfg(windows)]
 mod windec;

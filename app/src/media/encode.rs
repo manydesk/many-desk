@@ -330,7 +330,7 @@ impl Video {
                     .usage_type(UsageType::ScreenContentRealTime)
                     .rate_control_mode(RateControlMode::Bitrate)
                     .skip_frames(true)
-                    .intra_frame_period(IntraFramePeriod::from_num_frames((p.fps * 60.0) as u32));
+                    .intra_frame_period(IntraFramePeriod::from_num_frames((p.fps * KEY_EVERY_SECS) as u32));
                 match Encoder::with_api_config(OpenH264API::from_source(), cfg) {
                     Ok(e) => enc = Some((H264::Open(e), p, dw, dh)),
                     Err(e) => {
@@ -392,6 +392,12 @@ impl Video {
 }
 
 /// The screen counts as still after this long without a change.
+/// A keyframe at least this often (seconds), whatever happens: lost frames bring one on
+/// request, this one heals what nobody noticed (a decoder that hid an error, a frame lost
+/// on the way to it) — the picture is never wrong for longer. A full-screen keyframe of
+/// text is ~2 MB, so not much more often.
+pub const KEY_EVERY_SECS: f64 = 30.0;
+
 const STILL: Duration = Duration::from_millis(300);
 /// Encoder passes over a still picture (software/Media Foundation path).
 const REFINE_PASSES: u8 = 2;

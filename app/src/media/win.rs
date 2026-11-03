@@ -110,7 +110,7 @@ impl MfEncoder {
                 let _ = c.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32));
                 let _ = c.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
                 let _ = c.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &variant_u32(0));
-                let _ = c.SetValue(&CODECAPI_AVEncMPVGOPSize, &variant_u32((fps * 60.0) as u32));
+                let _ = c.SetValue(&CODECAPI_AVEncMPVGOPSize, &variant_u32((fps * crate::media::encode::KEY_EVERY_SECS) as u32));
             }
 
             let info = mft.GetOutputStreamInfo(0)?;

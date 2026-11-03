@@ -169,18 +169,34 @@ impl App {
         if !board.on {
             return false;
         }
-        // the colour chips, top right of the stage
-        let mut chip = Pos2::new(stage.right() - 14.0 - BOARD_COLORS.len() as f32 * 26.0, stage.top() + 12.0);
+        // the colour chips and the close chip, top right of the stage (on a phone a bit
+        // larger and left of the corner)
+        let big = super::compact(ui.ctx());
+        let (size, step) = if big { (34.0, 40.0) } else { (22.0, 26.0) };
+        let mut chip = Pos2::new(stage.right() - 14.0 - (BOARD_COLORS.len() + 1) as f32 * step, stage.top() + 12.0);
         let mut over_chips = false;
         for (n, c) in BOARD_COLORS.iter().enumerate() {
-            let r = Rect::from_min_size(chip, Vec2::splat(22.0));
+            let r = Rect::from_min_size(chip, Vec2::splat(size));
             let hit = ui.interact(r, Id::unique(("board-c", key, n)), Sense::click());
-            over_chips |= hit.hovered();
-            painter.circle(r.center(), 9.0, Color32::from_rgb(c[0], c[1], c[2]), Stroke::new(if board.color == n { 3.0 } else { 1.5 }, Color32::WHITE));
+            over_chips |= hit.hovered() || hit.is_pointer_button_down_on();
+            painter.circle(r.center(), size * 0.41, Color32::from_rgb(c[0], c[1], c[2]), Stroke::new(if board.color == n { 3.0 } else { 1.5 }, Color32::WHITE));
             if hit.clicked() {
                 board.color = n;
             }
-            chip.x += 26.0;
+            chip.x += step;
+        }
+        let r = Rect::from_min_size(chip, Vec2::splat(size));
+        let hit = ui.interact(r, Id::unique(("board-x", key)), Sense::click()).on_hover_text(t("board.close"));
+        over_chips |= hit.hovered() || hit.is_pointer_button_down_on();
+        painter.circle(r.center(), size * 0.45, th::SURFACE, Stroke::new(1.5, th::BORDER));
+        let k = size * 0.17;
+        for (a, b) in [(Vec2::new(-k, -k), Vec2::new(k, k)), (Vec2::new(-k, k), Vec2::new(k, -k))] {
+            painter.line_segment([r.center() + a, r.center() + b], Stroke::new(2.0, th::TEXT));
+        }
+        if hit.clicked() {
+            board.on = false;
+            board.cur = None;
+            return false;
         }
         ui.ctx().set_cursor_icon(if over_chips { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Crosshair });
         let norm = |p: Pos2| (((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0), ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0));

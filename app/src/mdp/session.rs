@@ -6,6 +6,8 @@
 //   uni stream per video frame (host → viewer): [key u8][ts u32][seq u32] + Annex-B H.264
 //   datagram [1] (viewer → host): keyframe request
 //   datagram [2] + Opus packet (both ways): voice, 20 ms per packet
+//   uni stream per camera frame (both ways): [0x10 | key][ts u32][seq u32] + Annex-B H.264
+//   datagram [3]: keyframe request for the camera picture
 //
 // Each frame gets its own stream, so a lost packet only delays that frame; once a newer
 // keyframe exists, older frames still in flight are reset instead of delivered late.
@@ -32,6 +34,9 @@ const CH_FILE: u8 = b'f';
 const CH_TUNNEL: u8 = b't';
 const DGRAM_KEYFRAME: u8 = 1;
 const DGRAM_AUDIO: u8 = 2;
+const DGRAM_CAM_KEY: u8 = 3;
+/// First byte of a uni stream: this frame is the camera picture, not the screen.
+const UNI_CAMERA: u8 = 0x10;
 
 #[derive(Deserialize, Clone)]
 pub struct Peer {
@@ -49,6 +54,8 @@ pub enum Media {
     File(Vec<u8>),
     /// one Opus packet
     Audio(Vec<u8>),
+    /// Annex-B H.264 access unit of the other side's camera (in order, gaps skipped)
+    Camera { key: bool, data: Vec<u8> },
 }
 
 pub type OnEvent = Arc<dyn Fn(Value) + Send + Sync>;
@@ -90,6 +97,13 @@ pub struct Session {
     /// host: the viewer draws the pointer itself (position/shape on the control stream)
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     cursor_apart: AtomicBool,
+    /// host: the viewer may show its camera here (the Camera permission)
+    camera_ok: AtomicBool,
+    /// our camera: sequence of the last frame sent, and "the other side wants a keyframe"
+    cam_seq: AtomicU32,
+    cam_key: Arc<AtomicBool>,
+    /// the other side's camera: next sequence number expected, last keyframe request
+    cam_rx: Mutex<(Option<u32>, Option<Instant>)>,
 }
 
 impl Session {
@@ -343,24 +357,37 @@ fn start_video_sender(me: Arc<Session>, conn: quinn::Connection, video: Arc<Vide
 
 // ---- viewer: frames back in order; gaps resolved by jumping to a keyframe ----
 
-fn start_video_receiver(me: Arc<Session>, conn: quinn::Connection) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, bool, u32, Vec<u8>)>();
-    let c = conn.clone();
+type FrameTx = tokio::sync::mpsc::UnboundedSender<(u32, bool, u32, Vec<u8>)>;
+
+/// Both sides: uni streams from the other side — screen frames (viewer, to `video`) and
+/// camera frames.
+fn start_uni_receiver(me: Arc<Session>, conn: quinn::Connection, video: Option<FrameTx>) {
     crate::rt::spawn(async move {
-        while let Ok(mut s) = c.accept_uni().await {
-            let tx = tx.clone();
+        while let Ok(mut s) = conn.accept_uni().await {
+            let (tx, me) = (video.clone(), me.clone());
             crate::rt::spawn(async move {
                 let mut head = [0u8; 9];
                 if s.read_exact(&mut head).await.is_err() {
                     return;
                 }
-                let Ok(data) = s.read_to_end(32 << 20).await else { return };
+                let camera = head[0] & UNI_CAMERA != 0;
+                let Ok(data) = s.read_to_end(if camera { 4 << 20 } else { 32 << 20 }).await else { return };
                 let ts = u32::from_be_bytes(head[1..5].try_into().unwrap());
                 let seq = u32::from_be_bytes(head[5..9].try_into().unwrap());
-                let _ = tx.send((seq, head[0] == 1, ts, data));
+                let key = head[0] & 1 == 1;
+                if camera {
+                    me.camera_in(seq, key, data);
+                } else if let Some(tx) = tx {
+                    let _ = tx.send((seq, key, ts, data));
+                }
             });
         }
     });
+}
+
+fn start_video_receiver(me: Arc<Session>, conn: quinn::Connection) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u32, bool, u32, Vec<u8>)>();
+    start_uni_receiver(me.clone(), conn.clone(), Some(tx));
     crate::rt::spawn(async move {
         let mut next: Option<u32> = None; // next sequence number to deliver
         let mut waiting: BTreeMap<u32, (bool, u32, Vec<u8>)> = BTreeMap::new();
@@ -505,7 +532,9 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
     if me.host && !me.hold.load(Ordering::SeqCst) {
         me.start_sending();
     }
-    if !me.host {
+    if me.host {
+        start_uni_receiver(me.clone(), conn.clone(), None);
+    } else {
         start_video_receiver(me.clone(), conn.clone());
     }
     let (c, rx_me) = (conn.clone(), me.clone());
@@ -523,6 +552,7 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
                     }
                 }
                 Some(&DGRAM_AUDIO) => (rx_me.media)(Media::Audio(d[1..].to_vec())),
+                Some(&DGRAM_CAM_KEY) => rx_me.cam_key.store(true, Ordering::Relaxed),
                 _ => {}
             }
         }
@@ -532,6 +562,7 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
     let watch = me.clone();
     crate::rt::spawn(async move {
         let reason = conn.closed().await;
+        eprintln!("[session] connection ended: {reason}");
         let r = match reason {
             quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed => "bye",
             quinn::ConnectionError::TimedOut => "lost",
@@ -596,6 +627,10 @@ impl Session {
             frames_in: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             cursor_apart: AtomicBool::new(false),
+            camera_ok: AtomicBool::new(false),
+            cam_seq: AtomicU32::new(0),
+            cam_key: Arc::new(AtomicBool::new(false)),
+            cam_rx: Mutex::new((None, None)),
         });
         Ok((s, out))
     }
@@ -789,6 +824,73 @@ impl Session {
             d.push(DGRAM_AUDIO);
             d.extend_from_slice(opus);
             let _ = c.send_datagram(Bytes::from(d));
+        }
+    }
+
+    /// Host: whether the viewer may show its camera here.
+    pub fn allow_camera(&self, on: bool) {
+        self.camera_ok.store(on, Ordering::SeqCst);
+    }
+
+    /// Set when the other side asks for a keyframe of our camera (the encoder clears it).
+    pub fn camera_keyframe(&self) -> Arc<AtomicBool> {
+        self.cam_key.clone()
+    }
+
+    /// One encoded frame of our camera, on a uni stream of its own. Small and frequent:
+    /// a frame not delivered within a second is given up (a keyframe follows on request).
+    pub fn send_camera(&self, f: EncodedFrame) {
+        let Some(conn) = self.conn() else { return };
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let seq = self.cam_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        crate::rt::spawn(async move {
+            let Ok(mut s) = conn.open_uni().await else { return };
+            let mut head = [0u8; 9];
+            head[0] = UNI_CAMERA | f.key as u8;
+            head[5..9].copy_from_slice(&seq.to_be_bytes());
+            let send = async {
+                if s.write_all(&head).await.is_ok() && s.write_all(&f.data).await.is_ok() {
+                    let _ = s.finish();
+                    let _ = s.stopped().await;
+                }
+            };
+            let wait = if f.key { Duration::from_secs(5) } else { Duration::from_secs(1) };
+            if tokio::time::timeout(wait, send).await.is_err() {
+                let _ = s.reset(0u32.into());
+            }
+        });
+    }
+
+    /// A camera frame from the other side: delivered in order; after a gap, deltas wait
+    /// for the next keyframe (asked for at most every 300 ms).
+    fn camera_in(&self, seq: u32, key: bool, data: Vec<u8>) {
+        if self.host && !self.camera_ok.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut rx = self.cam_rx.lock().unwrap();
+        if !key && rx.0 != Some(seq) {
+            // a late frame from before the one just shown: nothing lost
+            if rx.0.is_some_and(|n| seq < n && n - seq < 1000) {
+                return;
+            }
+            rx.0 = None;
+            if rx.1.is_none_or(|t| t.elapsed() > Duration::from_millis(300)) {
+                rx.1 = Some(Instant::now());
+                self.request_camera_keyframe();
+            }
+            return;
+        }
+        rx.0 = Some(seq.wrapping_add(1));
+        drop(rx);
+        (self.media)(Media::Camera { key, data });
+    }
+
+    /// The camera decoder lost sync: ask the other side for a keyframe.
+    pub fn request_camera_keyframe(&self) {
+        if let Some(c) = self.conn() {
+            let _ = c.send_datagram(Bytes::from_static(&[DGRAM_CAM_KEY]));
         }
     }
 

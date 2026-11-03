@@ -30,17 +30,19 @@ pub struct Permissions {
     pub restart: bool,
     pub privacy: bool,
     pub tunnel: bool,
+    /// either side may show its camera (the other side sees it in a small window)
+    pub camera: bool,
 }
 
 impl Default for Permissions {
     fn default() -> Self {
-        Permissions { control: true, clipboard: true, files: true, sound: true, restart: false, privacy: false, tunnel: false }
+        Permissions { control: true, clipboard: true, files: true, sound: true, restart: false, privacy: false, tunnel: false, camera: true }
     }
 }
 
 impl Permissions {
-    pub const NONE: Permissions = Permissions { control: false, clipboard: false, files: false, sound: false, restart: false, privacy: false, tunnel: false };
-    pub const FULL: Permissions = Permissions { control: true, clipboard: true, files: true, sound: true, restart: true, privacy: true, tunnel: true };
+    pub const NONE: Permissions = Permissions { control: false, clipboard: false, files: false, sound: false, restart: false, privacy: false, tunnel: false, camera: false };
+    pub const FULL: Permissions = Permissions { control: true, clipboard: true, files: true, sound: true, restart: true, privacy: true, tunnel: true, camera: true };
 }
 
 /// Unattended access: a password (only a key derived from it is kept) and optionally a
@@ -93,6 +95,8 @@ pub struct Store {
     pub turn: TurnCfg,
     /// check for a newer ManyDesk on startup (and offer to install it)
     pub autoupdate: bool,
+    /// phones: a finger moves the pointer like a touchpad (off: it works where it touches)
+    pub touchpad: bool,
 }
 
 /// TURN relay settings (Settings → TURN), as in the web build.
@@ -145,6 +149,7 @@ impl Default for Store {
             recent: Vec::new(),
             turn: TurnCfg { provider: "cloudflare".into(), ..Default::default() },
             autoupdate: true,
+            touchpad: true,
         }
     }
 }
@@ -226,6 +231,14 @@ impl Store {
 
 /// Where received files go.
 pub fn downloads() -> PathBuf {
+    // Android: Download/ManyDesk in the shared storage (the app's own folder without access)
+    #[cfg(target_os = "android")]
+    {
+        let dir = crate::android::shared_storage().map(|p| p.join("Download").join("ManyDesk")).unwrap_or_else(|| std::env::temp_dir().join("received"));
+        let _ = std::fs::create_dir_all(&dir);
+        return dir;
+    }
+    #[allow(unreachable_code)]
     directories::UserDirs::new()
         .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
         .unwrap_or_else(std::env::temp_dir)

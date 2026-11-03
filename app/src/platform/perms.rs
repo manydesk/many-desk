@@ -1,5 +1,5 @@
-// OS permissions a host needs: screen recording and input control (macOS asks for both;
-// Windows and Linux/X11 need nothing).
+// OS permissions a host needs: screen recording and input control (macOS asks for both,
+// Android for control; Windows and Linux/X11 need nothing).
 #[cfg(target_os = "macos")]
 mod mac {
     #[link(name = "ApplicationServices", kind = "framework")]
@@ -24,7 +24,11 @@ pub fn status() -> Perms {
     unsafe {
         Perms { screen: mac::CGPreflightScreenCaptureAccess(), input: mac::AXIsProcessTrusted() }
     }
-    #[cfg(not(target_os = "macos"))]
+    // Android: the screen is asked for when a session starts (MediaProjection); control
+    // needs the accessibility service on.
+    #[cfg(target_os = "android")]
+    return Perms { screen: true, input: crate::android::input_ready() };
+    #[cfg(not(any(target_os = "macos", target_os = "android")))]
     Perms { screen: true, input: true }
 }
 
@@ -39,6 +43,10 @@ pub fn request(screen: bool) {
             "Privacy_Accessibility"
         };
         let _ = std::process::Command::new("open").arg(format!("x-apple.systempreferences:com.apple.preference.security?{anchor}")).spawn();
+    }
+    #[cfg(target_os = "android")]
+    if !screen {
+        crate::android::open_input_settings();
     }
     let _ = screen;
 }

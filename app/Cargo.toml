@@ -1,11 +1,11 @@
 [package]
 name = "manydesk"
-version = "0.14.5"
+version = "0.15.0"
 edition = "2021"
 description = "ManyDesk — native remote desktop (egui UI, MDP transport)"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wayland", "x11"] }
 egui = "0.37"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
 serde = { version = "1", features = ["derive"] }
@@ -24,7 +24,6 @@ aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 flate2 = "1"
 base64 = "0.22"
-arboard = { version = "3", default-features = false, features = ["image-data"] }
 sys-locale = "0.3"
 gethostname = "0.5"
 directories = "6"
@@ -34,14 +33,39 @@ rcgen = "0.13"
 if-addrs = "0.13"
 bytes = "1"
 openh264 = "0.9"
-xcap = "0.9"
-rfd = "0.15"
 resvg = { version = "0.45", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cpal = "0.18"
 audiopus_sys = { version = "0.2", features = ["static"] }
 qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Desktop only: screen capture, file dialogs and the clipboard (the phones have their own,
+# see src/android.rs and src/ios.rs).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# "clipboard": egui's text fields, Copy/Paste events and copy_text use the system clipboard
+eframe = { version = "0.37", default-features = false, features = ["clipboard"] }
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+xcap = "0.9"
+rfd = "0.15"
+
+# OpenGL everywhere but iOS, which has Metal only (wgpu).
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["android-native-activity"] }
+winit = { version = "0.30", features = ["android-native-activity"] }
+jni = "0.21"
+libc = "0.2"
+ndk-context = "0.1"
+android_logger = "0.14"
+log = "0.4"
 
 [build-dependencies]
 winresource = "0.1"
@@ -57,7 +81,7 @@ dispatch2 = "0.3"
 block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_System_Shutdown", "Win32_System_Services", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_System_Environment", "Win32_System_LibraryLoader", "Win32_System_StationsAndDesktops", "Win32_Security", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_System_Shutdown", "Win32_System_Services", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_System_Environment", "Win32_System_LibraryLoader", "Win32_System_StationsAndDesktops", "Win32_Security", "Win32_Foundation", "Win32_System_DataExchange"] }
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

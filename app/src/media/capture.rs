@@ -3,7 +3,9 @@
 //  Linux/Wayland: the desktop portal (PipeWire) through xcap's recorder.
 //  macOS / Windows: xcap's recorder (AVFoundation / DXGI) for now.
 use std::io::Cursor;
+#[cfg(not(mobile))]
 use std::sync::atomic::Ordering;
+#[cfg(not(mobile))]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,7 +56,16 @@ pub fn screens(thumbs: bool) -> Vec<Screen> {
             return list;
         }
     }
+    #[cfg(mobile)]
+    let _ = thumbs;
+    #[cfg(target_os = "android")]
+    return crate::android::screens();
+    // iOS lets no app capture the whole screen (only a ReplayKit broadcast extension).
+    #[cfg(target_os = "ios")]
+    return vec![];
+    #[cfg(not(mobile))]
     let Ok(monitors) = xcap::Monitor::all() else { return vec![] };
+    #[cfg(not(mobile))]
     monitors
         .iter()
         .filter_map(|m| {
@@ -132,7 +143,10 @@ fn thumb_url(img: image::RgbaImage) -> String {
 pub enum Source {
     #[cfg(target_os = "linux")]
     X11(X11Source),
+    #[cfg(not(mobile))]
     Recorder(RecorderSource),
+    #[cfg(target_os = "android")]
+    Android(crate::android::ScreenSource),
     Synth(SynthSource),
 }
 
@@ -145,6 +159,11 @@ impl Source {
         if !wayland() {
             return X11Source::open(screen).map(Source::X11);
         }
+        #[cfg(target_os = "android")]
+        return crate::android::ScreenSource::open(screen).map(Source::Android);
+        #[cfg(target_os = "ios")]
+        return Err("iOS cannot share its screen".into());
+        #[cfg(not(mobile))]
         RecorderSource::open(screen).map(Source::Recorder)
     }
 
@@ -153,7 +172,10 @@ impl Source {
         match self {
             #[cfg(target_os = "linux")]
             Source::X11(s) => s.grab(),
+            #[cfg(not(mobile))]
             Source::Recorder(s) => s.grab(wait),
+            #[cfg(target_os = "android")]
+            Source::Android(s) => s.grab(wait),
             Source::Synth(s) => s.grab(),
         }
     }
@@ -343,6 +365,7 @@ impl Drop for X11Source {
 
 /// One xcap recorder per monitor, shared by every session that shows it: Windows allows a
 /// single desktop duplication per output, and on Wayland each recorder is a portal prompt.
+#[cfg(not(mobile))]
 struct Hub {
     rec: xcap::VideoRecorder,
     latest: std::sync::Mutex<(u64, Option<Arc<xcap::Frame>>)>,
@@ -351,11 +374,15 @@ struct Hub {
 }
 
 // xcap's recorder handle only signals its worker thread.
+#[cfg(not(mobile))]
 unsafe impl Send for Hub {}
+#[cfg(not(mobile))]
 unsafe impl Sync for Hub {}
 
+#[cfg(not(mobile))]
 static HUBS: std::sync::Mutex<Vec<(u32, Arc<Hub>)>> = std::sync::Mutex::new(Vec::new());
 
+#[cfg(not(mobile))]
 impl Hub {
     fn start(m: &xcap::Monitor) -> Result<Arc<Hub>, String> {
         let (rec, rx) = m.video_recorder().map_err(|e| e.to_string())?;
@@ -380,12 +407,14 @@ impl Hub {
     }
 }
 
+#[cfg(not(mobile))]
 fn monitor(id: Option<u32>) -> Result<xcap::Monitor, String> {
     let monitors = xcap::Monitor::all().map_err(|e| e.to_string())?;
     let i = id.and_then(|id| monitors.iter().position(|m| m.id().ok() == Some(id))).unwrap_or(0);
     monitors.into_iter().nth(i).ok_or_else(|| "no monitor".into())
 }
 
+#[cfg(not(mobile))]
 pub struct RecorderSource {
     hub: Arc<Hub>,
     id: u32,
@@ -400,6 +429,7 @@ pub struct RecorderSource {
     backoff: Duration,
 }
 
+#[cfg(not(mobile))]
 impl RecorderSource {
     fn open(screen: Option<&Screen>) -> Result<Self, String> {
         let m = monitor(screen.map(|s| s.id))?;
@@ -486,10 +516,12 @@ impl RecorderSource {
 }
 
 /// How long without a frame before the recorder is checked on.
+#[cfg(not(mobile))]
 const STALE: Duration = Duration::from_millis(1500);
 
 /// What a screenshot shows that the last recorded frame does not (a size change,
 /// or more than a few sampled pixels off — the two paths may round colours differently).
+#[cfg(not(mobile))]
 fn differs(f: &xcap::Frame, shot: &image::RgbaImage) -> Option<String> {
     if f.width != shot.width() || f.height != shot.height() {
         return Some(format!("size {}x{} -> {}x{}", f.width, f.height, shot.width(), shot.height()));
@@ -509,6 +541,7 @@ fn differs(f: &xcap::Frame, shot: &image::RgbaImage) -> Option<String> {
 }
 
 /// One user less; the last one stops the recorder.
+#[cfg(not(mobile))]
 fn release(hub: Arc<Hub>, id: u32) {
     // Under the registry lock, so a session opening right now cannot join a stopping hub.
     let mut hubs = HUBS.lock().unwrap();
@@ -518,6 +551,7 @@ fn release(hub: Arc<Hub>, id: u32) {
     }
 }
 
+#[cfg(not(mobile))]
 impl Drop for RecorderSource {
     fn drop(&mut self) {
         let hub = self.hub.clone();

@@ -47,8 +47,9 @@ pub fn exclude_from_capture(title: &str) -> bool {
     }
 }
 
-/// X11 has no capture exclusion; the overlay shows up in the shared picture there.
-#[cfg(target_os = "linux")]
+/// X11 has no capture exclusion; the overlay shows up in the shared picture there. The
+/// phones have one window only.
+#[cfg(any(target_os = "linux", mobile))]
 pub fn exclude_from_capture(_title: &str) -> bool {
     true
 }

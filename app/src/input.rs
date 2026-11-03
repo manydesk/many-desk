@@ -81,6 +81,8 @@ impl Input {
     }
 
     pub fn start(&self) {
+        #[cfg(mobile)]
+        return; // Android: the accessibility service does it (android.rs); iOS: no control
         #[cfg(target_os = "linux")]
         {
             let mut x = self.x11.lock().unwrap();
@@ -161,13 +163,21 @@ impl Input {
     }
 
     fn send(&self, cmd: &Value) {
-        #[cfg(target_os = "linux")]
-        if let Some(x) = self.x11.lock().unwrap().as_mut() {
-            x.handle(cmd);
-            return;
-        }
-        if let Some((_, tx)) = self.child.lock().unwrap().as_ref() {
-            let _ = tx.try_send(cmd.to_string());
+        #[cfg(target_os = "android")]
+        crate::android::inject(&cmd.to_string());
+        // iOS lets no app control the phone
+        #[cfg(target_os = "ios")]
+        let _ = cmd;
+        #[cfg(not(mobile))]
+        {
+            #[cfg(target_os = "linux")]
+            if let Some(x) = self.x11.lock().unwrap().as_mut() {
+                x.handle(cmd);
+                return;
+            }
+            if let Some((_, tx)) = self.child.lock().unwrap().as_ref() {
+                let _ = tx.try_send(cmd.to_string());
+            }
         }
     }
 
@@ -228,7 +238,10 @@ impl Input {
             "key" => {
                 let code = msg["code"].as_str().unwrap_or("");
                 let d = msg["d"].as_bool().unwrap_or(false);
-                if cfg!(windows) {
+                if cfg!(target_os = "android") {
+                    // mapped in AccessibilityService terms on the Java side (InputService)
+                    self.send(&json!({ "t": "key", "code": code, "d": d }));
+                } else if cfg!(windows) {
                     if let Some((k, e)) = keymap::win(code) {
                         self.send(&json!({ "t": "key", "k": k, "e": e, "d": d }));
                     }

@@ -90,6 +90,24 @@ fn candidates() -> [Vec<Face>; 5] {
         vec![f("C:\\Windows\\Fonts\\consola.ttf", None)],
         vec![f("C:\\Windows\\Fonts\\consolab.ttf", None), f("C:\\Windows\\Fonts\\consola.ttf", None)],
     ];
+    // Roboto is a variable font from Android 12 on; older phones have the static files.
+    #[cfg(target_os = "android")]
+    return [
+        vec![f("/system/fonts/Roboto-Regular.ttf", Some(400.0))],
+        vec![f("/system/fonts/Roboto-Regular.ttf", Some(500.0)), f("/system/fonts/Roboto-Medium.ttf", None)],
+        vec![f("/system/fonts/Roboto-Regular.ttf", Some(600.0)), f("/system/fonts/Roboto-Bold.ttf", None)],
+        vec![f("/system/fonts/DroidSansMono.ttf", None), f("/system/fonts/CutiveMono.ttf", None)],
+        vec![f("/system/fonts/DroidSansMono.ttf", None), f("/system/fonts/CutiveMono.ttf", None)],
+    ];
+    // iOS: the system fonts, where the sandbox lets them be read (egui's own otherwise)
+    #[cfg(target_os = "ios")]
+    return [
+        vec![f("/System/Library/Fonts/Core/SFUI.ttf", Some(400.0))],
+        vec![f("/System/Library/Fonts/Core/SFUI.ttf", Some(510.0))],
+        vec![f("/System/Library/Fonts/Core/SFUI.ttf", Some(590.0))],
+        vec![f("/System/Library/Fonts/Core/SFUIMono.ttf", Some(400.0))],
+        vec![f("/System/Library/Fonts/Core/SFUIMono.ttf", Some(600.0))],
+    ];
     #[cfg(target_os = "linux")]
     return [
         vec![
@@ -174,6 +192,16 @@ pub fn setup(ctx: &egui::Context) {
     fam(&mut fonts, FontFamily::Name("w600".into()), "ui600", FontFamily::Proportional);
     fam(&mut fonts, FontFamily::Monospace, "mono400", FontFamily::Monospace);
     fam(&mut fonts, FontFamily::Name("mono600".into()), "mono600", FontFamily::Monospace);
+    // Android's Roboto has no arrows and few symbols: Noto's symbol fonts behind every family
+    #[cfg(target_os = "android")]
+    for (n, path) in ["/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf", "/system/fonts/NotoSansSymbols-Regular-Subsetted2.ttf"].into_iter().enumerate() {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let name = format!("sym{n}");
+        fonts.font_data.insert(name.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+        for list in fonts.families.values_mut() {
+            list.push(name.clone());
+        }
+    }
     ctx.set_fonts(fonts);
 
     let mut style = (*ctx.global_style()).clone();

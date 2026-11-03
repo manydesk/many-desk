@@ -283,6 +283,11 @@ pub fn list_reply(rid: &str, path: &str) -> Value {
 }
 
 pub fn home() -> PathBuf {
+    // Android: the shared storage (Download, DCIM…) once "All files access" is on
+    #[cfg(target_os = "android")]
+    if let Some(p) = crate::android::shared_storage() {
+        return p;
+    }
     directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from("/"))
 }
 
@@ -296,7 +301,17 @@ pub fn roots() -> Vec<String> {
             out.push(d);
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    {
+        let home = home();
+        for p in [home.join("Download"), home.join("DCIM"), home.join("Documents"), crate::store::downloads()] {
+            let p = p.to_string_lossy().to_string();
+            if Path::new(&p).is_dir() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
     out.push("/".into());
     out
 }

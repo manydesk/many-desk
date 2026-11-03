@@ -82,5 +82,9 @@ fn open_path(p: &std::path::Path) -> Result<(), String> {
     let (cmd, args): (&str, Vec<&std::ffi::OsStr>) = ("cmd", vec!["/C".as_ref(), "start".as_ref(), "".as_ref(), p.as_os_str()]);
     #[cfg(target_os = "linux")]
     let (cmd, args): (&str, Vec<&std::ffi::OsStr>) = ("xdg-open", vec![p.as_os_str()]);
+    // phones update through their stores
+    #[cfg(mobile)]
+    return Err(format!("open {} by hand", p.display()));
+    #[cfg(not(mobile))]
     std::process::Command::new(cmd).args(args).spawn().map(|_| ()).map_err(|e| e.to_string())
 }

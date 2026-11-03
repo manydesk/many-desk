@@ -12,3 +12,6 @@ spike/ManyDeskGesture.app/
 
 # OS
 .DS_Store
+
+# Local Android signing key (scripts/build-android.sh makes one)
+android/debug.keystore

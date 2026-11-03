@@ -49,6 +49,10 @@ pub struct App {
     mac_local: bool,
     host_chat: Option<u32>,
     collapsed: HashSet<u32>,
+    /// host cards: when each went live, and the ones already folded by themselves (AnyDesk
+    /// folds its session window to a bar once the session runs; the user may unfold it)
+    host_live_at: HashMap<u32, Instant>,
+    auto_folded: HashSet<u32>,
     /// displays whose overlay window is already kept out of screen capture
     overlay_hidden: Vec<u32>,
     diag: DiagState,
@@ -72,6 +76,29 @@ pub struct App {
     /// started with --background: minimize on the first frame
     minimize_once: bool,
     update_started: bool,
+    /// A finger down on a remote screen (phones, see touch_gestures).
+    touch: Option<Touch>,
+    /// Phones: the soft keyboard is up for typing into a session (toolbar button).
+    soft_keyboard: bool,
+    /// Phones: the finger moves a pointer like a laptop's touchpad (AnyDesk's default);
+    /// off, a finger works where it touches.
+    touchpad: bool,
+    /// Phones: each session's pointer (0..1 of the remote screen) and the last tap (a tap
+    /// and then a press drags).
+    tp_cursor: HashMap<u32, Pos2>,
+    tp_last_tap: Option<Instant>,
+    /// Phones: each session's pinch zoom — the scale over "fit" and where the picture starts.
+    zoom: HashMap<u32, (f32, Pos2)>,
+    /// Phones: the session menu (the round button) is open, and where its buttons were drawn
+    /// (fingers there are not for the host).
+    fab_open: bool,
+    /// A Cmd/Ctrl+C/X/V press went to the remote side; its release goes too.
+    shortcut_down: bool,
+    fab_rects: Vec<Rect>,
+    /// The other side's camera window per session (size, folded), and where the camera
+    /// windows are this frame (the pointer there is not for the host).
+    pips: HashMap<u32, Pip>,
+    pip_rects: Vec<Rect>,
     /// Settings → startup: (starts with the system, service installed), looked up off the
     /// UI thread (Windows asks `reg` and the service manager), and when it was.
     startup: Arc<Mutex<(bool, bool)>>,
@@ -85,6 +112,7 @@ enum FmAct {
     Open(String),
     Click(usize, bool, bool),
     SelectAll,
+    SelectNone,
     Copy,
     Refresh,
     Mkdir,
@@ -125,7 +153,9 @@ fn mono(s: impl Into<String>, size: f32, w: W, color: Color32, spacing: f32) -> 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, rx: Receiver<Msg>) -> Self {
         bus::set_waker(cc.egui_ctx.clone());
+        crate::perf::startup("app");
         th::setup(&cc.egui_ctx);
+        crate::perf::startup("fonts");
         let mut core = Core::new();
         // Test hook: MANYDESK_AUTOCONNECT=<id> connects on start (headless tests).
         if let Ok(id) = std::env::var("MANYDESK_AUTOCONNECT") {
@@ -140,6 +170,7 @@ impl App {
             Ok("settings") => Page::Settings,
             _ => Page::Remote,
         };
+        let touchpad = core.store.touchpad;
         App {
             req_perms: core.store.perms,
             core,
@@ -155,6 +186,8 @@ impl App {
             mac_local: cfg!(target_os = "macos"),
             host_chat: None,
             collapsed: HashSet::new(),
+            host_live_at: HashMap::new(),
+            auto_folded: HashSet::new(),
             overlay_hidden: Vec::new(),
             diag: Default::default(),
             stun_text,
@@ -172,6 +205,17 @@ impl App {
             covered: Vec::new(),
             minimize_once: std::env::args().any(|a| a == "--background"),
             update_started: false,
+            touch: None,
+            soft_keyboard: false,
+            touchpad,
+            tp_cursor: HashMap::new(),
+            tp_last_tap: None,
+            zoom: HashMap::new(),
+            fab_open: false,
+            shortcut_down: false,
+            fab_rects: Vec::new(),
+            pips: HashMap::new(),
+            pip_rects: Vec::new(),
             startup: Default::default(),
             startup_checked: None,
             update: Default::default(),
@@ -186,7 +230,51 @@ impl eframe::App for App {
         [0.0; 4]
     }
 
+    /// Test hooks: MANYDESK_TESTCOPY=<text> copies it once the window is up (as "copy my
+    /// ID" does); MANYDESK_TESTPASTE=<text>, 6 s into a session: Cmd/Ctrl+V as the keyboard
+    /// gives it (Paste with the clipboard's text, then the V's release), then 1 s later the
+    /// release alone (a Cmd+V with files on the clipboard).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        static STEP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        static LIVE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        use std::sync::atomic::Ordering::SeqCst;
+        if ctx.cumulative_pass_nr() == 3 {
+            if let Ok(text) = std::env::var("MANYDESK_TESTCOPY") {
+                ctx.copy_text(text);
+            }
+            // MANYDESK_TESTCONNECT=<id>: connects; MANYDESK_TESTACCEPT=1: accepts every request
+            if let Ok(id) = std::env::var("MANYDESK_TESTCONNECT") {
+                self.core.connect(&id);
+            }
+        }
+        if self.core.pending.is_some() && std::env::var_os("MANYDESK_TESTACCEPT").is_some() {
+            let perms = self.core.store.unattended.perms;
+            self.core.decide(true, perms);
+        }
+        let Ok(text) = std::env::var("MANYDESK_TESTPASTE") else { return };
+        let Some(key) = self.core.tabs.iter().find(|t| t.state == TabState::Live && t.remote.control).map(|t| t.key) else { return };
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let since = LIVE.lock().unwrap().get_or_insert_with(Instant::now).elapsed();
+        let cmd = egui::Modifiers::COMMAND;
+        let up = egui::Event::Key { key: egui::Key::V, physical_key: Some(egui::Key::V), pressed: false, repeat: false, modifiers: cmd };
+        let step = STEP.load(SeqCst);
+        if step == 0 && since > Duration::from_secs(6) {
+            self.core.set_capture(Some(key));
+            raw.events.push(egui::Event::Paste(text));
+            STEP.store(1, SeqCst);
+        } else if step == 1 {
+            raw.events.push(up);
+            STEP.store(2, SeqCst);
+        } else if step == 2 && since > Duration::from_secs(7) {
+            raw.events.push(up);
+            eprintln!("[testpaste] done");
+            STEP.store(3, SeqCst);
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        let _turn = background::claim(self);
         crate::perf::beat();
         crate::perf::phase("logic");
         // Test hook: MANYDESK_MINIMIZE=1 minimizes the window once it is up (hidden host).
@@ -194,15 +282,8 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         crate::perf::phase("core.tick");
-        self.core.tick(&self.rx);
+        self.tick_core();
         crate::perf::phase("logic");
-        // Test hook: accept requests even while the window is hidden (no ui pass then).
-        if self.core.pending.is_some() && std::env::var_os("MANYDESK_AUTOACCEPT").is_some() {
-            // tests may ask for every permission (restart, privacy, tunnel included)
-            let perms = if std::env::var_os("MANYDESK_AUTOFULL").is_some() { crate::store::Permissions::FULL } else { self.req_perms };
-            self.core.decide(true, perms);
-        }
-        self.core.apply_isolation();
         // Keep ticking while sessions exist, also when the window is hidden (then eframe
         // runs only this, not ui()).
         if !self.core.tabs.is_empty() || !self.core.hosts.is_empty() || self.core.pending.is_some() {
@@ -212,9 +293,13 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "android")]
+        let _turn = background::claim(self);
         let ctx = ui.ctx().clone();
+        self.pip_rects.clear();
         crate::perf::tick("uiframe");
         crate::perf::phase("ui");
+        crate::perf::startup("first frame");
         if self.minimize_once {
             self.minimize_once = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -229,7 +314,24 @@ impl eframe::App for App {
             }
         }
         let active = self.core.active.filter(|k| self.core.tabs.iter().any(|t| t.key == *k));
-        if !(self.fullscreen && active.is_some()) {
+        // phones: keep clear of the status bar / notch and the navigation bar
+        #[cfg(mobile)]
+        {
+            let (top, bottom) = crate::phone::insets();
+            if top > 0.0 {
+                egui::Panel::top("safe-top").exact_size(top).frame(egui::Frame::new().fill(th::SURFACE)).show(ui, |_| {});
+            }
+            if bottom > 0.0 {
+                egui::Panel::bottom("safe-bottom").exact_size(bottom).frame(egui::Frame::new().fill(th::SURFACE)).show(ui, |_| {});
+            }
+        }
+        let narrow = compact(&ctx);
+        if narrow {
+            // a phone: an app bar at home, the whole screen for a session
+            if active.is_none() {
+                self.app_bar(ui);
+            }
+        } else if !(self.fullscreen && active.is_some()) {
             self.titlebar(ui);
         }
         // A host chat is a column of its own on the right (body.chat-open).
@@ -248,15 +350,32 @@ impl eframe::App for App {
         crate::perf::phase("ui.overlays");
         self.request_window(&ctx);
         self.host_stack(&ctx);
+        self.host_cameras(&ctx);
         self.pointer_overlay(&ctx);
         self.privacy_cover(&ctx);
         self.act_dialog(&ctx);
         self.toasts(&ctx);
+        #[cfg(mobile)]
+        crate::phone::sync_keyboard(ctx.egui_wants_keyboard_input() || (self.soft_keyboard && active.is_some()));
         crate::perf::phase("os");
     }
 }
 
 impl App {
+    /// The core's turn: events in, sessions forward (also from android's background tick).
+    fn tick_core(&mut self) {
+        self.core.tick(&self.rx);
+        // Test hook: accept requests even while the window is hidden (no ui pass then).
+        if self.core.pending.is_some() && std::env::var_os("MANYDESK_AUTOACCEPT").is_some() {
+            // tests may ask for every permission (restart, privacy, tunnel included)
+            let perms = if std::env::var_os("MANYDESK_AUTOFULL").is_some() { crate::store::Permissions::FULL } else { self.req_perms };
+            self.core.decide(true, perms);
+        }
+        self.core.apply_isolation();
+        #[cfg(target_os = "android")]
+        crate::android::notify_request(self.core.pending.as_ref().map(|r| r.name.as_str()));
+    }
+
     // ================================================================ title bar ===
 
     fn titlebar(&mut self, ui: &mut Ui) {
@@ -438,6 +557,22 @@ impl App {
     // ================================================================ home ===
 
     fn home(&mut self, ui: &mut Ui) {
+        // A phone (or a narrow window): one column under the app bar, AnyDesk's way.
+        if compact(ui.ctx()) {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(th::BG)).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    egui::Frame::new().inner_margin(Margin { left: 14, right: 14, top: 14, bottom: 32 }).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        match self.page {
+                            Page::Remote => self.mobile_home(ui),
+                            Page::Share => self.page_share(ui),
+                            Page::Settings => self.page_settings(ui),
+                        }
+                    });
+                });
+            });
+            return;
+        }
         egui::Panel::left("sidebar").exact_size(280.0).resizable(false).frame(egui::Frame::new().fill(th::SURFACE)).show(ui, |ui| {
             let r = ui.max_rect();
             ui.painter().vline(r.right() - 0.5, r.y_range(), Stroke::new(1.0, th::BORDER));
@@ -527,6 +662,136 @@ impl App {
         p.galley(Pos2::new(foot.left() + 18.0 + 22.0, foot.top() + 38.0), g, faint);
     }
 
+    /// Phones: the app bar — ManyDesk and settings at home; a way back and the page's name
+    /// elsewhere (AnyDesk's app has the same).
+    fn app_bar(&mut self, ui: &mut Ui) {
+        egui::Panel::top("app-bar").exact_size(56.0).frame(egui::Frame::new().fill(th::SURFACE).inner_margin(Margin::symmetric(8, 0))).show(ui, |ui| {
+            let r = ui.max_rect().expand2(Vec2::new(8.0, 0.0));
+            ui.painter().hline(r.x_range(), r.bottom() - 0.5, Stroke::new(1.0, th::BORDER));
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if self.page == Page::Remote {
+                    ui.add_space(6.0);
+                    let (lr, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+                    ui.painter().rect_filled(lr, 8.0, th::ACCENT);
+                    self.icons.paint(ui, "monitor", lr.shrink(6.0), Color32::WHITE);
+                    ui.label(text("ManyDesk", 18.0, W::Semibold, th::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if th::tbbtn(ui, &self.icons, "gear", false, false, &t("tt.settings")).clicked() {
+                            self.page = Page::Settings;
+                        }
+                        if th::tbbtn(ui, &self.icons, "share", false, false, &t("nav.share")).clicked() {
+                            self.page = Page::Share;
+                        }
+                    });
+                } else {
+                    if th::tbbtn(ui, &self.icons, "back", false, false, &t("home")).clicked() {
+                        self.page = Page::Remote;
+                    }
+                    let title = if self.page == Page::Share { t("nav.share") } else { t("nav.settings") };
+                    ui.label(text(title, 17.0, W::Semibold, th::TEXT));
+                }
+            });
+        });
+    }
+
+    /// Phones: this device's address, the remote address to connect to, the sessions open
+    /// now and the recent ones.
+    fn mobile_home(&mut self, ui: &mut Ui) {
+        let card = |ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)| {
+            egui::Frame::new().fill(th::SURFACE).stroke(Stroke::new(1.0, th::BORDER)).corner_radius(12).inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                add(ui);
+            });
+        };
+        // this device
+        let (n, _) = self.core.rv_status;
+        let id = self.core.store.my_id.clone();
+        let mut copy = false;
+        card(ui, &mut |ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
+                ui.label(text(t("desk.title"), 13.0, W::Semibold, th::MUTED));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(text(if n > 0 { t("mob.online") } else { t("rv.connecting") }, 12.0, W::Regular, th::MUTED));
+                    th::dot(ui, if n > 0 { th::OK } else { th::WARN });
+                });
+            });
+            ui.label(text(t("desk.sub"), 12.0, W::Regular, th::MUTED));
+            ui.horizontal(|ui| {
+                ui.label(mono(rv::format_id(&id), 28.0, W::Semibold, th::ACCENT, 1.5));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if th::tbbtn(ui, &self.icons, "copy", false, false, &t("tt.copy")).clicked() {
+                        copy = true;
+                    }
+                });
+            });
+        });
+        if copy {
+            ui.ctx().copy_text(id);
+            self.core.toast(t("toast.copied"), false);
+        }
+        // Android: nobody can control this phone until its accessibility service is on
+        if cfg!(target_os = "android") && !self.core.perms.input {
+            ui.add_space(12.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(0xff, 0xf8, 0xe6))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(0xf3, 0xd8, 0x92)))
+                .corner_radius(12)
+                .inner_margin(Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        self.icons.show(ui, "shield", 18.0, th::WARN);
+                        ui.label(text(t("mob.axOff"), 14.0, W::Semibold, Color32::from_rgb(0x6b, 0x4e, 0x00)));
+                    });
+                    ui.add_space(4.0);
+                    ui.label(text(t("mob.axOffHint"), 12.5, W::Regular, Color32::from_rgb(0x6b, 0x4e, 0x00)));
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let bw = (ui.available_width() - 8.0) / 2.0;
+                        if th::btn_sized(ui, &t("mob.axOn"), Btn::Primary, Some(bw)).clicked() {
+                            crate::platform::perms::request(false);
+                        }
+                        if th::btn_sized(ui, &t("mob.appInfo"), Btn::Normal, Some(bw)).clicked() {
+                            #[cfg(target_os = "android")]
+                            crate::android::open_app_info();
+                        }
+                    });
+                });
+        }
+        ui.add_space(12.0);
+        // the remote device
+        card(ui, &mut |ui| {
+            ui.label(text(t("nav.remote"), 13.0, W::Semibold, th::MUTED));
+            ui.add_space(8.0);
+            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 48.0), Sense::hover());
+            self.address_bar(ui, r);
+        });
+        // sessions open now (the tabs of a desktop)
+        let open: Vec<(u32, String, String, bool)> = self.core.tabs.iter().map(|t| (t.key, t.label.clone(), t.peer_id.clone(), t.state == TabState::Live)).collect();
+        if !open.is_empty() {
+            ui.add_space(18.0);
+            self.page_title(ui, "mob.open");
+            for (k, label, peer, live) in open {
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 56.0), Sense::click());
+                ui.painter().rect(r, 12.0, th::SURFACE, Stroke::new(1.0, th::BORDER), StrokeKind::Inside);
+                self.icons.paint(ui, "monitor", Rect::from_center_size(Pos2::new(r.left() + 24.0, r.center().y), Vec2::splat(22.0)), th::ACCENT);
+                ui.painter().text(Pos2::new(r.left() + 48.0, r.center().y - 2.0), Align2::LEFT_BOTTOM, label, th::font(14.5, W::Semibold), th::TEXT);
+                ui.painter().text(Pos2::new(r.left() + 48.0, r.center().y + 2.0), Align2::LEFT_TOP, rv::format_id(&peer), th::mono(12.0, W::Regular), th::MUTED);
+                ui.painter().circle_filled(Pos2::new(r.right() - 20.0, r.center().y), 5.0, if live { th::OK } else { th::WARN });
+                if resp.clicked() {
+                    self.core.active = Some(k);
+                }
+                ui.add_space(8.0);
+            }
+        }
+        ui.add_space(18.0);
+        self.page_title(ui, "recent.title");
+        self.recent_grid(ui);
+    }
+
     fn page_title(&self, ui: &mut Ui, key: &str) {
         ui.label(text(t(key), 19.0, W::Semibold, th::TEXT));
         ui.add_space(8.0);
@@ -571,8 +836,9 @@ impl App {
             p.text(Pos2::new(c.x, rect.top() + 124.0), Align2::CENTER_CENTER, t("recent.emptyHint"), th::font(13.5, W::Regular), th::MUTED);
             return;
         }
-        let gap = 16.0;
-        let cols = (((width + gap) / (210.0 + gap)).floor() as usize).max(1);
+        // a phone: two tiles a row, like AnyDesk's
+        let (gap, min_w) = if compact(ui.ctx()) { (10.0, 140.0) } else { (16.0, 210.0) };
+        let cols = (((width + gap) / (min_w + gap)).floor() as usize).max(1);
         let tw = (width - gap * (cols as f32 - 1.0)) / cols as f32;
         let th_h = tw * 10.0 / 16.0;
         let tile_h = th_h + 58.0;
@@ -714,7 +980,7 @@ impl App {
 
     fn page_share(&mut self, ui: &mut Ui) {
         self.page_title(ui, "nav.share");
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "android")) {
             let perms = self.core.perms;
             th::panel(ui, |ui| {
                 th::h3(ui, &t("perm.title"));
@@ -1298,7 +1564,7 @@ impl App {
     fn session_view(&mut self, ui: &mut Ui, key: u32) {
         let ctx = ui.ctx().clone();
         let Some(i) = self.core.tabs.iter().position(|t| t.key == key) else { return };
-        let fs = self.fullscreen;
+        let fs = self.fullscreen || compact(&ctx);
         if !fs {
             egui::Panel::top("toolbar").exact_size(TOOLBAR_H).frame(egui::Frame::new().fill(th::SURFACE).inner_margin(Margin::symmetric(10, 0))).show(ui, |ui| {
                 let r = ui.max_rect().expand2(Vec2::new(10.0, 0.0));
@@ -1308,7 +1574,7 @@ impl App {
         }
         if self.core.tabs[i].chat.open {
             let label = self.core.tabs[i].label.clone();
-            egui::Panel::right("chat").exact_size(CHAT_W).resizable(false).frame(egui::Frame::new().fill(th::SURFACE)).show(ui, |ui| {
+            egui::Panel::right("chat").exact_size(chat_width(&ctx)).resizable(false).frame(egui::Frame::new().fill(th::SURFACE)).show(ui, |ui| {
                 let (send, close) = chat_column(ui, &self.icons, &mut self.core.tabs[i].chat, &label);
                 if close {
                     self.core.tabs[i].chat.open = false;
@@ -1335,19 +1601,30 @@ impl App {
             self.upload_frame(&ctx, i, key);
             let tab = &self.core.tabs[i];
             if tab.state == TabState::Live && tab.fm.open {
-                self.file_manager(ui, stage, key);
+                // a phone: the menu button keeps a strip of its own under the file manager
+                let fm_stage = if compact(&ctx) { Rect::from_min_max(stage.min, Pos2::new(stage.right(), stage.bottom() - 84.0)) } else { stage };
+                self.file_manager(ui, fm_stage, key);
                 self.fs_toolbar(&ctx, stage, key);
+                self.session_fab(ui, stage, key);
                 return;
             }
             let tab = &self.core.tabs[i];
             if tab.state != TabState::Live || tab.texture.is_none() {
                 self.connecting_card(ui, stage, i, key);
+                // the camera does not need the screen (a host that can't capture it still has a face)
+                if self.core.tabs.get(i).is_some_and(|t| t.state == TabState::Live) {
+                    let peer = self.core.tabs[i].label.clone();
+                    self.camera_pip(&ctx, key, stage, &peer);
+                }
+                self.session_fab(ui, stage, key);
                 return;
             }
             let tex = tab.texture.clone().unwrap();
             let control = tab.remote.control;
             let capturing = self.core.capture_tab == Some(key);
             let resp = ui.allocate_rect(stage, Sense::click_and_drag());
+            let peer = self.core.tabs[i].label.clone();
+            self.camera_pip(&ctx, key, stage, &peer);
             let rect = match mode {
                 ViewMode::Fit => fit_rect(stage, tex.size_vec2(), ppp),
                 ViewMode::Stretch => stage,
@@ -1381,8 +1658,15 @@ impl App {
                     Rect::from_min_size(min.round(), size)
                 }
             };
+            // phones: the pinch zoom over "fit"
+            let rect = if cfg!(mobile) && mode == ViewMode::Fit { self.zoomed(key, stage, rect) } else { rect };
             let painter = ui.painter().with_clip_rect(stage);
             painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            // touchpad: the pointer the finger moves
+            if cfg!(mobile) && self.touchpad_for(key) && control {
+                let c = self.tp_cursor.get(&key).copied().unwrap_or(Pos2::new(0.5, 0.5));
+                paint_arrow(&painter, rect.min + Vec2::new(c.x * rect.width(), c.y * rect.height()));
+            }
             if std::env::var_os("MANYDESK_PERF").is_some() {
                 let (ts, rp) = (tex.size_vec2(), rect.size() * ppp);
                 let line = format!("[draw] texture {}x{} drawn as {:.2}x{:.2} px at ({:.2},{:.2}) px", ts.x, ts.y, rp.x, rp.y, rect.min.x * ppp, rect.min.y * ppp);
@@ -1426,7 +1710,7 @@ impl App {
                 th::dashed_rect(ui, r, th::ACCENT);
                 ui.painter().text(r.center(), Align2::CENTER_CENTER, t("sess.drop"), th::font(15.0, W::Regular), th::TEXT);
             }
-            if !capturing && control && !self.boards.get(&key).is_some_and(|b| b.on) {
+            if !capturing && control && !cfg!(mobile) && !self.boards.get(&key).is_some_and(|b| b.on) {
                 let g = ui.painter().layout_no_wrap(t("sess.click"), th::font(12.5, W::Regular), th::TEXT);
                 let hint = Rect::from_center_size(Pos2::new(stage.center().x, stage.bottom() - 20.0 - 16.0), Vec2::new(g.size().x + 28.0, 32.0));
                 ui.painter().add(th::shadow().as_shape(hint, CornerRadius::same(16)));
@@ -1435,11 +1719,16 @@ impl App {
             }
             if self.board(ui, &resp, key, rect, stage) {
                 self.fs_toolbar(&ctx, stage, key);
+                self.session_fab(ui, stage, key);
                 return;
             }
             if resp.clicked() && !capturing && control {
                 self.core.set_capture(Some(key));
                 return;
+            }
+            // a phone has no pointer to give back: fingers control the host right away
+            if cfg!(mobile) && !capturing && control {
+                self.core.set_capture(Some(key));
             }
             if capturing {
                 // The local pointer: a small dot that moves instantly (the remote arrow follows).
@@ -1450,6 +1739,7 @@ impl App {
                 self.forward_input(&ctx, key, rect, rect.intersect(stage));
             }
             self.fs_toolbar(&ctx, stage, key);
+            self.session_fab(ui, stage, key);
         });
     }
 
@@ -1648,10 +1938,13 @@ impl App {
         let (label, sas, stats, os, control, quality, live) =
             (tab.label.clone(), tab.sas.clone(), tab.stats.clone(), crate::core::os_name(&tab.os).to_string(), tab.remote.control, tab.quality, tab.state == TabState::Live);
         let (mic_on, remote_mic, unread, chat_open) = (tab.mic.is_some(), tab.remote_mic, tab.chat.unread, tab.chat.open);
+        let cam_on = tab.cams.mine.is_some();
         let (screens, cur_screen, view) = (tab.screens.clone(), tab.screen, tab.view);
         let (fm_open, fm_busy) = (tab.fm.open, tab.fm.transfers.iter().filter(|t| !t.finished).count());
         let (privacy_on, board_on) = (tab.privacy, self.boards.get(&key).is_some_and(|b| b.on));
-        ui.horizontal_centered(|ui| {
+        // a phone: the bar scrolls sideways, the name is in the tab already
+        let narrow = compact(ui.ctx());
+        let bar = |ui: &mut Ui| ui.horizontal_centered(|ui| {
             // .sess-name
             ui.spacing_mut().item_spacing.x = 8.0;
             if live {
@@ -1659,7 +1952,9 @@ impl App {
             } else {
                 th::dot(ui, th::WARN);
             }
-            ui.label(text(&label, 13.5, W::Semibold, th::TEXT));
+            if !narrow {
+                ui.label(text(&label, 13.5, W::Semibold, th::TEXT));
+            }
             if !sas.is_empty() {
                 pill(ui, th::mono(12.5, W::Semibold), 1.0, &sas, th::OK, th::OK_SOFT).on_hover_text(t("tt.sas"));
             }
@@ -1678,10 +1973,20 @@ impl App {
             if th::tbbtn(ui, &self.icons, "mic", mic_on, false, &t(if mic_on { "tt.micOn" } else { "tt.mic" })).clicked() && live {
                 self.core.set_mic(Some(key), None, !mic_on);
             }
+            if th::tbbtn(ui, &self.icons, "camera", cam_on, false, &t(if cam_on { "tt.camOn" } else { "tt.cam" })).clicked() && live {
+                self.core.set_camera(Some(key), None, !cam_on);
+            }
             let r = th::tbbtn(ui, &self.icons, "file", fm_open, false, &t("tt.fm"));
             th::badge(ui, r.rect, fm_busy);
             if r.clicked() && live {
                 self.core.fm_toggle(key);
+            }
+            // a phone has no keyboard until asked for: typing into the remote screen
+            if cfg!(mobile) && th::tbbtn(ui, &self.icons, "keyboard", self.soft_keyboard, false, &t("tt.keyboard")).clicked() && live {
+                self.soft_keyboard = !self.soft_keyboard;
+                if self.soft_keyboard {
+                    self.core.set_capture(Some(key));
+                }
             }
             // .tbselect
             ui.add_space(4.0);
@@ -1769,6 +2074,11 @@ impl App {
                 }
             });
         });
+        if narrow {
+            egui::ScrollArea::horizontal().id_salt(("toolbar", key)).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| bar(ui));
+        } else {
+            bar(ui);
+        }
     }
 
     /// Captured pointer and keys → the host (positions normalized to the remote screen).
@@ -1784,8 +2094,18 @@ impl App {
         let events = ctx.input(|i| i.events.clone());
         let mut moved = None;
         let mut out = Vec::new();
+        let touch = cfg!(mobile);
+        if touch {
+            // the whole stage takes fingers in touchpad mode (the pointer is where it is)
+            let area = if self.touchpad_for(key) { visible.union(ctx.content_rect()) } else { visible };
+            self.touch_gestures(ctx, &events, key, rect, area, &mut out);
+        }
         for ev in events {
             match ev {
+                // a finger: see touch_gestures
+                egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } if touch => {}
+                // the camera window floats over the picture
+                egui::Event::PointerMoved(p) | egui::Event::PointerButton { pos: p, pressed: true, .. } if self.pip_rects.iter().any(|r| r.contains(p)) => {}
                 egui::Event::PointerMoved(p) if visible.contains(p) => moved = Some(norm(p)),
                 egui::Event::PointerButton { pos, button, pressed, .. } if visible.contains(pos) => {
                     let b = match button {
@@ -1806,6 +2126,15 @@ impl App {
                     out.push(json!({ "t": "scroll", "dx": -delta.x * k, "dy": -delta.y * k }));
                 }
                 egui::Event::Key { key: k, modifiers, .. } if is_switch_keys(k, modifiers) => {}
+                // the release of a Cmd/Ctrl+C/X/V: its press came as Copy/Cut/Paste (below),
+                // or as nothing at all when the clipboard holds files
+                egui::Event::Key { key: k, physical_key, pressed: false, modifiers, .. } if matches!(physical_key.unwrap_or(k), egui::Key::C | egui::Key::X | egui::Key::V) && (self.shortcut_down || modifiers.command) => {
+                    let code = keys::code(physical_key.unwrap_or(k)).unwrap_or("KeyV");
+                    if !std::mem::take(&mut self.shortcut_down) {
+                        out.push(json!({ "t": "key", "code": code, "d": true }));
+                    }
+                    out.push(json!({ "t": "key", "code": code, "d": false }));
+                }
                 egui::Event::Text(s) if text_mode => out.push(json!({ "t": "text", "s": s })),
                 egui::Event::Key { key: k, physical_key, modifiers, .. } if text_mode && keys::code(physical_key.unwrap_or(k)).is_some_and(|c| types_text(c, modifiers, typed)) => {}
                 egui::Event::Key { key: k, physical_key, pressed, .. } => {
@@ -1814,25 +2143,418 @@ impl App {
                         out.push(json!({ "t": "key", "code": code, "d": pressed }));
                     }
                 }
-                egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => {
-                    let code = match ev {
-                        egui::Event::Copy => "KeyC",
-                        egui::Event::Cut => "KeyX",
-                        _ => "KeyV",
-                    };
-                    out.push(json!({ "t": "key", "code": code, "d": true }));
-                    out.push(json!({ "t": "key", "code": code, "d": false }));
+                // Cmd/Ctrl held is already over there; the key goes up with its release
+                egui::Event::Copy | egui::Event::Cut => {
+                    self.shortcut_down = true;
+                    out.push(json!({ "t": "key", "code": if matches!(ev, egui::Event::Copy) { "KeyC" } else { "KeyX" }, "d": true }));
+                }
+                // text copied here a moment ago: it goes first, so the other side pastes it
+                // and not what it had (the clipboard watcher would be up to 0.7 s late)
+                egui::Event::Paste(text) => {
+                    self.shortcut_down = true;
+                    self.core.paste(key, Some(&text), &mut out);
+                }
+                egui::Event::PasteImage(_) => {
+                    self.shortcut_down = true;
+                    self.core.paste(key, None, &mut out);
                 }
                 egui::Event::WindowFocused(false) => self.core.set_capture(None),
                 _ => {}
             }
         }
         if let Some((x, y)) = moved {
-            self.core.input(key, json!({ "t": "move", "x": x, "y": y }));
+            out.insert(0, json!({ "t": "move", "x": x, "y": y }));
         }
-        for m in out {
-            self.core.input(key, m);
+        self.core.input_many(key, out);
+    }
+
+    /// A finger on the remote screen, played as a mouse. Touchpad mode (AnyDesk's default):
+    /// the finger moves the pointer, a tap clicks where it is, a tap and then a press drags.
+    /// Touch mode: a tap clicks under the finger, a drag drags. Both: holding still is a right
+    /// click, two fingers scroll — or zoom and pan the picture.
+    fn touch_gestures(&mut self, ctx: &egui::Context, events: &[egui::Event], key: u32, rect: Rect, area: Rect, out: &mut Vec<serde_json::Value>) {
+        const SLOP: f32 = 10.0;
+        let norm = |p: Pos2| (((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0), ((p.y - rect.top()) / rect.height()).clamp(0.0, 1.0));
+        let btn = |t: &str, b: i32, (x, y): (f32, f32)| json!({ "t": t, "b": b, "c": 1, "x": x, "y": y });
+        let mv = |(x, y): (f32, f32)| json!({ "t": "move", "x": x, "y": y });
+        let touchpad = self.touchpad_for(key);
+        // a phone over there: a long press is a long press, not a right click (its "back")
+        let phone = self.remote_is_phone(key);
+        let fab: Vec<Rect> = self.fab_rects.iter().chain(&self.pip_rects).copied().collect();
+        let mut cur = self.tp_cursor.get(&key).copied().unwrap_or(Pos2::new(0.5, 0.5));
+        let at_cur = |c: Pos2| (c.x, c.y);
+        for ev in events {
+            match ev {
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } if area.contains(*pos) && !fab.iter().any(|r| r.contains(*pos)) => {
+                    let hold = touchpad && self.tp_last_tap.is_some_and(|t| t.elapsed() < Duration::from_millis(350));
+                    self.touch = Some(Touch { start: *pos, last: *pos, at: Instant::now(), dragging: false, done: false, hold, down_sent: false });
+                }
+                egui::Event::PointerMoved(p) => {
+                    let Some(t) = self.touch.as_mut() else { continue };
+                    let prev = t.last;
+                    t.last = *p;
+                    if t.done {
+                        continue;
+                    }
+                    if !t.dragging && t.start.distance(*p) > SLOP {
+                        t.dragging = true;
+                        if !touchpad {
+                            if !t.down_sent {
+                                out.push(mv(norm(t.start)));
+                                out.push(btn("down", 0, norm(t.start)));
+                            }
+                        } else if t.hold {
+                            out.push(mv(at_cur(cur)));
+                            out.push(btn("down", 0, at_cur(cur)));
+                            t.down_sent = true;
+                        }
+                    }
+                    if t.dragging {
+                        if touchpad {
+                            let d = *p - prev;
+                            cur.x = (cur.x + d.x * TP_SPEED / rect.width()).clamp(0.0, 1.0);
+                            cur.y = (cur.y + d.y * TP_SPEED / rect.height()).clamp(0.0, 1.0);
+                            out.push(mv(at_cur(cur)));
+                        } else {
+                            out.push(mv(norm(*p)));
+                        }
+                    }
+                }
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
+                    let Some(t) = self.touch.take() else { continue };
+                    if touchpad {
+                        if t.down_sent {
+                            out.push(btn("up", 0, at_cur(cur)));
+                        } else if !t.dragging && !t.done {
+                            out.push(mv(at_cur(cur)));
+                            out.push(btn("down", 0, at_cur(cur)));
+                            out.push(btn("up", 0, at_cur(cur)));
+                            self.tp_last_tap = Some(Instant::now());
+                        }
+                    } else if t.dragging || t.down_sent {
+                        out.push(btn("up", 0, norm(*pos)));
+                    } else if !t.done {
+                        out.push(mv(norm(t.start)));
+                        out.push(btn("down", 0, norm(t.start)));
+                        out.push(btn("up", 0, norm(t.start)));
+                    }
+                }
+                _ => {}
+            }
         }
+        // two fingers: zoom (pinch) and pan the picture once zoomed, else scroll
+        if let Some(m) = ctx.multi_touch().filter(|m| m.num_touches >= 2) {
+            if let Some(t) = self.touch.as_mut() {
+                if (!touchpad && t.dragging) || t.down_sent {
+                    out.push(btn("up", 0, if touchpad { at_cur(cur) } else { norm(t.last) }));
+                }
+                t.dragging = false;
+                t.down_sent = false;
+                t.done = true;
+            }
+            let (z, min) = self.zoom.get(&key).copied().unwrap_or((1.0, rect.min));
+            if (m.zoom_delta - 1.0).abs() > 0.003 {
+                let nz = (z * m.zoom_delta).clamp(1.0, 6.0);
+                let k = nz / z;
+                self.zoom.insert(key, (nz, m.center_pos - (m.center_pos - rect.min) * k));
+            } else if z > 1.01 {
+                self.zoom.insert(key, (z, min + m.translation_delta));
+            } else if m.translation_delta != Vec2::ZERO {
+                let d = m.translation_delta;
+                out.push(json!({ "t": "scroll", "dx": -d.x * 2.0, "dy": -d.y * 2.0 }));
+            }
+            ctx.request_repaint();
+        }
+        // held still: a right click
+        if let Some(t) = self.touch.as_mut().filter(|t| !t.dragging && !t.done) {
+            if t.at.elapsed() > Duration::from_millis(550) && phone && !touchpad {
+                // held down until the finger lifts (and dragged if it moves)
+                t.dragging = true;
+                t.down_sent = true;
+                out.push(mv(norm(t.start)));
+                out.push(btn("down", 0, norm(t.start)));
+            } else if t.at.elapsed() > Duration::from_millis(550) {
+                t.done = true;
+                let p = if touchpad { at_cur(cur) } else { norm(t.start) };
+                out.push(mv(p));
+                out.push(btn("down", 2, p));
+                out.push(btn("up", 2, p));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
+        // zoomed in: the picture follows the pointer
+        if touchpad {
+            if let Some((z, min)) = self.zoom.get(&key).copied().filter(|z| z.0 > 1.01) {
+                let p = rect.min + Vec2::new(cur.x * rect.width(), cur.y * rect.height());
+                let inner = area.shrink(40.0);
+                let shift = Vec2::new(
+                    if p.x < inner.left() { inner.left() - p.x } else if p.x > inner.right() { inner.right() - p.x } else { 0.0 },
+                    if p.y < inner.top() { inner.top() - p.y } else if p.y > inner.bottom() { inner.bottom() - p.y } else { 0.0 },
+                );
+                if shift != Vec2::ZERO {
+                    self.zoom.insert(key, (z, min + shift));
+                    ctx.request_repaint();
+                }
+            }
+        }
+        self.tp_cursor.insert(key, cur);
+    }
+
+    /// Whether the other side is a phone (Android): it is touched, not pointed at.
+    fn remote_is_phone(&self, key: u32) -> bool {
+        self.core.tabs.iter().find(|t| t.key == key).is_some_and(|t| matches!(t.os.as_str(), "android" | "ios"))
+    }
+
+    /// Touchpad mode for session `key`: the setting, but a phone over there is always touched
+    /// directly (a pointer means nothing on it).
+    fn touchpad_for(&self, key: u32) -> bool {
+        self.touchpad && !self.remote_is_phone(key)
+    }
+
+    /// The picture under a pinch zoom: `fit` scaled by the session's zoom, kept on the stage.
+    fn zoomed(&mut self, key: u32, stage: Rect, fit: Rect) -> Rect {
+        let Some((z, min)) = self.zoom.get(&key).copied() else { return fit };
+        if z <= 1.001 {
+            self.zoom.remove(&key);
+            return fit;
+        }
+        let size = fit.size() * z;
+        let axis = |min: f32, len: f32, lo: f32, hi: f32| if len <= hi - lo { (lo + hi - len) / 2.0 } else { min.clamp(hi - len, lo) };
+        let min = Pos2::new(axis(min.x, size.x, stage.left(), stage.right()), axis(min.y, size.y, stage.top(), stage.bottom()));
+        self.zoom.insert(key, (z, min));
+        Rect::from_min_size(min, size)
+    }
+
+    /// Phones: the session's round menu button (AnyDesk's), bottom right, and its buttons
+    /// above it when open — keyboard, files, chat, the pointer mode, actions, home, end.
+    fn session_fab(&mut self, ui: &mut Ui, stage: Rect, key: u32) {
+        if !compact(ui.ctx()) {
+            return;
+        }
+        self.fab_rects.clear();
+        let c = Pos2::new(stage.right() - 40.0, stage.bottom() - 48.0);
+        let main = Rect::from_center_size(c, Vec2::splat(56.0));
+        let p = ui.painter().clone();
+        let mut items: Vec<(&'static str, String, bool)> = Vec::new();
+        if self.fab_open {
+            let (fm_open, chat_open, live) = self.core.tabs.iter().find(|t| t.key == key).map(|t| (t.fm.open, t.chat.open, t.state == TabState::Live)).unwrap_or((false, false, false));
+            let (mic_on, cam_on) = self.core.tabs.iter().find(|t| t.key == key).map(|t| (t.mic.is_some(), t.cams.mine.is_some())).unwrap_or((false, false));
+            items.push(("power", t("tt.disconnect"), false));
+            items.push(("home", t("home"), false));
+            if live {
+                items.push(("more", t("tt.actions"), false));
+                items.push(("chat", t("tt.chat"), chat_open));
+                items.push(("file", t("tt.fm"), fm_open));
+                items.push(("mic", t(if mic_on { "tt.micOn" } else { "tt.mic" }), mic_on));
+                items.push(("camera", t(if cam_on { "tt.camOn" } else { "tt.cam" }), cam_on));
+                if !self.remote_is_phone(key) {
+                    items.push(("mouse", t(if self.touchpad { "mob.touchpad" } else { "mob.touch" }), self.touchpad));
+                }
+                items.push(("keyboard", t("tt.keyboard"), self.soft_keyboard));
+            }
+            // dim the session behind the menu
+            p.rect_filled(stage, 0.0, Color32::from_black_alpha(90));
+        }
+        let mut clicked: Option<&'static str> = None;
+        let mut more_resp: Option<egui::Response> = None;
+        // as many above the button as fit (a phone turned sideways has little height), the
+        // rest in columns further left, each as wide as the widest label needs
+        let per_col = (((c.y - 66.0 - (stage.top() + 28.0)) / 56.0).floor() as usize + 1).max(1);
+        let widest = items.iter().map(|(_, l, _)| p.layout_no_wrap(l.clone(), th::font(13.0, W::Medium), th::TEXT).size().x).fold(0.0, f32::max);
+        let col_w = widest + 20.0 + 12.0 + 44.0 + 16.0;
+        for (n, (icon, label, on)) in items.iter().enumerate() {
+            let bc = Pos2::new(c.x - (n / per_col) as f32 * col_w, c.y - 66.0 - (n % per_col) as f32 * 56.0);
+            let b = Rect::from_center_size(bc, Vec2::splat(44.0));
+            let resp = ui.interact(b, Id::unique(("fab-item", key, n)), Sense::click());
+            p.add(th::shadow().as_shape(b, CornerRadius::same(22)));
+            p.circle_filled(bc, 22.0, if *on { th::ACCENT } else if *icon == "power" { th::DANGER } else { th::SURFACE });
+            self.icons.paint(ui, icon, Rect::from_center_size(bc, Vec2::splat(20.0)), if *on || *icon == "power" { Color32::WHITE } else { th::TEXT });
+            let g = p.layout_no_wrap(label.clone(), th::font(13.0, W::Medium), th::TEXT);
+            let lr = Rect::from_min_size(Pos2::new(b.left() - 12.0 - g.size().x - 20.0, bc.y - 14.0), Vec2::new(g.size().x + 20.0, 28.0));
+            p.rect_filled(lr, 14.0, th::SURFACE);
+            p.galley(Pos2::new(lr.left() + 10.0, bc.y - g.size().y / 2.0), g, th::TEXT);
+            let lresp = ui.interact(lr, Id::unique(("fab-label", key, n)), Sense::click());
+            self.fab_rects.push(b.union(lr));
+            if resp.clicked() || lresp.clicked() {
+                clicked = Some(icon);
+            }
+            if *icon == "more" {
+                more_resp = Some(resp.union(lresp));
+            }
+        }
+        let resp = ui.interact(main, Id::unique(("fab", key)), Sense::click());
+        p.add(th::shadow_lg().as_shape(main, CornerRadius::same(28)));
+        p.circle_filled(c, 28.0, th::ACCENT);
+        self.icons.paint(ui, if self.fab_open { "x" } else { "monitor" }, Rect::from_center_size(c, Vec2::splat(24.0)), Color32::WHITE);
+        self.fab_rects.push(main);
+        if self.fab_open {
+            self.fab_rects.push(stage); // the dimmed stage closes the menu
+        }
+        if let Some(r) = &more_resp {
+            egui::Popup::menu(r).show(|ui| self.actions_menu(ui, key));
+        }
+        if resp.clicked() {
+            self.fab_open = !self.fab_open;
+        } else if self.fab_open && clicked.is_none() && ui.input(|i| i.pointer.any_click()) && more_resp.as_ref().is_none_or(|r| !egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(r))) {
+            self.fab_open = false;
+        }
+        match clicked {
+            Some("power") => {
+                self.fab_open = false;
+                self.core.close_tab(key);
+            }
+            Some("home") => {
+                self.fab_open = false;
+                self.core.active = None;
+                self.core.set_capture(None);
+            }
+            Some("keyboard") => {
+                self.soft_keyboard = !self.soft_keyboard;
+                self.fab_open = false;
+            }
+            Some("file") => {
+                self.core.fm_toggle(key);
+                self.fab_open = false;
+            }
+            Some("chat") => {
+                if let Some(t) = self.core.tab(key) {
+                    t.chat.open = !t.chat.open;
+                    t.chat.unread = 0;
+                }
+                self.fab_open = false;
+            }
+            Some("mic") => {
+                let on = self.core.tabs.iter().find(|t| t.key == key).is_some_and(|t| t.mic.is_some());
+                self.core.set_mic(Some(key), None, !on);
+                self.fab_open = false;
+            }
+            Some("camera") => {
+                let on = self.core.tabs.iter().find(|t| t.key == key).is_some_and(|t| t.cams.mine.is_some());
+                self.core.set_camera(Some(key), None, !on);
+                self.fab_open = false;
+            }
+            Some("mouse") => {
+                self.touchpad = !self.touchpad;
+                self.core.store.touchpad = self.touchpad;
+                self.core.store.save();
+            }
+            _ => {}
+        }
+    }
+
+    // ================================================================== cameras ===
+
+    /// Host: each viewer's camera, floating over the window.
+    fn host_cameras(&mut self, ctx: &egui::Context) {
+        // below the top bar (the address field stays reachable)
+        let mut area = ctx.content_rect().shrink(8.0);
+        area.min.y += 56.0;
+        let on: Vec<(u32, String)> = self.core.hosts.iter().filter(|h| h.cams.remote).map(|h| (h.key, h.req.name.clone())).collect();
+        for (key, name) in on {
+            self.camera_pip(ctx, key, area, &name);
+        }
+    }
+
+    /// The other side's camera in a small window over `area` (AnyDesk's video next to the
+    /// remote screen): dragged anywhere, folded to a round button and back, resized from
+    /// its corner.
+    fn camera_pip(&mut self, ctx: &egui::Context, key: u32, area: Rect, name: &str) {
+        let cams = if let Some(t) = self.core.tabs.iter_mut().find(|t| t.key == key) {
+            &mut t.cams
+        } else if let Some(h) = self.core.hosts.iter_mut().find(|h| h.key == key) {
+            &mut h.cams
+        } else {
+            return;
+        };
+        if !cams.remote {
+            return;
+        }
+        let pic = cams.feed.lock().unwrap().as_ref().and_then(|f| f.shared.latest.lock().unwrap().take());
+        if let Some(pic) = pic {
+            let img = egui::ColorImage::from_rgba_premultiplied([pic.width, pic.height], &pic.rgba);
+            match &mut cams.texture {
+                Some(t) => t.set(img, TextureOptions::LINEAR),
+                None => cams.texture = Some(ctx.load_texture(format!("cam-{key}"), img, TextureOptions::LINEAR)),
+            }
+        }
+        let tex = cams.texture.clone();
+        let small = compact(ctx);
+        let max_w = (area.width() * 0.6).clamp(120.0, 640.0);
+        let mut pip = *self.pips.entry(key).or_insert(Pip { width: if small { 132.0 } else { 260.0 }, folded: false });
+        let aspect = tex.as_ref().map(|t| t.size_vec2()).filter(|s| s.x > 0.0).map(|s| s.y / s.x).unwrap_or(0.75);
+        pip.width = pip.width.clamp(112.0, max_w);
+        let size = if pip.folded { Vec2::splat(48.0) } else { Vec2::new(pip.width, (pip.width * aspect).round()) };
+        // top right, under the corner of the stage (the phone's menu button is at the bottom)
+        let default = Pos2::new(area.right() - 16.0, area.top() + 16.0);
+        let icons = &self.icons;
+        let shown = egui::Area::new(Id::unique(("cam-pip", key)))
+            .order(egui::Order::Foreground)
+            .movable(true)
+            .constrain_to(area)
+            .pivot(Align2::RIGHT_TOP)
+            .default_pos(default)
+            .show(ctx, |ui| {
+                let (rect, body) = ui.allocate_exact_size(size, Sense::click());
+                let p = ui.painter();
+                if pip.folded {
+                    p.add(th::shadow_lg().as_shape(rect, CornerRadius::same(24)));
+                    p.circle_filled(rect.center(), 24.0, th::ACCENT);
+                    icons.paint(ui, "camera", Rect::from_center_size(rect.center(), Vec2::splat(22.0)), Color32::WHITE);
+                    if body.on_hover_text(tf("cam.show", &[("who", name)])).clicked() {
+                        pip.folded = false;
+                    }
+                    return;
+                }
+                p.add(th::shadow_lg().as_shape(rect, CornerRadius::same(10)));
+                match &tex {
+                    Some(t) => {
+                        egui::Image::new((t.id(), t.size_vec2())).corner_radius(10).paint_at(ui, rect);
+                    }
+                    None => {
+                        p.rect_filled(rect, 10.0, Color32::from_gray(28));
+                        icons.paint(ui, "camera", Rect::from_center_size(rect.center(), Vec2::splat(28.0)), Color32::from_gray(140));
+                    }
+                }
+                p.rect_stroke(rect, 10.0, Stroke::new(1.0, Color32::from_white_alpha(40)), StrokeKind::Inside);
+                // who it is, bottom left
+                let g = p.layout_no_wrap(name.to_string(), th::font(11.5, W::Medium), Color32::WHITE);
+                let lw = (g.size().x + 14.0).min(rect.width() - 16.0);
+                let lr = Rect::from_min_size(Pos2::new(rect.left() + 8.0, rect.bottom() - 8.0 - 22.0), Vec2::new(lw, 22.0));
+                p.rect_filled(lr, 11.0, Color32::from_black_alpha(140));
+                p.with_clip_rect(lr.shrink(4.0)).galley(Pos2::new(lr.left() + 7.0, lr.center().y - g.size().y / 2.0), g, Color32::WHITE);
+                let hovered = ui.rect_contains_pointer(rect) || small;
+                if hovered {
+                    // fold, top right
+                    let fr = Rect::from_center_size(Pos2::new(rect.right() - 18.0, rect.top() + 18.0), Vec2::splat(26.0));
+                    let fresp = ui.interact(fr, Id::unique(("cam-fold", key)), Sense::click());
+                    p.circle_filled(fr.center(), 13.0, Color32::from_black_alpha(if fresp.hovered() { 200 } else { 140 }));
+                    icons.paint(ui, "shrink", fr.shrink(6.0), Color32::WHITE);
+                    if fresp.on_hover_text(t("cam.hide")).clicked() {
+                        pip.folded = true;
+                    }
+                    // resize, bottom right
+                    let gr = Rect::from_min_size(rect.right_bottom() - Vec2::splat(20.0), Vec2::splat(20.0));
+                    let gresp = ui.interact(gr, Id::unique(("cam-grip", key)), Sense::drag());
+                    let c = if gresp.hovered() || gresp.dragged() { Color32::WHITE } else { Color32::from_white_alpha(170) };
+                    for d in [5.0, 10.0] {
+                        p.line_segment([gr.right_bottom() - Vec2::new(d + 4.0, 4.0), gr.right_bottom() - Vec2::new(4.0, d + 4.0)], Stroke::new(1.5, c));
+                    }
+                    if gresp.hovered() || gresp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                    }
+                    if gresp.dragged() {
+                        let d = gresp.drag_delta();
+                        pip.width = (pip.width + (d.x + d.y / aspect) / 2.0).clamp(112.0, max_w);
+                    }
+                }
+                // a double click: small ↔ big
+                if body.double_clicked() {
+                    pip.width = if pip.width < max_w * 0.75 { max_w } else if small { 132.0 } else { 260.0 };
+                }
+            });
+        self.pips.insert(key, pip);
+        self.pip_rects.push(shown.response.rect);
     }
 
     // ============================================================= file manager ===
@@ -1840,6 +2562,9 @@ impl App {
     /// AnyDesk-style file transfer: this computer on the left, the host on the right, the
     /// copies in progress underneath. Takes the place of the remote screen while open.
     fn file_manager(&mut self, ui: &mut Ui, stage: Rect, key: u32) {
+        if compact(ui.ctx()) {
+            return self.file_manager_mobile(ui, stage, key);
+        }
         let ctx = ui.ctx().clone();
         let Some(i) = self.core.tabs.iter().position(|t| t.key == key) else { return };
         ui.painter().rect_filled(stage, 0.0, th::BG);
@@ -1881,6 +2606,296 @@ impl App {
         }
         if allowed && !dropped.is_empty() {
             self.core.fm_copy(key, true, Some(dropped.iter().map(|p| p.to_string_lossy().to_string()).collect()));
+        }
+        for (remote, a) in acts {
+            self.fm_apply(&ctx, key, remote, a);
+        }
+        if self.core.tabs.get(i).is_some_and(|t| t.fm.busy()) {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
+        self.fm_dialog(&ctx);
+    }
+
+    /// The file manager on a phone, the way AnyDesk's app does it: one side at a time (this
+    /// device / the remote) under a switch, big rows — a tap opens a folder, a long press
+    /// starts selecting — the actions along the bottom and the copies above them.
+    fn file_manager_mobile(&mut self, ui: &mut Ui, stage: Rect, key: u32) {
+        let ctx = ui.ctx().clone();
+        let Some(i) = self.core.tabs.iter().position(|t| t.key == key) else { return };
+        ui.painter().rect_filled(stage, 0.0, th::BG);
+        let side_id = Id::unique(("fm-side", key));
+        let mut remote = ctx.data(|d| d.get_temp::<bool>(side_id)).unwrap_or(true);
+        let (allowed, label) = (self.core.tabs[i].remote.files, self.core.tabs[i].label.clone());
+        let mut acts: Vec<(bool, FmAct)> = Vec::new();
+        let mut child = ui.new_child(UiBuilder::new().max_rect(stage.shrink2(Vec2::new(12.0, 10.0))).layout(egui::Layout::top_down(egui::Align::Min)));
+        let ui = &mut child;
+        ui.spacing_mut().item_spacing.y = 8.0;
+        let w = ui.available_width();
+
+        // this device | the remote
+        let (sw, _) = ui.allocate_exact_size(Vec2::new(w, 40.0), Sense::hover());
+        ui.painter().rect_filled(sw, 10.0, th::SURFACE_2);
+        for (n, (is_remote, icon, name)) in [(false, "home", t("fm.thisDevice")), (true, "monitor", label)].into_iter().enumerate() {
+            let half = (w - 6.0) / 2.0;
+            let r = Rect::from_min_size(Pos2::new(sw.left() + 3.0 + n as f32 * half, sw.top() + 3.0), Vec2::new(half, 34.0));
+            let resp = ui.interact(r, Id::unique(("fm-side-btn", key, n)), Sense::click());
+            let on = remote == is_remote;
+            if on {
+                ui.painter().add(th::shadow().as_shape(r, CornerRadius::same(8)));
+                ui.painter().rect_filled(r, 8.0, th::SURFACE);
+            }
+            let col = if on { th::ACCENT } else { th::MUTED };
+            let mut job = egui::text::LayoutJob::simple_singleline(name, th::font(13.0, if on { W::Semibold } else { W::Regular }), col);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(half - 44.0);
+            let g = ui.painter().layout_job(job);
+            let x = r.center().x - (g.size().x + 22.0) / 2.0;
+            self.icons.paint(ui, icon, Rect::from_min_size(Pos2::new(x, r.center().y - 8.0), Vec2::splat(16.0)), col);
+            ui.painter().galley(Pos2::new(x + 22.0, r.center().y - g.size().y / 2.0), g, col);
+            if resp.clicked() {
+                remote = is_remote;
+                ctx.data_mut(|d| d.insert_temp(side_id, remote));
+            }
+        }
+
+        let tab = &self.core.tabs[i];
+        let p = if remote { &tab.fm.remote } else { &tab.fm.local };
+        let other = if remote { &tab.fm.local } else { &tab.fm.remote };
+        let nsel = p.selected.len();
+        let mut push = |a: FmAct| acts.push((remote, a));
+
+        if remote && !allowed {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                self.icons.show(ui, "shield", 32.0, th::MUTED);
+                ui.add_space(8.0);
+                ui.label(text(t("fm.noPerm"), 13.5, W::Regular, th::MUTED));
+            });
+        } else {
+            // the phone's own files need "All files access"
+            #[cfg(target_os = "android")]
+            if !remote && !crate::android::files_access() {
+                egui::Frame::new().fill(th::ACCENT_SOFT).corner_radius(10).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(text(t("fm.access"), 12.5, W::Regular, th::TEXT));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if th::btn(ui, &t("fm.accessBtn"), Btn::Primary).clicked() {
+                            crate::android::open_files_access();
+                        }
+                        if th::btn(ui, &t("fm.refresh"), Btn::Normal).clicked() {
+                            push(FmAct::Open(crate::fm::home().to_string_lossy().to_string()));
+                        }
+                    });
+                });
+            }
+            // where we are: up, the folder (its path under it), the places, refresh
+            ui.horizontal(|ui| {
+                ui.set_height(44.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let up = ui.add_enabled_ui(p.parent.is_some(), |ui| th::tbbtn(ui, &self.icons, "up", false, false, &t("fm.up"))).inner;
+                if up.clicked() {
+                    if let Some(par) = &p.parent {
+                        push(FmAct::Open(par.clone()));
+                    }
+                }
+                let right_w = 2.0 * 34.0 + 6.0;
+                let tw = (ui.available_width() - right_w - 6.0).max(40.0);
+                let folder = p.path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().filter(|s| !s.is_empty()).unwrap_or(&p.path).to_string();
+                let (tr, _) = ui.allocate_exact_size(Vec2::new(tw, 40.0), Sense::hover());
+                let mut job = egui::text::LayoutJob::simple_singleline(folder, th::font(14.5, W::Semibold), th::TEXT);
+                job.wrap = egui::text::TextWrapping::truncate_at_width(tw);
+                let g = ui.painter().layout_job(job);
+                ui.painter().galley(Pos2::new(tr.left(), tr.top() + 2.0), g, th::TEXT);
+                // the path, its end kept when it is too long
+                let path = &p.path;
+                let max_chars = (tw / 6.5) as usize;
+                let shown = if path.chars().count() > max_chars { format!("…{}", path.chars().rev().take(max_chars.saturating_sub(1)).collect::<Vec<_>>().into_iter().rev().collect::<String>()) } else { path.clone() };
+                ui.painter().text(Pos2::new(tr.left(), tr.bottom() - 2.0), Align2::LEFT_BOTTOM, shown, th::font(11.5, W::Regular), th::MUTED);
+                let places = th::tbbtn(ui, &self.icons, "folder", false, false, &t("fm.places"));
+                egui::Popup::menu(&places).show(|ui| {
+                    for r in &p.roots {
+                        if ui.add(egui::Button::new(text(r, 13.5, W::Regular, th::TEXT)).frame(false).min_size(Vec2::new(220.0, 36.0))).clicked() {
+                            push(FmAct::Open(r.clone()));
+                        }
+                    }
+                });
+                if p.loading {
+                    ui.add(egui::Spinner::new().size(16.0).color(th::MUTED));
+                } else if th::tbbtn(ui, &self.icons, "refresh", false, false, &t("fm.refresh")).clicked() {
+                    push(FmAct::Refresh);
+                }
+            });
+            if !p.error.is_empty() {
+                ui.label(text(&p.error, 12.5, W::Regular, th::DANGER));
+            }
+
+            // the copies (newest two) and the actions take the bottom
+            let shown_tr: Vec<&crate::fm::Transfer> = tab.fm.transfers.iter().rev().take(2).collect();
+            let tr_h = if shown_tr.is_empty() { 0.0 } else { 34.0 + 40.0 * shown_tr.len() as f32 };
+            let bar_h = if nsel > 0 { 104.0 } else { 52.0 };
+            let list_h = (ui.available_height() - tr_h - bar_h - 8.0).max(80.0);
+            const ROW: f32 = 58.0;
+            egui::ScrollArea::vertical().id_salt(("fm-mlist", key, remote)).max_height(list_h).auto_shrink([false, false]).show_rows(ui, ROW, p.entries.len(), |ui, range| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for n in range {
+                    let e = &p.entries[n];
+                    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::click());
+                    let sel = p.selected.contains(&e.n);
+                    if sel {
+                        ui.painter().rect_filled(r, 8.0, th::ACCENT_SOFT);
+                    } else if resp.is_pointer_button_down_on() {
+                        ui.painter().rect_filled(r, 8.0, th::SURFACE_2);
+                    }
+                    let icon = Rect::from_center_size(Pos2::new(r.left() + 22.0, r.center().y), Vec2::splat(26.0));
+                    self.icons.paint(ui, if e.d { "folder" } else { "doc" }, icon, if e.d { th::WARN } else { th::MUTED });
+                    let x0 = r.left() + 46.0;
+                    let name_w = (r.width() - 46.0 - if nsel > 0 { 40.0 } else { 12.0 }).max(30.0);
+                    let mut job = egui::text::LayoutJob::simple_singleline(e.n.clone(), th::font(14.5, W::Regular), th::TEXT);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
+                    let g = ui.painter().layout_job(job);
+                    ui.painter().galley(Pos2::new(x0, r.center().y - g.size().y - 1.0), g, th::TEXT);
+                    let date = (e.m > 0).then(|| chrono::DateTime::from_timestamp_millis(e.m).map(|d| d.with_timezone(&chrono::Local).format("%d.%m.%Y %H:%M").to_string()).unwrap_or_default());
+                    let what = if e.d { t("fm.folderItems") } else { crate::fm::human_size(e.s) };
+                    let sub = match date {
+                        Some(d) => format!("{what} · {d}"),
+                        None => what,
+                    };
+                    ui.painter().text(Pos2::new(x0, r.center().y + 3.0), Align2::LEFT_TOP, sub, th::font(12.0, W::Regular), th::MUTED);
+                    // selecting: a round check on the right
+                    if nsel > 0 {
+                        let c = Pos2::new(r.right() - 20.0, r.center().y);
+                        if sel {
+                            ui.painter().circle_filled(c, 10.0, th::ACCENT);
+                            ui.painter().line_segment([c + Vec2::new(-4.5, 0.0), c + Vec2::new(-1.0, 3.5)], Stroke::new(2.0, Color32::WHITE));
+                            ui.painter().line_segment([c + Vec2::new(-1.0, 3.5), c + Vec2::new(5.0, -3.5)], Stroke::new(2.0, Color32::WHITE));
+                        } else {
+                            ui.painter().circle_stroke(c, 10.0, Stroke::new(1.5, th::BORDER_STRONG));
+                        }
+                    }
+                    ui.painter().hline(egui::Rangef::new(x0, r.right()), r.bottom() - 0.5, Stroke::new(1.0, th::BORDER));
+                    // held for a moment: selecting starts (and the release is not a tap)
+                    let long_id = Id::unique(("fm-long", key, remote));
+                    if resp.is_pointer_button_down_on() {
+                        let held = ui.input(|i| i.pointer.press_start_time().map(|t0| i.time - t0)).unwrap_or(0.0);
+                        if held >= 0.45 && ui.data(|d| d.get_temp::<usize>(long_id)) != Some(n) {
+                            ui.data_mut(|d| d.insert_temp(long_id, n));
+                            if !sel {
+                                push(FmAct::Click(n, true, false));
+                            }
+                        } else if held < 0.45 {
+                            ui.ctx().request_repaint_after(Duration::from_millis(50));
+                        }
+                    }
+                    let was_long = resp.clicked() && ui.data_mut(|d| d.remove_temp::<usize>(long_id)) == Some(n);
+                    // a hold too long to count as a click ends without one
+                    if !resp.clicked() && !ui.input(|i| i.pointer.any_down()) && ui.data(|d| d.get_temp::<usize>(long_id)) == Some(n) {
+                        ui.data_mut(|d| d.remove_temp::<usize>(long_id));
+                    }
+                    if was_long {
+                    } else if resp.secondary_clicked() {
+                        if !sel {
+                            push(FmAct::Click(n, true, false));
+                        }
+                    } else if resp.clicked() {
+                        if nsel > 0 || !e.d {
+                            push(FmAct::Click(n, true, false));
+                        } else {
+                            push(FmAct::Open(p.join(&e.n)));
+                        }
+                    }
+                }
+            });
+            if p.entries.is_empty() && !p.loading && p.error.is_empty() {
+                ui.add_space(-list_h + 30.0);
+                ui.vertical_centered(|ui| ui.label(text(t("fm.empty"), 13.0, W::Regular, th::MUTED)));
+                ui.add_space(list_h - 60.0);
+            }
+
+            // the copies
+            if !shown_tr.is_empty() {
+                let (r, _) = ui.allocate_exact_size(Vec2::new(w, tr_h), Sense::hover());
+                ui.painter().rect(r, 10.0, th::SURFACE, Stroke::new(1.0, th::BORDER), StrokeKind::Inside);
+                ui.painter().text(Pos2::new(r.left() + 12.0, r.top() + 17.0), Align2::LEFT_CENTER, t("fm.transfers"), th::font(12.5, W::Semibold), th::TEXT);
+                if tab.fm.transfers.iter().any(|t| t.finished) {
+                    let cr = Rect::from_min_size(Pos2::new(r.right() - 90.0, r.top() + 4.0), Vec2::new(84.0, 26.0));
+                    let resp = ui.interact(cr, Id::unique(("fm-mclear", key)), Sense::click());
+                    ui.painter().text(Pos2::new(cr.right() - 6.0, cr.center().y), Align2::RIGHT_CENTER, t("fm.clear"), th::font(12.5, W::Regular), th::ACCENT);
+                    if resp.clicked() {
+                        acts.push((false, FmAct::ClearDone));
+                    }
+                }
+                for (k, tr) in shown_tr.iter().enumerate() {
+                    let row = Rect::from_min_size(Pos2::new(r.left() + 12.0, r.top() + 34.0 + k as f32 * 40.0), Vec2::new(r.width() - 24.0, 40.0));
+                    self.icons.paint(ui, if tr.upload { "arrow" } else { "back" }, Rect::from_min_size(Pos2::new(row.left(), row.top() + 4.0), Vec2::splat(15.0)), th::MUTED);
+                    let frac = if tr.total > 0 { (tr.done as f32 / tr.total as f32).clamp(0.0, 1.0) } else if tr.finished { 1.0 } else { 0.0 };
+                    let (fill, status) = if !tr.error.is_empty() {
+                        (th::DANGER, tr.error.clone())
+                    } else if tr.cancelled {
+                        (th::MUTED, t("fm.cancelled"))
+                    } else if tr.finished {
+                        (th::OK, t("fm.done"))
+                    } else {
+                        (th::ACCENT, format!("{}%", (frac * 100.0) as u32))
+                    };
+                    let name_w = row.width() - 22.0 - 80.0 - if tr.finished { 0.0 } else { 30.0 };
+                    let mut job = egui::text::LayoutJob::simple_singleline(tr.name.clone(), th::font(12.5, W::Regular), th::TEXT);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
+                    let g = ui.painter().layout_job(job);
+                    ui.painter().galley(Pos2::new(row.left() + 22.0, row.top() + 2.0), g, th::TEXT);
+                    let st_right = row.right() - if tr.finished { 0.0 } else { 30.0 };
+                    ui.painter().text(Pos2::new(st_right, row.top() + 2.0), Align2::RIGHT_TOP, status, th::font(12.0, W::Regular), fill);
+                    let bar = Rect::from_min_size(Pos2::new(row.left() + 22.0, row.top() + 24.0), Vec2::new(st_right - row.left() - 22.0, 5.0));
+                    ui.painter().rect_filled(bar, 2.5, th::BORDER);
+                    ui.painter().rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * frac, 5.0)), 2.5, fill);
+                    if !tr.finished {
+                        let b = Rect::from_center_size(Pos2::new(row.right() - 10.0, row.top() + 14.0), Vec2::splat(28.0));
+                        let resp = ui.interact(b, Id::unique(("fm-mx", &tr.id)), Sense::click());
+                        self.icons.paint(ui, "x", b.shrink(7.0), th::MUTED);
+                        if resp.clicked() {
+                            acts.push((false, FmAct::Cancel(tr.id.clone())));
+                        }
+                    }
+                }
+            }
+
+            // the actions
+            if nsel > 0 {
+                ui.horizontal(|ui| {
+                    ui.set_height(40.0);
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if th::tbbtn(ui, &self.icons, "x", false, false, &t("fm.cancelSel")).clicked() {
+                        acts.push((remote, FmAct::SelectNone));
+                    }
+                    ui.label(text(tf("fm.selected", &[("n", &nsel.to_string())]), 13.5, W::Semibold, th::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if th::tbbtn(ui, &self.icons, "trash", false, true, &t("fm.delete")).clicked() {
+                            acts.push((remote, FmAct::Delete));
+                        }
+                        if nsel == 1 && th::tbbtn(ui, &self.icons, "edit", false, false, &t("fm.rename")).clicked() {
+                            acts.push((remote, FmAct::Rename));
+                        }
+                        if nsel < p.entries.len() && ui.add(egui::Button::new(text(t("fm.selectAll"), 13.0, W::Regular, th::ACCENT)).frame(false)).clicked() {
+                            acts.push((remote, FmAct::SelectAll));
+                        }
+                    });
+                });
+                let ok = allowed && !other.path.is_empty();
+                let label = if remote { t("fm.toHere") } else { t("fm.toRemote") };
+                if ui.add_enabled_ui(ok, |ui| th::btn_sized(ui, &label, Btn::Primary, Some(w))).inner.clicked() {
+                    acts.push((remote, FmAct::Copy));
+                    acts.push((remote, FmAct::SelectNone));
+                }
+            } else {
+                ui.horizontal(|ui| {
+                    ui.set_height(44.0);
+                    if th::btn(ui, &format!("+  {}", t("fm.newFolder")), Btn::Normal).clicked() {
+                        acts.push((remote, FmAct::Mkdir));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(text(tf("fm.items", &[("n", &p.entries.len().to_string())]), 12.5, W::Regular, th::MUTED));
+                    });
+                });
+            }
         }
         for (remote, a) in acts {
             self.fm_apply(&ctx, key, remote, a);
@@ -2159,6 +3174,7 @@ impl App {
             }
             FmAct::Click(n, toggle, range) => pane.click(n, toggle, range),
             FmAct::SelectAll => pane.selected = pane.entries.iter().map(|e| e.n.clone()).collect(),
+            FmAct::SelectNone => pane.selected.clear(),
             FmAct::Refresh => {
                 let path = pane.path.clone();
                 return self.fm_apply(ctx, key, remote, FmAct::Open(path));
@@ -2345,14 +3361,43 @@ impl App {
     /// .host-stack: one .host-panel per viewer of this screen.
     fn host_stack(&mut self, ctx: &egui::Context) {
         if self.core.hosts.is_empty() {
+            self.host_live_at.clear();
+            self.auto_folded.clear();
             return;
         }
-        let right = 18.0 + if self.host_chat.is_some() { CHAT_W } else { 0.0 };
+        // a few seconds after a session goes live its card folds to a bar
+        let now = Instant::now();
+        let live: Vec<u32> = self.core.hosts.iter().filter(|h| h.state == HostState::Live && h.auth.is_none()).map(|h| h.key).collect();
+        self.host_live_at.retain(|k, _| live.contains(k));
+        for k in live {
+            let at = *self.host_live_at.entry(k).or_insert(now);
+            if now.duration_since(at) > Duration::from_secs(4) {
+                if self.auto_folded.insert(k) {
+                    self.collapsed.insert(k);
+                }
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+        // a chat is open (this side's host chat, or the chat of the session in front)
+        let viewer_chat = self.core.active.and_then(|k| self.core.tabs.iter().find(|t| t.key == k)).is_some_and(|t| t.chat.open);
+        let chat = self.host_chat.is_some() || viewer_chat;
+        let narrow = compact(ctx);
+        // a phone: the chat is the whole screen, and typing needs the keyboard's room
+        if narrow && (chat || ctx.egui_wants_keyboard_input()) {
+            return;
+        }
+        let right = if narrow { 12.0 } else { 18.0 + if chat { CHAT_W } else { 0.0 } };
+        let width = if narrow { (ctx.content_rect().width() - 24.0).min(360.0) } else { 360.0 };
+        #[cfg(mobile)]
+        let bottom = 18.0 + crate::phone::insets().1 + if self.core.active.is_some() { 84.0 } else { 0.0 };
+        #[cfg(not(mobile))]
+        let bottom = 18.0;
         let mut actions: Vec<(u32, &'static str, bool, bool)> = Vec::new();
         let mut perm_change = None;
         let hosts: Vec<u32> = self.core.hosts.iter().map(|h| h.key).collect();
-        egui::Area::new(Id::unique("host-stack")).anchor(Align2::RIGHT_BOTTOM, Vec2::new(-right, -18.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-            ui.set_width(360.0);
+        egui::Area::new(Id::unique("host-stack")).anchor(Align2::RIGHT_BOTTOM, Vec2::new(-right, -bottom)).order(egui::Order::Foreground).show(ctx, |ui| {
+            ui.set_width(width);
             for key in hosts {
                 let Some(h) = self.core.hosts.iter().find(|h| h.key == key) else { continue };
                 let color = Color32::from_rgb(h.color[0], h.color[1], h.color[2]);
@@ -2360,6 +3405,7 @@ impl App {
                 let collapsed = self.collapsed.contains(&key);
                 let chat_active = self.host_chat == Some(key);
                 let (name, from, sas, stats, remote_mic, unread, mic_on) = (h.req.name.clone(), h.req.from.clone(), h.sas.clone(), h.stats.clone(), h.remote_mic, h.chat.unread, h.mic.is_some());
+                let (cam_on, can_cam) = (h.cams.mine.is_some(), h.req.cam);
                 let mut perms = h.perms;
                 let waiting = h.auth.is_some();
                 let fr = egui::Frame::new()
@@ -2369,11 +3415,11 @@ impl App {
                     .shadow(th::shadow_lg())
                     .inner_margin(Margin { left: 20, right: 16, top: 14, bottom: 14 })
                     .show(ui, |ui| {
-                        ui.set_width(360.0 - 36.0);
+                        ui.set_width(width - 36.0);
                         ui.horizontal(|ui| {
                             let state = if waiting { t("host.authWait") } else if live { t("host.connected") } else { t("host.connecting") };
                             ui.scope(|ui| {
-                                ui.set_width(360.0 - 36.0 - 40.0);
+                                ui.set_width(width - 36.0 - 40.0);
                                 self.accept_head(ui, &name, "", &from, Some((if live { color } else { th::MUTED }, state)));
                             });
                             if th::iconbtn(ui, &self.icons, if collapsed { "expand" } else { "shrink" }, &t("tt.collapse")).clicked() {
@@ -2415,6 +3461,9 @@ impl App {
                             if th::tbbtn(ui, &self.icons, "mic", mic_on, false, &t(if mic_on { "tt.micOn" } else { "tt.mic" })).clicked() && live {
                                 actions.push((key, "mic", !mic_on, false));
                             }
+                            if can_cam && th::tbbtn(ui, &self.icons, "camera", cam_on, false, &t(if cam_on { "tt.camOn" } else { "tt.cam" })).clicked() && live {
+                                actions.push((key, "camera", !cam_on, false));
+                            }
                             if th::tbbtn(ui, &self.icons, "file", false, false, &t("tt.file")).clicked() && live {
                                 actions.push((key, "file", false, false));
                             }
@@ -2449,11 +3498,15 @@ impl App {
                     self.host_chat = open.then_some(k);
                 }
                 "mic" => self.core.set_mic(None, Some(k), c),
+                "camera" => self.core.set_camera(None, Some(k), c),
                 "file" => {
                     let sid = self.core.hosts.iter().find(|h| h.key == k).and_then(|h| h.sid);
+                    #[cfg(not(mobile))]
                     if let Some(files) = rfd::FileDialog::new().pick_files() {
                         self.core.send_files(sid, files);
                     }
+                    #[cfg(mobile)]
+                    let _ = sid;
                 }
                 "close" => self.core.close_host(k, true),
                 _ => {
@@ -2566,7 +3619,7 @@ impl App {
         let name = self.core.hosts[i].req.name.clone();
         let mut send = false;
         let mut close = false;
-        egui::Panel::right("host-chat").exact_size(CHAT_W).resizable(false).frame(egui::Frame::new().fill(th::SURFACE)).show(ui, |ui| {
+        egui::Panel::right("host-chat").exact_size(chat_width(ui.ctx())).resizable(false).frame(egui::Frame::new().fill(th::SURFACE)).show(ui, |ui| {
             (send, close) = chat_column(ui, &self.icons, &mut self.core.hosts[i].chat, &name);
         });
         if close {
@@ -2713,6 +3766,7 @@ fn perm_toggles(ui: &mut Ui, icons: &Icons, p: &mut crate::store::Permissions) -
             ("clip", "perm.clipboard", &mut p.clipboard),
             ("file", "perm.files", &mut p.files),
             ("speaker", "perm.sound", &mut p.sound),
+            ("camera", "perm.camera", &mut p.camera),
             ("power", "perm.restart", &mut p.restart),
             ("shield", "perm.privacy", &mut p.privacy),
             ("share", "perm.tunnel", &mut p.tunnel),
@@ -2723,10 +3777,26 @@ fn perm_toggles(ui: &mut Ui, icons: &Icons, p: &mut crate::store::Permissions) -
     changed
 }
 
+/// The other side's camera window: its width in points, or folded to a round button.
+#[derive(Clone, Copy)]
+struct Pip {
+    width: f32,
+    folded: bool,
+}
+
 /// Where a `tex`-pixel picture goes in `stage` (points) so it fits whole. The host sends
 /// the picture at about the stage's pixel size, give or take a pixel or two of rounding:
 /// stretching it by those would resample every pixel and blur all the text, so near 1:1
 /// it is drawn 1:1 — and always on whole pixels.
+/// The chat column: beside the session on a desktop, the whole width on a phone.
+fn chat_width(ctx: &egui::Context) -> f32 {
+    if compact(ctx) {
+        ctx.content_rect().width()
+    } else {
+        CHAT_W
+    }
+}
+
 fn fit_rect(stage: Rect, tex: Vec2, ppp: f32) -> Rect {
     let stage_px = stage.size() * ppp;
     let mut scale = (stage_px.x / tex.x).min(stage_px.y / tex.y);
@@ -2821,6 +3891,38 @@ fn time_ago(ts: i64) -> String {
     }
 }
 
+/// The touchpad pointer: an arrow with its tip at `p`.
+fn paint_arrow(painter: &egui::Painter, p: Pos2) {
+    let at = |pts: &[(f32, f32)]| pts.iter().map(|&(x, y)| p + Vec2::new(x, y)).collect::<Vec<_>>();
+    // the tail and the head (each convex), then the outline around both
+    painter.add(egui::Shape::convex_polygon(at(&[(4.6, 12.0), (7.0, 11.4), (10.2, 18.4), (7.6, 19.6)]), Color32::WHITE, Stroke::NONE));
+    painter.add(egui::Shape::convex_polygon(at(&[(0.0, 0.0), (12.5, 12.2), (0.0, 17.2)]), Color32::WHITE, Stroke::NONE));
+    let outline = at(&[(0.0, 0.0), (12.5, 12.2), (7.0, 12.2), (10.2, 18.4), (7.6, 19.6), (4.6, 13.0), (0.0, 17.2), (0.0, 0.0)]);
+    painter.add(egui::Shape::line(outline, Stroke::new(1.2, Color32::BLACK)));
+}
+
+struct Touch {
+    start: Pos2,
+    last: Pos2,
+    at: Instant,
+    /// moved past the slop (touch mode: the mouse button is down on the host)
+    dragging: bool,
+    /// taken by a long press or a second finger
+    done: bool,
+    /// touchpad: pressed right after a tap — the move drags (button held)
+    hold: bool,
+    /// touchpad: the held button went down on the host
+    down_sent: bool,
+}
+
+/// Touchpad: how far the pointer goes for a finger's travel (the picture is small).
+const TP_SPEED: f32 = 1.6;
+
+/// A phone-sized screen (or window): pages stack instead of sitting beside the sidebar.
+pub fn compact(ctx: &egui::Context) -> bool {
+    cfg!(mobile) || ctx.content_rect().width() < 640.0
+}
+
 fn thumbnail(pic: &crate::video::Picture) -> Option<Vec<u8>> {
     let img = image::RgbaImage::from_raw(pic.width as u32, pic.height as u32, pic.rgba.clone())?;
     let small = image::imageops::thumbnail(&img, 480, (480 * pic.height / pic.width.max(1)).max(1) as u32);
@@ -2837,6 +3939,8 @@ fn reveal(p: &std::path::Path) {
     let _ = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(p.parent().unwrap_or(p)).spawn();
+    #[cfg(mobile)]
+    let _ = p;
 }
 
 #[cfg(test)]
@@ -2889,5 +3993,54 @@ mod tests {
         assert_eq!(reformat_id("1923 456", 2), ("192 345 6".into(), 2));
         // backspace over the space after "123" removes nothing visible but keeps the cursor
         assert_eq!(reformat_id("123456", 3), ("123 456".into(), 3));
+    }
+}
+
+/// Android drops the window while ManyDesk is in the background, and eframe then runs
+/// nothing of the app — no core ticks: requests went unanswered and sessions stalled
+/// until the user came back. A thread ticks the core instead whenever the UI thread has
+/// been quiet for a while; the two take turns through `TURN` (the UI thread holds it for
+/// each logic and ui pass), so the core never runs on both at once.
+#[cfg(target_os = "android")]
+mod background {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::{Mutex, MutexGuard, Once};
+    use std::time::Duration;
+
+    use super::App;
+
+    static TURN: Mutex<()> = Mutex::new(());
+    /// The app, boxed by eframe: its address holds for the process.
+    static APP: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
+
+    struct Ptr(*mut App);
+    // Only dereferenced while holding TURN, i.e. while the UI thread is not in the app.
+    unsafe impl Send for Ptr {}
+
+    /// The UI thread's turn; also registers the app and starts the background tick.
+    pub fn claim(app: &mut App) -> MutexGuard<'static, ()> {
+        APP.store(app as *mut App, Ordering::Release);
+        static START: Once = Once::new();
+        START.call_once(|| {
+            std::thread::Builder::new()
+                .name("background-tick".into())
+                .spawn(run)
+                .ok();
+        });
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn run() {
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if crate::perf::since_beat_ms() < 300 {
+                continue; // the UI thread is ticking
+            }
+            let Ok(_turn) = TURN.try_lock() else { continue };
+            let p = Ptr(APP.load(Ordering::Acquire));
+            if !p.0.is_null() {
+                unsafe { (*p.0).tick_core() };
+            }
+        }
     }
 }

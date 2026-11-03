@@ -329,9 +329,9 @@ impl Encoder {
             set(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, false);
             set(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, false);
             set(s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel, false);
-            // Lost frames bring a keyframe on request; the periodic one only costs traffic
-            // (a full-screen keyframe of text is ~2 MB).
-            set(s, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, cf_f64(60.0), true);
+            // Lost frames bring a keyframe on request; the periodic one heals the rest
+            // (see KEY_EVERY_SECS).
+            set(s, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, cf_f64(crate::media::encode::KEY_EVERY_SECS as f64), true);
             set(s, kVTCompressionPropertyKey_MinAllowedFrameQP, cf_i32(MIN_QP), true);
             VTCompressionSessionPrepareToEncodeFrames(s);
             let mut hw: CFTypeRef = ptr::null();

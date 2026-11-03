@@ -30,6 +30,7 @@ use crate::rendezvous::Rendezvous;
 use crate::rv::{self, Key};
 use crate::store::{self, Store};
 use crate::video::Feed;
+use crate::media::camera::Camera;
 
 pub const MAX_HOST: usize = 5;
 const REQUEST_SECS: u64 = 60;
@@ -42,6 +43,10 @@ pub fn platform() -> &'static str {
         "darwin"
     } else if cfg!(windows) {
         "win32"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
     } else {
         "linux"
     }
@@ -52,11 +57,18 @@ pub fn os_name(p: &str) -> &'static str {
         "darwin" => "macOS",
         "win32" => "Windows",
         "linux" => "Linux",
+        "android" => "Android",
+        "ios" => "iOS",
         _ => "",
     }
 }
 
 pub fn hostname() -> String {
+    // a phone's host name is "localhost": its model says more
+    #[cfg(target_os = "android")]
+    if let Some(m) = crate::android::device_name() {
+        return m;
+    }
     gethostname::gethostname().to_string_lossy().trim_end_matches(".local").chars().take(60).collect()
 }
 
@@ -149,6 +161,7 @@ pub struct Tab {
     pub player: Option<Arc<Player>>,
     pub mic: Option<Mic>,
     pub mic_error: bool,
+    pub cams: Cams,
     pub chat: Chat,
     pub quality: Mode,
     pub stats: String,
@@ -179,6 +192,29 @@ pub struct Tab {
     pub pointer: Option<(f32, f32)>,
     pub pointer_shape: Option<RemoteCursor>,
     pub pointer_gen: u32,
+}
+
+/// A session's cameras (AnyDesk's video call): ours while it is on, and the other side's
+/// picture while theirs is.
+#[derive(Default)]
+pub struct Cams {
+    pub mine: Option<Camera>,
+    /// the other side's camera is on
+    pub remote: bool,
+    /// its decoder, shared with the session's media callback
+    pub feed: Arc<Mutex<Option<Arc<Feed>>>>,
+    pub texture: Option<egui::TextureHandle>,
+}
+
+impl Cams {
+    /// The other side's camera went off (or the session ended).
+    fn remote_off(&mut self) {
+        self.remote = false;
+        if let Some(f) = self.feed.lock().unwrap().take() {
+            f.stop();
+        }
+        self.texture = None;
+    }
 }
 
 /// The host's pointer image; size and hot spot in the host display's pixels.
@@ -251,6 +287,8 @@ pub struct Request {
     pub os: String,
     pub from: String,
     native: bool,
+    /// the viewer can show and send a camera picture
+    pub cam: bool,
     /// unattended access: the session already started for this request (waiting for
     /// either the password or the Accept button)
     host_key: Option<u32>,
@@ -288,6 +326,7 @@ pub struct Host {
     pub remote_mic: bool,
     pub player: Option<Arc<Player>>,
     pub mic: Option<Mic>,
+    pub cams: Cams,
     /// where this viewer last pointed on the shared screen (for the host overlay)
     pub pointer: Option<Pointer>,
     /// the display this viewer is shown
@@ -635,6 +674,7 @@ impl Core {
             "privacy:check" => self.privacy_check(),
             "clip:files" | "clip:image" => self.on_local_clip(name, &v),
             "toast" => self.toast(v["text"].as_str().unwrap_or(""), v["error"].as_bool().unwrap_or(false)),
+            "camera:error" => self.on_camera_error(&v),
             _ => {}
         }
     }
@@ -694,7 +734,7 @@ impl Core {
         let topic = rv::random_topic();
         self.rv.subscribe(&topic, false);
         let req = json!({
-            "t": "req", "reply": topic, "k": raw, "name": self.name, "os": platform(), "from": self.store.my_id, "caps": ["mdp1"],
+            "t": "req", "reply": topic, "k": raw, "name": self.name, "os": platform(), "from": self.store.my_id, "caps": ["mdp1", "cam1"],
         });
         self.tabs.push(Tab {
             outbox: Some(req),
@@ -714,6 +754,7 @@ impl Core {
             player: None,
             mic: None,
             mic_error: false,
+            cams: Cams::default(),
             chat: Chat::default(),
             quality: Mode::Auto,
             stats: String::new(),
@@ -805,6 +846,7 @@ impl Core {
         self.tabs[i].sid = Some(sid);
         let player = Arc::new(Player::start());
         self.tabs[i].player = Some(player.clone());
+        let cam = self.tabs[i].cams.feed.clone();
         let stun = self.store.stun.clone();
         let turn_cfg = self.store.turn.clone();
         let rv = self.rv.clone();
@@ -818,6 +860,11 @@ impl Core {
                 }
                 Media::File(d) => bus::file(sid, d),
                 Media::Audio(p) => player.push(p),
+                Media::Camera { key, data } => {
+                    if let Some(f) = cam.lock().unwrap().clone() {
+                        f.push(key, data);
+                    }
+                }
             });
             let (s, prep) = match Session::prepare(false, stun, turn, events, media).await {
                 Ok(x) => x,
@@ -858,7 +905,8 @@ impl Core {
         }
         self.end_handshake(i);
         self.log_tab(i);
-        let tab = self.tabs.remove(i);
+        let mut tab = self.tabs.remove(i);
+        tab.cams.remote_off();
         self.tunnels.retain(|t| t.tab != key);
         for c in tab.fm.cancels.values() {
             c.store(true, Ordering::Relaxed);
@@ -986,6 +1034,37 @@ impl Core {
         }
     }
 
+    /// Several input messages, sent one after the other by one task, so they arrive in this
+    /// order (a key press before its release, the clipboard before the paste).
+    pub fn input_many(&mut self, key: u32, msgs: Vec<Value>) {
+        if msgs.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.iter().find(|t| t.key == key) else { return };
+        if tab.state != TabState::Live || !tab.remote.control || tab.auth.is_some() {
+            return;
+        }
+        let Some(s) = self.session(tab.sid) else { return };
+        let texts: Vec<String> = msgs.iter().map(|m| m.to_string()).collect();
+        crate::rt::spawn(async move {
+            for t in texts {
+                let _ = s.send_text(false, &t).await;
+            }
+        });
+    }
+
+    /// Cmd/Ctrl+V into session `key`: this side's text goes over first (when the clipboard
+    /// is shared: copied before the session or a moment ago, it may not be there yet), then
+    /// the V of the shortcut.
+    pub fn paste(&mut self, key: u32, text: Option<&str>, out: &mut Vec<Value>) {
+        let shared = self.tabs.iter().find(|t| t.key == key).is_some_and(|t| t.remote.clipboard);
+        if let Some(text) = text.filter(|t| shared && !t.is_empty() && t.len() <= 1 << 20) {
+            self.clip_last = text.to_string();
+            out.push(json!({ "t": "clip", "text": text }));
+        }
+        out.push(json!({ "t": "key", "code": "KeyV", "d": true }));
+    }
+
     pub fn set_capture(&mut self, key: Option<u32>) {
         if let (Some(old), true) = (self.capture_tab, key != self.capture_tab) {
             if let Some(t) = self.tabs.iter().find(|t| t.key == old) {
@@ -1050,6 +1129,72 @@ impl Core {
         self.ctl(sid, json!({ "t": "mic", "on": live }));
     }
 
+    /// Camera on/off for a viewer tab or a host session (AnyDesk's "video" in the session
+    /// bar): the picture goes to the other side, which shows it in a floating window.
+    pub fn set_camera(&mut self, viewer: Option<u32>, host: Option<u32>, on: bool) {
+        let (sid, allowed) = if let Some(k) = viewer {
+            self.tabs.iter().find(|t| t.key == k).map(|t| (t.sid, t.remote.camera)).unwrap_or((None, false))
+        } else {
+            self.hosts.iter().find(|h| Some(h.key) == host).map(|h| (h.sid, h.req.cam && h.auth.is_none())).unwrap_or((None, false))
+        };
+        if on && !allowed {
+            self.toast(t(if viewer.is_some() { "cam.notAllowed" } else { "cam.oldPeer" }), true);
+            return;
+        }
+        let cam = match self.session(sid).filter(|_| on) {
+            Some(s) => {
+                let s2 = s.clone();
+                let sid = sid.unwrap_or(0);
+                Some(Camera::start(s.camera_keyframe(), move |f| s2.send_camera(f), move |e| bus::emit("camera:error", json!({ "sid": sid, "e": e }))))
+            }
+            None => None,
+        };
+        let live = cam.is_some();
+        if let Some(t) = viewer.and_then(|k| self.tabs.iter_mut().find(|t| t.key == k)) {
+            t.cams.mine = cam;
+        } else if let Some(h) = host.and_then(|k| self.hosts.iter_mut().find(|h| h.key == k)) {
+            h.cams.mine = cam;
+        }
+        self.ctl(sid, json!({ "t": "cam", "on": live }));
+    }
+
+    /// Our camera could not run: off again, and why.
+    fn on_camera_error(&mut self, v: &Value) {
+        let sid = v["sid"].as_u64().map(|s| s as u32);
+        let e = v["e"].as_str().unwrap_or("");
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.sid == sid) {
+            t.cams.mine = None;
+        } else if let Some(h) = self.hosts.iter_mut().find(|h| h.sid == sid) {
+            h.cams.mine = None;
+        } else {
+            return;
+        }
+        self.ctl(sid, json!({ "t": "cam", "on": false }));
+        let msg = match e {
+            "denied" => t(if cfg!(target_os = "macos") { "cam.deniedMac" } else { "cam.denied" }),
+            "nocamera" => t("cam.none"),
+            e => tf("cam.failed", &[("e", e)]),
+        };
+        self.toast(msg, true);
+    }
+
+    /// The other side turned its camera on or off: a decoder for it while it is on.
+    fn remote_camera(&mut self, sid: Option<u32>, cams: &mut Cams, on: bool) {
+        if !on {
+            return cams.remote_off();
+        }
+        cams.remote = true;
+        let mut slot = cams.feed.lock().unwrap();
+        if slot.is_none() {
+            let reg = self.sessions.clone();
+            *slot = Some(Arc::new(Feed::start_camera(move || {
+                if let Some(s) = sid.and_then(|id| reg.lock().unwrap().get(&id).cloned()) {
+                    s.request_camera_keyframe();
+                }
+            })));
+        }
+    }
+
     /// Background tabs: remote audio muted and microphone paused, so a conversation
     /// only ever happens with the session on screen.
     pub fn apply_isolation(&mut self) {
@@ -1095,10 +1240,11 @@ impl Core {
                     return;
                 }
                 let native = msg["caps"].as_array().is_some_and(|c| c.iter().any(|x| x == "mdp1"));
+                let cam = msg["caps"].as_array().is_some_and(|c| c.iter().any(|x| x == "cam1"));
                 let from = msg["from"].as_str().filter(|f| f.len() == 9 && f.chars().all(|c| c.is_ascii_digit())).unwrap_or("").to_string();
                 // Switch sides: the computer we offered ours to connects back; no prompt.
                 if native && self.is_switch_request(&msg) {
-                    let req = Request { reply, key, peer: pubkey, name: msg["name"].as_str().map(|n| n.chars().take(60).collect()).unwrap_or_else(|| t("host.unknown")), os: os_name(msg["os"].as_str().unwrap_or("")).to_string(), from, native, host_key: None, at: Instant::now() };
+                    let req = Request { reply, key, peer: pubkey, name: msg["name"].as_str().map(|n| n.chars().take(60).collect()).unwrap_or_else(|| t("host.unknown")), os: os_name(msg["os"].as_str().unwrap_or("")).to_string(), from, native, cam, host_key: None, at: Instant::now() };
                     self.start_host(req, Permissions { restart: false, privacy: false, tunnel: false, ..Permissions::default() }, false);
                     return;
                 }
@@ -1115,6 +1261,7 @@ impl Core {
                     os: os_name(msg["os"].as_str().unwrap_or("")).to_string(),
                     from,
                     native,
+                    cam,
                     at: Instant::now(),
                     host_key: None,
                 });
@@ -1185,12 +1332,26 @@ impl Core {
         let r = req.clone();
         let player = Arc::new(Player::start());
         let pl = player.clone();
+        let cams = Cams::default();
+        let cam = cams.feed.clone();
         crate::rt::spawn(async move {
-            let events = Arc::new(move |ev: Value| bus::emit("mdp", json!({ "sid": sid, "ev": ev })));
+            let events = Arc::new(move |ev: Value| {
+                // Android: remote control is played where it arrives (see android::early_input)
+                #[cfg(target_os = "android")]
+                if crate::android::early_input(sid, &ev) {
+                    return;
+                }
+                bus::emit("mdp", json!({ "sid": sid, "ev": ev }))
+            });
             let media = Arc::new(move |m: Media| match m {
                 Media::File(d) => bus::file(sid, d),
                 Media::Audio(p) => pl.push(p),
                 Media::Video { .. } => {}
+                Media::Camera { key, data } => {
+                    if let Some(f) = cam.lock().unwrap().clone() {
+                        f.push(key, data);
+                    }
+                }
             });
             let reject = |e: String| {
                 let obj = json!({ "t": "reject", "reason": e, "ts": rv::now_ms() });
@@ -1241,6 +1402,7 @@ impl Core {
             remote_mic: false,
             player: Some(player),
             mic: None,
+            cams,
             pointer: None,
             screen: shown,
             fm_cancel: HashMap::new(),
@@ -1290,7 +1452,9 @@ impl Core {
 
     pub fn close_host(&mut self, key: u32, send_bye: bool) {
         let Some(i) = self.hosts.iter().position(|h| h.key == key) else { return };
-        let h = self.hosts.remove(i);
+        let mut h = self.hosts.remove(i);
+        h.cams.mine = None;
+        h.cams.remote_off();
         for c in h.fm_cancel.values() {
             c.store(true, Ordering::Relaxed);
         }
@@ -1324,6 +1488,10 @@ impl Core {
         let (sid, p) = (self.hosts[i].sid, self.hosts[i].perms);
         if let Some(s) = self.session(sid) {
             s.allow_tunnels(p.tunnel);
+            s.allow_camera(p.camera);
+        }
+        if !p.camera {
+            self.hosts[i].cams.remote_off();
         }
         self.ctl(sid, json!({ "t": "perm", "control": p.control, "clipboard": p.clipboard, "p": p, "os": platform() }));
     }
@@ -1375,9 +1543,23 @@ impl Core {
             self.set_mic(None, Some(key), true);
             eprintln!("[test] host mic on: {}", self.hosts.iter().any(|h| h.mic.is_some()));
         }
+        // Test hook: MANYDESK_TESTCAM=1 turns the host camera on when a viewer joins.
+        if std::env::var_os("MANYDESK_TESTCAM").is_some() {
+            let key = self.hosts[i].key;
+            self.set_camera(None, Some(key), true);
+            eprintln!("[test] host camera on: {}", self.hosts.iter().any(|h| h.cams.mine.is_some()));
+        }
     }
 
     fn update_host_input(&mut self) {
+        #[cfg(target_os = "android")]
+        {
+            let sids: Vec<u32> = self.hosts.iter().filter(|h| h.state == HostState::Live && h.perms.control && h.auth.is_none()).filter_map(|h| h.sid).collect();
+            if !sids.is_empty() && !crate::android::input_ready() {
+                self.toast(t("perm.axAndroid"), true);
+            }
+            crate::android::set_control(sids);
+        }
         if self.privacy_on || self.hosts.iter().any(|h| h.state == HostState::Live && h.perms.control) {
             self.input.start();
         } else {
@@ -1424,6 +1606,25 @@ impl Core {
                             bus::emit("test:type", json!({ "tab": key, "step": "run" }));
                             tokio::time::sleep(Duration::from_secs(2)).await;
                             bus::emit("test:type", json!({ "tab": key, "step": "type", "line": line }));
+                        });
+                    }
+                    // Test hook: MANYDESK_TESTINPUT='[{"t":"down","b":0,"x":0.5,"y":0.5},{"wait":100},…]':
+                    // these input events, 4 s after the session opened ("wait" = a pause in ms).
+                    if let Some(list) = std::env::var("MANYDESK_TESTINPUT").ok().and_then(|v| serde_json::from_str::<Vec<Value>>(&v).ok()) {
+                        let sid = self.tabs[i].sid;
+                        let reg = self.sessions.clone();
+                        crate::rt::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            let Some(s) = sid.and_then(|id| reg.lock().unwrap().get(&id).cloned()) else { return };
+                            for m in list {
+                                match m["wait"].as_u64() {
+                                    Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                                    None => {
+                                        let _ = s.send_text(false, &m.to_string()).await;
+                                    }
+                                }
+                            }
+                            eprintln!("[testinput] sent");
                         });
                     }
                     // Test hook: MANYDESK_TESTSTRESS=<secs>: 60 pointer moves a second (a small
@@ -1485,6 +1686,8 @@ impl Core {
                     let tab = &mut self.tabs[i];
                     let was_live = tab.state == TabState::Live;
                     tab.state = TabState::Failed(reason.clone());
+                    tab.cams.mine = None;
+                    tab.cams.remote_off();
                     self.log_tab(i);
                     self.sessions.lock().unwrap().remove(&sid);
                     if was_live {
@@ -1540,6 +1743,12 @@ impl Core {
         match m["t"].as_str() {
             Some("chat") => tab.chat.receive(m["text"].as_str().unwrap_or("")),
             Some("mic") => tab.remote_mic = m["on"].as_bool().unwrap_or(false),
+            Some("cam") => {
+                let (sid, on) = (tab.sid, m["on"].as_bool().unwrap_or(false));
+                let mut cams = std::mem::take(&mut self.tabs[i].cams);
+                self.remote_camera(sid, &mut cams, on);
+                self.tabs[i].cams = cams;
+            }
             Some("cur") => {
                 tab.pointer = m["x"].as_f64().zip(m["y"].as_f64()).map(|(x, y)| (x as f32, y as f32));
                 crate::bus::wake();
@@ -1640,9 +1849,20 @@ impl Core {
                     clipboard: m["clipboard"].as_bool().unwrap_or(false),
                     ..Permissions::NONE
                 });
+                // an older host knows no camera permission (the default would allow it)
+                tab.remote.camera = m["p"]["camera"].as_bool().unwrap_or(false);
                 tab.os = m["os"].as_str().unwrap_or(&tab.os).to_string();
+                let (key, cam_on) = (tab.key, tab.cams.mine.is_some());
                 if !tab.remote.control && self.capture_tab == Some(tab.key) {
                     self.set_capture(None);
+                }
+                if cam_on && !self.tabs[i].remote.camera {
+                    self.set_camera(Some(key), None, false);
+                }
+                // Test hook: MANYDESK_TESTCAM=1 turns the camera on as soon as the host allows it.
+                if std::env::var_os("MANYDESK_TESTCAM").is_some() && !cam_on && self.tabs[i].remote.camera {
+                    self.set_camera(Some(key), None, true);
+                    eprintln!("[test] viewer camera on: {}", self.tabs[i].cams.mine.is_some());
                 }
             }
             Some("clip") => {
@@ -1724,6 +1944,12 @@ impl Core {
             }
             Some("chat") => self.hosts[i].chat.receive(m["text"].as_str().unwrap_or("")),
             Some("mic") => self.hosts[i].remote_mic = m["on"].as_bool().unwrap_or(false),
+            Some("cam") => {
+                let (sid, on) = (self.hosts[i].sid, m["on"].as_bool().unwrap_or(false) && self.hosts[i].perms.camera);
+                let mut cams = std::mem::take(&mut self.hosts[i].cams);
+                self.remote_camera(sid, &mut cams, on);
+                self.hosts[i].cams = cams;
+            }
             Some("quality") => {
                 if let Some(mode) = m["mode"].as_str().and_then(Mode::parse) {
                     self.hosts[i].quality.set_mode(mode);
@@ -1737,6 +1963,9 @@ impl Core {
             Some("clip") => {
                 if self.hosts[i].perms.clipboard {
                     if let Some(text) = m["text"].as_str() {
+                        if std::env::var_os("MANYDESK_TESTNOINJECT").is_some() {
+                            eprintln!("[clip] {:?}", text.chars().take(40).collect::<String>());
+                        }
                         self.clip_last = text.to_string();
                         clip::set_text(text);
                     }
@@ -1758,6 +1987,13 @@ impl Core {
                     "up" => "up",
                     _ => "move",
                 };
+                // Test hook: MANYDESK_TESTNOINJECT=1 logs the viewer's input instead of playing it.
+                if std::env::var_os("MANYDESK_TESTNOINJECT").is_some() {
+                    if kind != "move" {
+                        eprintln!("[input] {m}");
+                    }
+                    return;
+                }
                 let pos = self.hosts[i].screen.clone().and_then(|sc| self.input.handle(&sc, &m));
                 let now = Instant::now();
                 let h = &mut self.hosts[i];
@@ -1853,7 +2089,9 @@ impl Core {
     fn on_file_bytes(&mut self, sid: u32, data: Vec<u8>) {
         use std::io::Write;
         let Some(Some(inc)) = self.incoming_of(sid) else { return };
-        let _ = inc.file.write_all(&data);
+        if let Err(e) = inc.file.write_all(&data) {
+            eprintln!("[fm] write failed for {}: {e}", inc.path.display());
+        }
         let batch = inc.batch.clone();
         if let (Some(b), Some(tab)) = (batch, self.tabs.iter_mut().find(|t| t.sid == Some(sid))) {
             if let Some(tr) = tab.fm.transfer(&b) {
@@ -1889,9 +2127,20 @@ impl Core {
                 let Some(path) = base.and_then(|b| fm::target(&b, rel, empty_dir)) else { return };
                 if empty_dir {
                     let _ = std::fs::create_dir_all(&path);
-                } else if let Ok(file) = std::fs::File::create(&path) {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    *slot = Some(Incoming { id: batch, name, file, path, batch: Some(m["fm"].as_str().unwrap_or("").into()) });
+                } else {
+                    match std::fs::File::create(&path) {
+                        Ok(file) => {
+                            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            *slot = Some(Incoming { id: batch, name, file, path, batch: Some(m["fm"].as_str().unwrap_or("").into()) });
+                        }
+                        // not writable (a phone without storage access, say): the copy says so
+                        Err(e) => {
+                            eprintln!("[fm] cannot write {}: {e}", path.display());
+                            if let Some(tr) = tab.and_then(|i| self.tabs[i].fm.transfer(&batch)) {
+                                tr.error = e.to_string();
+                            }
+                        }
+                    }
                 }
             }
             Some("fend") => {
@@ -1919,7 +2168,9 @@ impl Core {
                     if let Some(tr) = f.transfer(&batch) {
                         tr.finished = true;
                         tr.cancelled = cancelled;
-                        tr.error = e;
+                        if !e.is_empty() || tr.error.is_empty() {
+                            tr.error = e;
+                        }
                         tr.done = tr.done.max(if cancelled { 0 } else { tr.total });
                         dest = Some(tr.dest.clone());
                     }

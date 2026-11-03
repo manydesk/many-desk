@@ -25,6 +25,9 @@ pub struct Shared {
     times: Mutex<Vec<Instant>>,
     pub bytes: std::sync::atomic::AtomicU64,
     queued: std::sync::atomic::AtomicUsize,
+    /// a frame was dropped on a full queue: the next ones refer to it, so the decoder waits
+    /// for a keyframe (decoding on would paint the changes over a broken picture)
+    lost: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -45,10 +48,19 @@ pub struct Feed {
 impl Feed {
     /// `ask_key`: request a keyframe from the sender.
     pub fn start(ask_key: impl Fn() + Send + 'static) -> Feed {
+        Self::spawn(ask_key, false)
+    }
+
+    /// The other side's camera picture (the test hooks below stay with the screen).
+    pub fn start_camera(ask_key: impl Fn() + Send + 'static) -> Feed {
+        Self::spawn(ask_key, true)
+    }
+
+    fn spawn(ask_key: impl Fn() + Send + 'static, camera: bool) -> Feed {
         let (tx, rx) = sync_channel::<(bool, Vec<u8>)>(16);
         let shared = Arc::new(Shared::default());
         let sh = shared.clone();
-        std::thread::Builder::new().name("decode".into()).spawn(move || run(rx, sh, ask_key)).ok();
+        std::thread::Builder::new().name(if camera { "decode-camera" } else { "decode" }.into()).spawn(move || run(rx, sh, ask_key, camera)).ok();
         Feed { tx, shared }
     }
 
@@ -61,6 +73,8 @@ impl Feed {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.shared.queued.fetch_sub(1, Ordering::Relaxed);
+                self.shared.lost.store(true, Ordering::Relaxed);
+                crate::perf::tick("view-queuedrop");
                 false
             }
         }
@@ -98,7 +112,7 @@ fn snap_hook(w: usize, h: usize, rgba: &[u8]) {
     }
 }
 
-fn run(rx: Receiver<(bool, Vec<u8>)>, sh: Arc<Shared>, ask_key: impl Fn()) {
+fn run(rx: Receiver<(bool, Vec<u8>)>, sh: Arc<Shared>, ask_key: impl Fn(), camera: bool) {
     let Ok(mut dec) = Decoder::new() else { return };
     *sh.decoder.lock().unwrap() = dec.name();
     let mut need_key = true;
@@ -117,6 +131,9 @@ fn run(rx: Receiver<(bool, Vec<u8>)>, sh: Arc<Shared>, ask_key: impl Fn()) {
         // Far behind: drop deltas, resync on the next keyframe. Frames often arrive in a
         // burst after a hiccup on the network; decoding takes a few ms, so a short queue
         // drains by itself — dropping it would cost a keyframe (many times a delta's size).
+        if sh.lost.swap(false, Ordering::Relaxed) {
+            need_key = true;
+        }
         let behind = queued >= 8;
         if behind && !key {
             crate::perf::tick("view-decdrop");
@@ -134,9 +151,15 @@ fn run(rx: Receiver<(bool, Vec<u8>)>, sh: Arc<Shared>, ask_key: impl Fn()) {
                 need_key = false;
                 let t1 = Instant::now();
                 *sh.size.lock().unwrap() = (dec.width, dec.height);
-                snap_hook(dec.width, dec.height, &dec.rgba);
+                if camera {
+                    camera_dump(&dec.rgba, dec.width, dec.height);
+                } else {
+                    snap_hook(dec.width, dec.height, &dec.rgba);
+                }
                 *sh.latest.lock().unwrap() = Some(Picture { width: dec.width, height: dec.height, rgba: dec.rgba.clone() });
-                dump_frame(&dec.rgba, dec.width, dec.height);
+                if !camera {
+                    dump_frame(&dec.rgba, dec.width, dec.height);
+                }
                 sh.times.lock().unwrap().push(Instant::now());
                 crate::perf::add("decode", t1 - t0);
                 crate::perf::add("handoff", t1.elapsed());
@@ -160,6 +183,31 @@ fn dump_frame(rgba: &[u8], w: usize, h: usize) {
     static PATH: OnceLock<Option<String>> = OnceLock::new();
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let Some(path) = PATH.get_or_init(|| std::env::var("MANYDESK_DUMPFRAME").ok()) else { return };
+    let mut last = LAST.lock().unwrap();
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+        return;
+    }
+    *last = Some(Instant::now());
+    if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, rgba.to_vec()) {
+        let tmp = format!("{path}.tmp.png");
+        if img.save(&tmp).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Test hook: MANYDESK_CAMDUMP=<file.png> writes the other side's camera picture there
+/// about once a second (and MANYDESK_DEBUG logs that pictures arrive).
+fn camera_dump(rgba: &[u8], w: usize, h: usize) {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n % 30 == 0 && std::env::var_os("MANYDESK_DEBUG").is_some() {
+        eprintln!("[camera] decoded {} pictures from the other side ({w}x{h})", n + 1);
+    }
+    let Some(path) = PATH.get_or_init(|| std::env::var("MANYDESK_CAMDUMP").ok()) else { return };
     let mut last = LAST.lock().unwrap();
     if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
         return;
