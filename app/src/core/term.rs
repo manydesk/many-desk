@@ -214,11 +214,16 @@ impl Core {
     /// Closes the terminal window; the shell ends with it.
     pub fn term_close(&mut self, key: u32) {
         let Some(tab) = self.tab(key) else { return };
+        let terminal_only = tab.mode == SessMode::Terminal;
         tab.term_open = false;
         if let Some(term) = tab.term.take() {
             if term.ended.is_none() {
                 term.tx.send(json!({ "t": "term", "op": "close", "id": term.id }));
             }
+        }
+        // a terminal session ends with its window
+        if terminal_only {
+            self.close_tab(key);
         }
     }
 }

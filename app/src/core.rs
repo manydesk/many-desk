@@ -126,6 +126,44 @@ struct Incoming {
 
 // ---------------------------------------------------------------- viewer tabs ---
 
+/// What a session is for (AnyDesk: a desktop session, or File Transfer on its own; RustDesk
+/// adds a terminal one). The request says it; the host then shows no picture and allows only
+/// what that mode needs.
+#[derive(PartialEq, Clone, Copy, Default, Debug)]
+pub enum SessMode {
+    #[default]
+    Desktop,
+    Files,
+    Terminal,
+}
+
+impl SessMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessMode::Desktop => "desktop",
+            SessMode::Files => "files",
+            SessMode::Terminal => "terminal",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "files" => SessMode::Files,
+            "terminal" => SessMode::Terminal,
+            _ => SessMode::Desktop,
+        }
+    }
+
+    /// What of `p` a session of this mode gets.
+    pub fn mask(self, p: Permissions) -> Permissions {
+        match self {
+            SessMode::Desktop => p,
+            SessMode::Files => Permissions { files: p.files, ..Permissions::NONE },
+            SessMode::Terminal => Permissions { terminal: p.terminal, ..Permissions::NONE },
+        }
+    }
+}
+
 #[derive(PartialEq, Clone)]
 pub enum TabState {
     Requesting,
@@ -180,6 +218,8 @@ pub struct Tab {
     /// the remote shell, and whether its window is up (instead of the picture)
     pub term: Option<term::TermView>,
     pub term_open: bool,
+    /// desktop, or a file transfer / terminal session without the picture
+    pub mode: SessMode,
     /// how the remote picture sits in the stage, and the scroll offset (points) in 1:1
     pub view: ViewMode,
     pub pan: egui::Vec2,
@@ -300,6 +340,8 @@ pub struct Request {
     native: bool,
     /// the viewer can show and send a camera picture
     pub cam: bool,
+    /// what the viewer asked for
+    pub mode: SessMode,
     /// unattended access: the session already started for this request (waiting for
     /// either the password or the Accept button)
     host_key: Option<u32>,
@@ -408,7 +450,7 @@ pub struct Core {
     /// viewer: the key derived for a tab's password prompt, kept until the host says ok
     auth_keys: HashMap<u32, String>,
     /// direct IP: the address asked who it is, and since when
-    ip_wait: Option<(std::net::IpAddr, String, Instant)>,
+    ip_wait: Option<(std::net::IpAddr, String, SessMode, Instant)>,
     /// host: displays whose resolution a viewer changed, and their mode before
     mode_orig: HashMap<u32, crate::platform::display::Mode>,
     /// host: the virtual display a viewer added (gone with the last session)
@@ -590,8 +632,8 @@ impl Core {
             self.lan_scan = now;
             crate::lan::scan();
         }
-        if self.ip_wait.as_ref().is_some_and(|(_, _, at)| at.elapsed() > Duration::from_secs(4)) {
-            let (ip, _, _) = self.ip_wait.take().unwrap();
+        if self.ip_wait.as_ref().is_some_and(|(_, _, _, at)| at.elapsed() > Duration::from_secs(4)) {
+            let (ip, _, _, _) = self.ip_wait.take().unwrap();
             self.toast(tf("lan.noAnswer", &[("ip", &ip.to_string())]), true);
         }
         // Viewer handshakes that got no answer.
@@ -754,14 +796,19 @@ impl Core {
     // ------------------------------------------------- viewer: connect by ID ---
 
     pub fn connect(&mut self, id: &str) {
+        self.connect_mode(id, SessMode::Desktop)
+    }
+
+    /// A session of `mode` with `id` (an ID or, on the LAN, an IP address).
+    pub fn connect_mode(&mut self, id: &str, mode: SessMode) {
         // direct IP (as RustDesk): ask that address who it is, then connect to that ID
         if let Some(ip) = parse_ip(id) {
             if let Some(p) = crate::lan::peers().into_iter().find(|p| p.ip == ip) {
-                return self.connect(&p.id);
+                return self.connect_mode(&p.id, mode);
             }
             let q = rv::random_topic()[..12].to_string();
             crate::lan::query(ip, &q);
-            self.ip_wait = Some((ip, q, Instant::now()));
+            self.ip_wait = Some((ip, q, mode, Instant::now()));
             return self.toast(tf("lan.asking", &[("ip", &ip.to_string())]), false);
         }
         let id = rv::normalize_id(id);
@@ -771,7 +818,8 @@ impl Core {
         if id == self.store.my_id {
             return self.toast(t("err.selfId"), true);
         }
-        if let Some(t) = self.tabs.iter().find(|t| t.peer_id == id && !matches!(t.state, TabState::Failed(_))) {
+        // one session per computer and mode (a file transfer can run beside the desktop)
+        if let Some(t) = self.tabs.iter().find(|t| t.peer_id == id && t.mode == mode && !matches!(t.state, TabState::Failed(_))) {
             self.active = Some(t.key);
             return;
         }
@@ -781,7 +829,7 @@ impl Core {
         let topic = rv::random_topic();
         self.rv.subscribe(&topic, false);
         let req = json!({
-            "t": "req", "reply": topic, "k": raw, "name": self.name, "os": platform(), "from": self.store.my_id, "caps": ["mdp1", "cam1"],
+            "t": "req", "reply": topic, "k": raw, "name": self.name, "os": platform(), "from": self.store.my_id, "caps": ["mdp1", "cam1"], "mode": mode.as_str(),
         });
         self.tabs.push(Tab {
             outbox: Some(req),
@@ -814,6 +862,7 @@ impl Core {
             modes: None,
             term: None,
             term_open: false,
+            mode,
             thumb_saved: false,
             // Test hook: MANYDESK_VIEW=actual starts in 1:1 (unscaled picture).
             view: if std::env::var("MANYDESK_VIEW").as_deref() == Ok("actual") { ViewMode::Actual } else { ViewMode::Fit },
@@ -1300,7 +1349,7 @@ impl Core {
                 let from = msg["from"].as_str().filter(|f| f.len() == 9 && f.chars().all(|c| c.is_ascii_digit())).unwrap_or("").to_string();
                 // Switch sides: the computer we offered ours to connects back; no prompt.
                 if native && self.is_switch_request(&msg) {
-                    let req = Request { reply, key, peer: pubkey, name: msg["name"].as_str().map(|n| n.chars().take(60).collect()).unwrap_or_else(|| t("host.unknown")), os: os_name(msg["os"].as_str().unwrap_or("")).to_string(), from, native, cam, host_key: None, at: Instant::now() };
+                    let req = Request { reply, key, peer: pubkey, name: msg["name"].as_str().map(|n| n.chars().take(60).collect()).unwrap_or_else(|| t("host.unknown")), os: os_name(msg["os"].as_str().unwrap_or("")).to_string(), from, native, cam, mode: SessMode::Desktop, host_key: None, at: Instant::now() };
                     self.start_host(req, Permissions { restart: false, privacy: false, tunnel: false, ..Permissions::default() }, false);
                     return;
                 }
@@ -1318,6 +1367,7 @@ impl Core {
                     from,
                     native,
                     cam,
+                    mode: SessMode::parse(msg["mode"].as_str().unwrap_or("")),
                     at: Instant::now(),
                     host_key: None,
                 });
@@ -1373,7 +1423,9 @@ impl Core {
     /// `hold`: unattended access — no picture or input until the password is proven.
     /// Returns the host key.
     fn start_host(&mut self, req: Request, perms: Permissions, hold: bool) -> u32 {
-        if !self.perms.screen {
+        let mode = req.mode;
+        let perms = mode.mask(perms);
+        if !self.perms.screen && mode == SessMode::Desktop {
             perms::request(true);
         }
         let key = self.next_id();
@@ -1422,7 +1474,8 @@ impl Core {
                 }
             };
             let (w, h) = s.add_video(screen).await;
-            if hold {
+            // no picture for a file transfer or terminal session
+            if hold || mode != SessMode::Desktop {
                 s.hold_video();
             }
             reg.lock().unwrap().insert(sid, s.clone());
@@ -1561,7 +1614,8 @@ impl Core {
         if self.hosts[i].auth.take().is_none() {
             return;
         }
-        self.hosts[i].perms = perms;
+        let mode = self.hosts[i].req.mode;
+        self.hosts[i].perms = mode.mask(perms);
         self.hosts[i].unattended = by_password;
         // The prompt for this request is no longer needed.
         self.queue.retain(|r| r.host_key != Some(key));
@@ -1571,7 +1625,7 @@ impl Core {
         }
         let sid = self.hosts[i].sid;
         self.ctl(sid, json!({ "t": "authok" }));
-        if let Some(s) = self.session(sid) {
+        if let Some(s) = self.session(sid).filter(|_| mode == SessMode::Desktop) {
             s.release_video();
         }
         if self.hosts[i].state == HostState::Live {
@@ -1585,7 +1639,7 @@ impl Core {
         self.switch_live();
         // Accept may have come before the session existed (then authorize() could not
         // reach it): release the picture now. Harmless when it is already flowing.
-        if let Some(s) = self.session(self.hosts[i].sid) {
+        if let Some(s) = self.session(self.hosts[i].sid).filter(|_| self.hosts[i].req.mode == SessMode::Desktop) {
             s.release_video();
         }
         self.send_perms(i);
@@ -1926,6 +1980,16 @@ impl Core {
                 // an older host knows no camera permission (the default would allow it)
                 tab.remote.camera = m["p"]["camera"].as_bool().unwrap_or(false);
                 tab.os = m["os"].as_str().unwrap_or(&tab.os).to_string();
+                // a file transfer or terminal session: its window is the session
+                match tab.mode {
+                    SessMode::Files if !tab.fm.open => {
+                        let key = tab.key;
+                        self.fm_toggle(key);
+                    }
+                    SessMode::Terminal => self.tabs[i].term_open = true,
+                    _ => {}
+                }
+                let tab = &mut self.tabs[i];
                 let (key, cam_on) = (tab.key, tab.cams.mine.is_some());
                 if !tab.remote.control && self.capture_tab == Some(tab.key) {
                     self.set_capture(None);
@@ -2385,6 +2449,10 @@ impl Core {
     /// Opens or closes the file manager (first open lists both home folders).
     pub fn fm_toggle(&mut self, key: u32) {
         let Some(tab) = self.tab(key) else { return };
+        // a file transfer session ends with its window (as in AnyDesk)
+        if tab.mode == SessMode::Files && tab.fm.open {
+            return self.close_tab(key);
+        }
         tab.fm.open = !tab.fm.open;
         if tab.fm.open {
             tab.term_open = false;
@@ -2572,9 +2640,9 @@ impl Core {
             let busy = self.presence.get(&id).is_some_and(|(at, b)| *b && at.elapsed() < PRESENCE_FRESH);
             self.presence.insert(id.clone(), (Instant::now(), busy));
         }
-        if self.ip_wait.as_ref().is_some_and(|(w, q, _)| w.to_string() == ip || v["q"].as_str() == Some(q.as_str())) {
-            self.ip_wait = None;
-            self.connect(&id);
+        if self.ip_wait.as_ref().is_some_and(|(w, q, _, _)| w.to_string() == ip || v["q"].as_str() == Some(q.as_str())) {
+            let mode = self.ip_wait.take().unwrap().2;
+            self.connect_mode(&id, mode);
         }
     }
 
@@ -2707,7 +2775,7 @@ impl Core {
                 // here (macOS: Screen Recording permission). Say so on both ends.
                 let frames = v["framesEncoded"].as_u64().unwrap_or(0);
                 let waited = h.live_since.is_some_and(|t| now.duration_since(t) > Duration::from_secs(12));
-                if frames == 0 && waited && h.auth.is_none() && !h.no_picture_sent {
+                if frames == 0 && waited && h.auth.is_none() && !h.no_picture_sent && h.req.mode == SessMode::Desktop {
                     h.no_picture_sent = true;
                     eprintln!("[host] no frame captured 12 s after the session started (screen recording permission?)");
                     let sid = h.sid;

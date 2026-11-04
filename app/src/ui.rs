@@ -46,6 +46,8 @@ pub struct App {
     thumbs: HashMap<String, (usize, TextureHandle, TextureHandle)>,
     screen_thumbs: HashMap<u32, TextureHandle>,
     req_perms: crate::store::Permissions,
+    /// the request the toggles above were set up for (its time)
+    req_seen: Option<Instant>,
     frames: HashMap<u32, usize>,
     mac_local: bool,
     host_chat: Option<u32>,
@@ -160,9 +162,10 @@ impl App {
         th::setup(&cc.egui_ctx);
         crate::perf::startup("fonts");
         let mut core = Core::new();
-        // Test hook: MANYDESK_AUTOCONNECT=<id> connects on start (headless tests).
+        // Test hook: MANYDESK_AUTOCONNECT=<id> connects on start (headless tests), as
+        // MANYDESK_AUTOMODE=files|terminal says (default: the desktop).
         if let Ok(id) = std::env::var("MANYDESK_AUTOCONNECT") {
-            core.connect(&id);
+            core.connect_mode(&id, crate::core::SessMode::parse(&std::env::var("MANYDESK_AUTOMODE").unwrap_or_default()));
         }
         let stun_text = core.store.stun.join("\n");
         let turn = core.store.turn.clone();
@@ -176,6 +179,7 @@ impl App {
         let touchpad = core.store.touchpad;
         App {
             req_perms: core.store.perms,
+            req_seen: None,
             core,
             rx,
             icons: Icons::default(),
@@ -264,7 +268,9 @@ impl eframe::App for App {
                 let since = T0.lock().unwrap().get_or_insert_with(Instant::now).elapsed();
                 let step = TSTEP.load(SeqCst);
                 if step == 0 && since > Duration::from_secs(3) {
-                    self.toggle_term(key);
+                    if !self.core.tabs.iter().any(|t| t.key == key && t.term_open) {
+                        self.toggle_term(key);
+                    }
                     TSTEP.store(1, SeqCst);
                 } else if step == 1 && since > Duration::from_secs(6) {
                     if let Some(term) = self.core.tab(key).and_then(|t| t.term.as_ref()) {
@@ -502,7 +508,7 @@ impl App {
             p.circle_filled(Pos2::new(cx + 3.5, cy), 3.5, c);
             cx += 7.0 + 7.0;
         }
-        self.icons.paint(ui, if tab.is_some() { "monitor" } else { "home" }, Rect::from_center_size(Pos2::new(cx + 9.0, cy), Vec2::splat(18.0)), fg);
+        self.icons.paint(ui, tab.map_or("home", |t| mode_icon(t.mode)), Rect::from_center_size(Pos2::new(cx + 9.0, cy), Vec2::splat(18.0)), fg);
         cx += 18.0 + 7.0;
         let g = ui.painter().layout_no_wrap(label, fnt, fg);
         let clip = Rect::from_min_size(Pos2::new(cx, rect.top()), Vec2::new(label_w, rect.height()));
@@ -542,7 +548,10 @@ impl App {
         p.rect(ab, 6.0, if focused { th::SURFACE } else { th::SURFACE_2 }, Stroke::new(1.0, if focused { th::ACCENT } else { th::BORDER_STRONG }), StrokeKind::Inside);
         self.icons.paint(ui, "monitor", Rect::from_min_size(Pos2::new(ab.left() + 10.0, ab.center().y - 9.0), Vec2::splat(18.0)), th::MUTED);
         let go = Rect::from_min_size(Pos2::new(ab.right() - 4.0 - 30.0, ab.center().y - 13.0), Vec2::new(30.0, 26.0));
-        let input = Rect::from_min_max(Pos2::new(ab.left() + 10.0 + 18.0 + 8.0, ab.top() + 4.0), Pos2::new(go.left() - 8.0, ab.bottom() - 4.0));
+        // AnyDesk's "Browse files" beside Connect (and RustDesk's terminal): no desktop
+        let term_b = go.translate(Vec2::new(-30.0 - 4.0, 0.0));
+        let files_b = term_b.translate(Vec2::new(-30.0 - 2.0, 0.0));
+        let input = Rect::from_min_max(Pos2::new(ab.left() + 10.0 + 18.0 + 8.0, ab.top() + 4.0), Pos2::new(files_b.left() - 6.0, ab.bottom() - 4.0));
         let mut submit = false;
         ui.scope_builder(UiBuilder::new().max_rect(input), |ui| {
             // No length limit: pasted text like "ID: 123 456 789" is fine, only digits count.
@@ -576,9 +585,21 @@ impl App {
         if gr.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        if (gr.clicked() || submit) && !self.address.trim().is_empty() {
+        let mut mode = (gr.clicked() || submit).then_some(crate::core::SessMode::Desktop);
+        for (r, icon, tip, m) in [(files_b, "file", "tt.browse", crate::core::SessMode::Files), (term_b, "terminal", "tt.termOnly", crate::core::SessMode::Terminal)] {
+            let resp = ui.interact(r, Id::unique(("rv-mode", icon)), Sense::click()).on_hover_text(t(tip));
+            if resp.hovered() {
+                ui.painter().rect_filled(r, 4.0, th::SURFACE_2);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            self.icons.paint(ui, icon, Rect::from_center_size(r.center(), Vec2::splat(17.0)), if resp.hovered() { th::ACCENT } else { th::MUTED });
+            if resp.clicked() {
+                mode = Some(m);
+            }
+        }
+        if let Some(m) = mode.filter(|_| !self.address.trim().is_empty()) {
             let a = std::mem::take(&mut self.address);
-            self.core.connect(&a);
+            self.core.connect_mode(&a, m);
         }
     }
 
@@ -876,14 +897,50 @@ impl App {
             if hover {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if resp.on_hover_text(t("tt.connect")).clicked() {
-                connect = Some(p.id.clone());
+            let resp = resp.on_hover_text(t("tt.connect"));
+            if resp.clicked() {
+                connect = Some((p.id.clone(), crate::core::SessMode::Desktop));
             }
+            resp.context_menu(|ui| {
+                if let Some(Some(m)) = self.session_menu(ui, false) {
+                    connect = Some((p.id.clone(), m));
+                }
+            });
             ui.add_space(8.0);
         }
-        if let Some(id) = connect {
-            self.core.connect(&id);
+        if let Some((id, m)) = connect {
+            self.core.connect_mode(&id, m);
         }
+    }
+
+    /// Connect / File transfer / Terminal (and Wake-on-LAN): the kinds of session a recent or
+    /// LAN computer offers. Some(None): wake it.
+    fn session_menu(&self, ui: &mut Ui, can_wake: bool) -> Option<Option<crate::core::SessMode>> {
+        use crate::core::SessMode as M;
+        let mut pick = None;
+        ui.set_min_width(190.0);
+        for (icon, key, m) in [("monitor", "ctx.connect", M::Desktop), ("file", "mode.files", M::Files), ("terminal", "mode.terminal", M::Terminal)] {
+            let r = ui.horizontal(|ui| {
+                self.icons.show(ui, icon, 15.0, th::MUTED);
+                ui.add(egui::Button::new(t(key)).frame(false))
+            });
+            if r.inner.clicked() {
+                pick = Some(Some(m));
+                ui.close();
+            }
+        }
+        if can_wake {
+            ui.separator();
+            let r = ui.horizontal(|ui| {
+                self.icons.show(ui, "power", 15.0, th::MUTED);
+                ui.add(egui::Button::new(t("lan.wake")).frame(false))
+            });
+            if r.inner.clicked() {
+                pick = Some(None);
+                ui.close();
+            }
+        }
+        pick
     }
 
     fn recent_grid(&mut self, ui: &mut Ui) {
@@ -910,6 +967,7 @@ impl App {
         let mut connect = None;
         let mut forget = None;
         let mut wake = None;
+        let mut menu_pick: Option<(String, Option<crate::core::SessMode>)> = None;
         for (i, r) in recents.iter().enumerate() {
             let (cx, cy) = ((i % cols) as f32, (i / cols) as f32);
             let rect = Rect::from_min_size(area.min + Vec2::new(cx * (tw + gap), cy * (tile_h + gap)), Vec2::new(tw, tile_h));
@@ -1020,6 +1078,21 @@ impl App {
             if resp.clicked() && !removed {
                 connect = Some(r.id.clone());
             }
+            // right click (a long press on a phone): the other kinds of session, as AnyDesk's
+            resp.context_menu(|ui| {
+                if let Some(m) = self.session_menu(ui, state == "offline" && !r.macs.is_empty()) {
+                    menu_pick = Some((r.id.clone(), m));
+                }
+                ui.separator();
+                if ui.button(t("tt.forget")).clicked() {
+                    forget = Some(r.id.clone());
+                }
+            });
+        }
+        match menu_pick {
+            Some((id, Some(m))) => self.core.connect_mode(&id, m),
+            Some((id, None)) => wake = Some(id),
+            None => {}
         }
         if let Some(id) = forget {
             self.core.store.forget(&id);
@@ -2061,6 +2134,9 @@ impl App {
         let (screens, cur_screen, view) = (tab.screens.clone(), tab.screen, tab.view);
         let (fm_open, fm_busy) = (tab.fm.open, tab.fm.transfers.iter().filter(|t| !t.finished).count());
         let (term_ok, term_on) = (tab.remote.terminal, tab.term_open);
+        let (mode, desk) = (tab.mode, tab.mode == crate::core::SessMode::Desktop);
+        // no picture: the route and the delay, not fps and codec
+        let stats = if desk { stats } else { stats.split(" · ").take(2).collect::<Vec<_>>().join(" · ") };
         let (privacy_on, board_on) = (tab.privacy, self.boards.get(&key).is_some_and(|b| b.on));
         // a phone: the bar scrolls sideways, the name is in the tab already
         let narrow = compact(ui.ctx());
@@ -2090,82 +2166,85 @@ impl App {
                     t.chat.unread = 0;
                 }
             }
-            if th::tbbtn(ui, &self.icons, "mic", mic_on, false, &t(if mic_on { "tt.micOn" } else { "tt.mic" })).clicked() && live {
-                self.core.set_mic(Some(key), None, !mic_on);
-            }
-            if th::tbbtn(ui, &self.icons, "camera", cam_on, false, &t(if cam_on { "tt.camOn" } else { "tt.cam" })).clicked() && live {
-                self.core.set_camera(Some(key), None, !cam_on);
-            }
-            let r = th::tbbtn(ui, &self.icons, "file", fm_open, false, &t("tt.fm"));
-            th::badge(ui, r.rect, fm_busy);
-            if r.clicked() && live {
-                self.core.fm_toggle(key);
-            }
-            if term_ok && th::tbbtn(ui, &self.icons, "terminal", term_on, false, &t("tt.term")).clicked() && live {
-                self.toggle_term(key);
-            }
-            // a phone has no keyboard until asked for: typing into the remote screen
-            if cfg!(mobile) && th::tbbtn(ui, &self.icons, "keyboard", self.soft_keyboard, false, &t("tt.keyboard")).clicked() && live {
-                self.soft_keyboard = !self.soft_keyboard;
-                if self.soft_keyboard {
-                    self.core.set_capture(Some(key));
+            // a file transfer or terminal session: only its own window, chat and the end
+            if desk {
+                if th::tbbtn(ui, &self.icons, "mic", mic_on, false, &t(if mic_on { "tt.micOn" } else { "tt.mic" })).clicked() && live {
+                    self.core.set_mic(Some(key), None, !mic_on);
                 }
-            }
-            // .tbselect
-            ui.add_space(4.0);
-            self.icons.show(ui, "gauge", 18.0, th::MUTED);
-            let mut q = quality;
-            egui::ComboBox::from_id_salt(("q", key))
-                .width(96.0)
-                .selected_text(text(t(&format!("q.{}", q.as_str())), 12.5, W::Regular, th::TEXT))
-                .show_ui(ui, |ui| {
-                    for m in [Mode::Auto, Mode::Speed, Mode::Balanced, Mode::Quality] {
-                        ui.selectable_value(&mut q, m, t(&format!("q.{}", m.as_str())));
-                    }
-                })
-                .response
-                .on_hover_text(t("tt.quality"));
-            if q != quality {
-                self.core.set_quality(key, q);
-            }
-            ui.add_space(4.0);
-            self.icons.show(ui, "monitor", 18.0, th::MUTED);
-            let mut v = view;
-            egui::ComboBox::from_id_salt(("v", key))
-                .width(150.0)
-                .selected_text(text(t(&format!("view.{}", v.as_str())), 12.5, W::Regular, th::TEXT))
-                .show_ui(ui, |ui| {
-                    for m in [ViewMode::Fit, ViewMode::Actual, ViewMode::Stretch] {
-                        ui.selectable_value(&mut v, m, t(&format!("view.{}", m.as_str())));
-                    }
-                })
-                .response
-                .on_hover_text(t("tt.view"));
-            if v != view {
-                if let Some(tab) = self.core.tab(key) {
-                    tab.view = v;
-                    tab.pan = Vec2::ZERO;
+                if th::tbbtn(ui, &self.icons, "camera", cam_on, false, &t(if cam_on { "tt.camOn" } else { "tt.cam" })).clicked() && live {
+                    self.core.set_camera(Some(key), None, !cam_on);
                 }
-            }
-            let r = th::tbbtn(ui, &self.icons, "more", privacy_on || board_on, false, &t("tt.actions"));
-            egui::Popup::menu(&r).show(|ui| self.actions_menu(ui, key));
-            if th::tbbtn(ui, &self.icons, if self.fullscreen { "shrink" } else { "expand" }, false, false, &t("tt.fs")).clicked() {
-                self.fullscreen = !self.fullscreen;
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-            }
-            // The host's displays (only when it has more than one): click or Ctrl+Alt+Shift+←/→.
-            if screens.len() > 1 {
-                let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, 22.0), Sense::hover());
-                ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, th::BORDER));
-                for (n, sc) in screens.iter().enumerate() {
-                    let tip = format!("{} · {}×{}\n{}", sc.name, sc.width, sc.height, t("tt.screenKeys"));
-                    if th::screenbtn(ui, &self.icons, n + 1, cur_screen == Some(sc.id), &tip).clicked() {
-                        self.core.switch_screen(key, Some(sc.id), 0);
+                let r = th::tbbtn(ui, &self.icons, "file", fm_open, false, &t("tt.fm"));
+                th::badge(ui, r.rect, fm_busy);
+                if r.clicked() && live {
+                    self.core.fm_toggle(key);
+                }
+                if term_ok && th::tbbtn(ui, &self.icons, "terminal", term_on, false, &t("tt.term")).clicked() && live {
+                    self.toggle_term(key);
+                }
+                // a phone has no keyboard until asked for: typing into the remote screen
+                if cfg!(mobile) && th::tbbtn(ui, &self.icons, "keyboard", self.soft_keyboard, false, &t("tt.keyboard")).clicked() && live {
+                    self.soft_keyboard = !self.soft_keyboard;
+                    if self.soft_keyboard {
+                        self.core.set_capture(Some(key));
                     }
                 }
-            }
-            if remote_mic {
-                self.icons.show(ui, "speaker", 18.0, th::OK).on_hover_text(t("tt.remoteMic"));
+                // .tbselect
+                ui.add_space(4.0);
+                self.icons.show(ui, "gauge", 18.0, th::MUTED);
+                let mut q = quality;
+                egui::ComboBox::from_id_salt(("q", key))
+                    .width(96.0)
+                    .selected_text(text(t(&format!("q.{}", q.as_str())), 12.5, W::Regular, th::TEXT))
+                    .show_ui(ui, |ui| {
+                        for m in [Mode::Auto, Mode::Speed, Mode::Balanced, Mode::Quality] {
+                            ui.selectable_value(&mut q, m, t(&format!("q.{}", m.as_str())));
+                        }
+                    })
+                    .response
+                    .on_hover_text(t("tt.quality"));
+                if q != quality {
+                    self.core.set_quality(key, q);
+                }
+                ui.add_space(4.0);
+                self.icons.show(ui, "monitor", 18.0, th::MUTED);
+                let mut v = view;
+                egui::ComboBox::from_id_salt(("v", key))
+                    .width(150.0)
+                    .selected_text(text(t(&format!("view.{}", v.as_str())), 12.5, W::Regular, th::TEXT))
+                    .show_ui(ui, |ui| {
+                        for m in [ViewMode::Fit, ViewMode::Actual, ViewMode::Stretch] {
+                            ui.selectable_value(&mut v, m, t(&format!("view.{}", m.as_str())));
+                        }
+                    })
+                    .response
+                    .on_hover_text(t("tt.view"));
+                if v != view {
+                    if let Some(tab) = self.core.tab(key) {
+                        tab.view = v;
+                        tab.pan = Vec2::ZERO;
+                    }
+                }
+                let r = th::tbbtn(ui, &self.icons, "more", privacy_on || board_on, false, &t("tt.actions"));
+                egui::Popup::menu(&r).show(|ui| self.actions_menu(ui, key));
+                if th::tbbtn(ui, &self.icons, if self.fullscreen { "shrink" } else { "expand" }, false, false, &t("tt.fs")).clicked() {
+                    self.fullscreen = !self.fullscreen;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                }
+                // The host's displays (only when it has more than one): click or Ctrl+Alt+Shift+←/→.
+                if screens.len() > 1 {
+                    let (sep, _) = ui.allocate_exact_size(Vec2::new(9.0, 22.0), Sense::hover());
+                    ui.painter().vline(sep.center().x, sep.y_range(), Stroke::new(1.0, th::BORDER));
+                    for (n, sc) in screens.iter().enumerate() {
+                        let tip = format!("{} · {}×{}\n{}", sc.name, sc.width, sc.height, t("tt.screenKeys"));
+                        if th::screenbtn(ui, &self.icons, n + 1, cur_screen == Some(sc.id), &tip).clicked() {
+                            self.core.switch_screen(key, Some(sc.id), 0);
+                        }
+                    }
+                }
+                if remote_mic {
+                    self.icons.show(ui, "speaker", 18.0, th::OK).on_hover_text(t("tt.remoteMic"));
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if th::tbbtn(ui, &self.icons, "power", false, true, &t("tt.disconnect")).clicked() {
@@ -2180,7 +2259,7 @@ impl App {
                 let tag_w = if os.is_empty() {
                     0.0
                 } else {
-                    let tag = t(if control { "perm.ctlOn" } else { "perm.viewOnly" });
+                    let tag = mode_tag(mode, control);
                     ui.painter().layout_no_wrap(format!("{os} · {tag}"), th::font(11.5, W::Medium), th::TEXT).size().x + 16.0 + 14.0
                 };
                 let max = (ui.available_width() - tag_w - 8.0).max(0.0);
@@ -2192,7 +2271,7 @@ impl App {
                 ui.painter().galley(r.min, g, th::MUTED);
                 if !os.is_empty() {
                     ui.add_space(6.0);
-                    let (tag, fg, bg) = if control { (t("perm.ctlOn"), th::OK, th::OK_SOFT) } else { (t("perm.viewOnly"), th::MUTED, th::SURFACE_2) };
+                    let (tag, fg, bg) = if control || !desk { (mode_tag(mode, control), th::OK, th::OK_SOFT) } else { (t("perm.viewOnly"), th::MUTED, th::SURFACE_2) };
                     pill(ui, th::font(11.5, W::Medium), 0.0, &format!("{os} · {tag}"), fg, bg);
                 }
             });
@@ -2475,7 +2554,11 @@ impl App {
             let (mic_on, cam_on) = self.core.tabs.iter().find(|t| t.key == key).map(|t| (t.mic.is_some(), t.cams.mine.is_some())).unwrap_or((false, false));
             items.push(("power", t("tt.disconnect"), false));
             items.push(("home", t("home"), false));
-            if live {
+            let desk = self.core.tabs.iter().find(|t| t.key == key).is_none_or(|t| t.mode == crate::core::SessMode::Desktop);
+            if live && !desk {
+                items.push(("chat", t("tt.chat"), chat_open));
+            }
+            if live && desk {
                 items.push(("more", t("tt.actions"), false));
                 items.push(("chat", t("tt.chat"), chat_open));
                 items.push(("file", t("tt.fm"), fm_open));
@@ -3422,6 +3505,15 @@ impl App {
             let (r, _) = ui.allocate_exact_size(screen.size(), Sense::click());
             ui.painter().rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(16, 24, 40, 89));
         });
+        // a file transfer or terminal request: what it needs is ticked (and can be unticked)
+        if self.req_seen != Some(req.at) {
+            self.req_seen = Some(req.at);
+            match req.mode {
+                crate::core::SessMode::Files => self.req_perms.files = true,
+                crate::core::SessMode::Terminal => self.req_perms.terminal = true,
+                crate::core::SessMode::Desktop => {}
+            }
+        }
         let left = 60u64.saturating_sub(req.at.elapsed().as_secs());
         let mut decision = None;
         let w = 400.0_f32.min(screen.width() - 32.0);
@@ -3429,6 +3521,18 @@ impl App {
             egui::Frame::new().fill(th::SURFACE).stroke(Stroke::new(1.0, th::BORDER)).corner_radius(12).shadow(th::shadow_lg()).inner_margin(22).show(ui, |ui| {
                 ui.set_width(w - 44.0);
                 self.accept_head(ui, &req.name, &req.os, &req.from, None);
+                // AnyDesk says what kind of session it is: a file transfer has no screen
+                if req.mode != crate::core::SessMode::Desktop {
+                    ui.add_space(12.0);
+                    egui::Frame::new().fill(th::ACCENT_SOFT).corner_radius(8).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            self.icons.show(ui, mode_icon(req.mode), 16.0, th::ACCENT);
+                            let k = if req.mode == crate::core::SessMode::Files { "req.wantsFiles" } else { "req.wantsTerm" };
+                            ui.label(text(t(k), 13.0, W::Medium, th::TEXT));
+                        });
+                    });
+                }
                 ui.add_space(16.0);
                 ui.label(text(t("acc.allow").to_uppercase(), 11.5, W::Semibold, th::MUTED));
                 ui.add_space(6.0);
@@ -4015,6 +4119,24 @@ fn reformat_id(edited: &str, cursor: usize) -> (String, usize) {
     let n = digits_before.min(d.len());
     let at = if n == 0 { 0 } else { text.char_indices().filter(|(_, c)| c.is_ascii_digit()).nth(n - 1).map(|(i, _)| i + 1).unwrap_or(text.len()) };
     (text, at)
+}
+
+/// The session's tag in the toolbar: what it can do (a desktop) or what it is.
+fn mode_tag(mode: crate::core::SessMode, control: bool) -> String {
+    match mode {
+        crate::core::SessMode::Files => t("mode.files"),
+        crate::core::SessMode::Terminal => t("mode.terminal"),
+        crate::core::SessMode::Desktop => t(if control { "perm.ctlOn" } else { "perm.viewOnly" }),
+    }
+}
+
+/// The icon of a session of this mode (tabs, requests).
+fn mode_icon(mode: crate::core::SessMode) -> &'static str {
+    match mode {
+        crate::core::SessMode::Files => "file",
+        crate::core::SessMode::Terminal => "terminal",
+        crate::core::SessMode::Desktop => "monitor",
+    }
 }
 
 /// A QR code (black modules on white, with a quiet zone).
