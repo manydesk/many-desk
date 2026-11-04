@@ -348,6 +348,13 @@ pub struct Request {
     pub at: Instant,
 }
 
+impl Host {
+    /// How long this viewer has been in (zero before).
+    pub fn live_for(&self) -> Duration {
+        self.live_since.map(|t| t.elapsed()).unwrap_or_default()
+    }
+}
+
 #[derive(PartialEq)]
 pub enum HostState {
     Starting,
@@ -1590,7 +1597,7 @@ impl Core {
 
     pub fn set_host_perms(&mut self, key: u32, perms: Permissions) {
         let Some(i) = self.hosts.iter().position(|h| h.key == key && h.auth.is_none()) else { return };
-        self.hosts[i].perms = perms;
+        self.hosts[i].perms = self.hosts[i].req.mode.mask(perms);
         self.send_perms(i);
         self.update_host_input();
     }
@@ -1988,6 +1995,11 @@ impl Core {
                     }
                     SessMode::Terminal => self.tabs[i].term_open = true,
                     _ => {}
+                }
+                // allowed now (the host ticked Terminal): a shell refused before starts again
+                let tab = &mut self.tabs[i];
+                if tab.remote.terminal && tab.term.as_ref().is_some_and(|t| t.ended.is_some()) {
+                    tab.term = None;
                 }
                 let tab = &mut self.tabs[i];
                 let (key, cam_on) = (tab.key, tab.cams.mine.is_some());

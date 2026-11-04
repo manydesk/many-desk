@@ -398,10 +398,21 @@ impl App {
     /// The core's turn: events in, sessions forward (also from android's background tick).
     fn tick_core(&mut self) {
         self.core.tick(&self.rx);
+        if std::env::var_os("MANYDESK_TESTGRANTTERM").is_some() {
+            if let Some(h) = self.core.hosts.iter().find(|h| h.state == crate::core::HostState::Live && !h.perms.terminal && h.live_for() > Duration::from_secs(8)) {
+                let (k, p) = (h.key, crate::store::Permissions { terminal: true, ..h.perms });
+                eprintln!("[test] host ticks Terminal");
+                self.core.set_host_perms(k, p);
+            }
+        }
         // Test hook: accept requests even while the window is hidden (no ui pass then).
         if self.core.pending.is_some() && std::env::var_os("MANYDESK_AUTOACCEPT").is_some() {
             // tests may ask for every permission (restart, privacy, tunnel included)
-            let perms = if std::env::var_os("MANYDESK_AUTOFULL").is_some() { crate::store::Permissions::FULL } else { self.req_perms };
+            let mut perms = if std::env::var_os("MANYDESK_AUTOFULL").is_some() { crate::store::Permissions::FULL } else { self.req_perms };
+            // MANYDESK_TESTGRANTTERM=1: Terminal is off at first and ticked 8 s into the session
+            if std::env::var_os("MANYDESK_TESTGRANTTERM").is_some() {
+                perms.terminal = false;
+            }
             self.core.decide(true, perms);
         }
         self.core.apply_isolation();
@@ -893,19 +904,27 @@ impl App {
             let os = crate::core::os_name(&p.os);
             let sub = format!("{} · {}{}", rv::format_id(&p.id), p.ip, if os.is_empty() { String::new() } else { format!(" · {os}") });
             ui.painter().text(Pos2::new(r.left() + 46.0, r.center().y + 2.0), Align2::LEFT_TOP, sub, th::mono(11.5, W::Regular), th::MUTED);
-            ui.painter().circle_filled(Pos2::new(r.right() - 20.0, r.center().y), 4.5, th::OK);
+            ui.painter().circle_filled(Pos2::new(r.right() - 48.0, r.center().y), 4.5, th::OK);
             if hover {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
+            let mr = Rect::from_center_size(Pos2::new(r.right() - 20.0, r.center().y), Vec2::new(28.0, 26.0));
+            let mresp = ui.interact(mr, Id::unique(("lan-more", &p.id)), Sense::click()).on_hover_text(t("tt.more"));
+            if mresp.hovered() {
+                ui.painter().rect_filled(mr, 6.0, th::BG);
+            }
+            self.icons.paint(ui, "more", Rect::from_center_size(mr.center(), Vec2::splat(16.0)), if mresp.hovered() { th::TEXT } else { th::MUTED });
             let resp = resp.on_hover_text(t("tt.connect"));
-            if resp.clicked() {
+            if resp.clicked() && !ui.rect_contains_pointer(mr) {
                 connect = Some((p.id.clone(), crate::core::SessMode::Desktop));
             }
-            resp.context_menu(|ui| {
+            let mut row_menu = |ui: &mut Ui| {
                 if let Some(Some(m)) = self.session_menu(ui, false) {
                     connect = Some((p.id.clone(), m));
                 }
-            });
+            };
+            egui::Popup::menu(&mresp).show(&mut row_menu);
+            resp.context_menu(&mut row_menu);
             ui.add_space(8.0);
         }
         if let Some((id, m)) = connect {
@@ -1036,9 +1055,12 @@ impl App {
             p.galley(Pos2::new(dc.x + 4.0 + 6.0, pill.center().y - g.size().y / 2.0), g, col);
             // .tile-meta
             let meta = Rect::from_min_max(Pos2::new(rect.left() + 12.0, thumb.bottom() + 10.0), Pos2::new(rect.right() - 12.0, rect.bottom() - 10.0));
+            // the ⋯ has a column of its own at the right, across both lines
+            let mr = Rect::from_min_max(Pos2::new(meta.right() - 26.0, meta.top() + 2.0), Pos2::new(meta.right() + 4.0, meta.bottom() - 2.0));
+            let text_right = mr.left() - 6.0;
             let tg = p.layout_no_wrap(time_ago(r.ts), th::font(11.0, W::Regular), th::MUTED);
-            p.galley(Pos2::new(meta.right() - tg.size().x, meta.top() + 19.0 - tg.size().y / 2.0), tg.clone(), th::MUTED);
-            let name_w = meta.width() - tg.size().x - 8.0;
+            p.galley(Pos2::new(text_right - tg.size().x, meta.top() + 27.0 - tg.size().y / 2.0), tg.clone(), th::MUTED);
+            let name_w = text_right - meta.left() - 4.0;
             let name = if r.name.is_empty() { rv::format_id(&r.id) } else { r.name.clone() };
             let mut job = egui::text::LayoutJob::simple_singleline(name, th::font(13.5, W::Semibold), th::TEXT);
             job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
@@ -1075,19 +1097,30 @@ impl App {
             if hover {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            if resp.clicked() && !removed {
+            let in_more = ui.rect_contains_pointer(mr);
+            if resp.clicked() && !removed && !in_more {
                 connect = Some(r.id.clone());
             }
-            // right click (a long press on a phone): the other kinds of session, as AnyDesk's
-            resp.context_menu(|ui| {
-                if let Some(m) = self.session_menu(ui, state == "offline" && !r.macs.is_empty()) {
+            // the ⋯ in the corner (AnyDesk's tile menu), or a right click / long press: the
+            // other kinds of session
+            let mresp = ui.interact(mr, Id::unique(("tile-more", &r.id)), Sense::click()).on_hover_text(t("tt.more"));
+            let menu_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&mresp));
+            if mresp.hovered() || menu_open {
+                ui.painter().rect_filled(mr, 6.0, th::SURFACE_2);
+            }
+            self.icons.paint(ui, "more", Rect::from_center_size(mr.center(), Vec2::splat(16.0)), if mresp.hovered() || menu_open { th::TEXT } else { th::MUTED });
+            let wake_ok = state == "offline" && !r.macs.is_empty();
+            let mut tile_menu = |ui: &mut Ui| {
+                if let Some(m) = self.session_menu(ui, wake_ok) {
                     menu_pick = Some((r.id.clone(), m));
                 }
                 ui.separator();
                 if ui.button(t("tt.forget")).clicked() {
                     forget = Some(r.id.clone());
                 }
-            });
+            };
+            egui::Popup::menu(&mresp).show(&mut tile_menu);
+            resp.context_menu(&mut tile_menu);
         }
         match menu_pick {
             Some((id, Some(m))) => self.core.connect_mode(&id, m),

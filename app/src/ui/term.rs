@@ -136,6 +136,14 @@ impl App {
         let inner = area.shrink(8.0);
         let rows = ((inner.height() / cell.y).floor() as u16).max(2);
         let cols = ((inner.width() / cell.x).floor() as u16).max(2);
+        // the shell starts once the host allows it (it may tick Terminal during the session)
+        let allowed = self.core.tabs.iter().find(|t| t.key == key).is_some_and(|t| t.remote.terminal);
+        if !allowed {
+            let g = p.layout(t("term.waitPerm"), th::font(14.0, W::Medium), FG, (area.width() - 80.0).max(120.0));
+            p.galley(Pos2::new(area.center().x - g.size().x / 2.0, area.center().y - g.size().y / 2.0), g, FG);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
         if self.core.tabs.iter().find(|t| t.key == key).is_some_and(|t| t.term.is_none()) {
             self.core.term_open(key, rows, cols);
         }
