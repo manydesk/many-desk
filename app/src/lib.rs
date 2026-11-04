@@ -8,6 +8,7 @@ mod diag;
 mod fm;
 mod i18n;
 mod input;
+mod lan;
 mod keymap;
 mod keys;
 mod mdp;

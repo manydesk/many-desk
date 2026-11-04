@@ -141,7 +141,9 @@ impl Rendezvous {
     }
 
     pub fn start(self: &Arc<Self>) {
-        for ep in &self.endpoints {
+        // Test hook: MANYDESK_TESTNORELAY=1 opens no relay or broker (the LAN alone, lan.rs).
+        let none = std::env::var_os("MANYDESK_TESTNORELAY").is_some();
+        for ep in self.endpoints.iter().filter(|_| !none) {
             let me = self.clone();
             let ep = ep.clone();
             crate::rt::spawn(async move {
@@ -237,6 +239,7 @@ impl Rendezvous {
         ev["id"] = json!(id);
         ev["sig"] = json!(sig);
         self.seen.lock().unwrap().insert(id.clone()); // ignore our own echo
+        crate::lan::send_event(&ev);
 
         let ev_text = ev.to_string();
         let mut brokers = 0;
@@ -265,7 +268,8 @@ impl Rendezvous {
         PublishResult { ok: relays + brokers, sent: open.len() + brokers, relays, brokers }
     }
 
-    fn on_event(&self, ev: &Value) {
+    /// An event from a relay, a broker or the LAN (lan.rs): checked, then delivered.
+    pub fn on_event(&self, ev: &Value) {
         let (Some(id), Some(content), Some(kind)) = (ev["id"].as_str(), ev["content"].as_str(), ev["kind"].as_u64()) else { return };
         if kind != KIND || content.len() > 64 * 1024 || self.seen.lock().unwrap().contains(id) {
             return;

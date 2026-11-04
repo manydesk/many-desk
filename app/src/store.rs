@@ -16,6 +16,14 @@ pub struct Recent {
     /// remembered unattended-access key for this computer (salt + derived key, hex)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<(String, String)>,
+    /// that computer trusts this one: no TOTP code is asked (hex token it gave us)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<String>,
+    /// its network cards and LAN address, as it told on the LAN (Wake-on-LAN)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macs: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ip: String,
 }
 
 /// What a viewer may do on this computer. The accept window, the session card and the
@@ -32,17 +40,19 @@ pub struct Permissions {
     pub tunnel: bool,
     /// either side may show its camera (the other side sees it in a small window)
     pub camera: bool,
+    /// a shell on this computer (Actions → Terminal)
+    pub terminal: bool,
 }
 
 impl Default for Permissions {
     fn default() -> Self {
-        Permissions { control: true, clipboard: true, files: true, sound: true, restart: false, privacy: false, tunnel: false, camera: true }
+        Permissions { control: true, clipboard: true, files: true, sound: true, restart: false, privacy: false, tunnel: false, camera: true, terminal: false }
     }
 }
 
 impl Permissions {
-    pub const NONE: Permissions = Permissions { control: false, clipboard: false, files: false, sound: false, restart: false, privacy: false, tunnel: false, camera: false };
-    pub const FULL: Permissions = Permissions { control: true, clipboard: true, files: true, sound: true, restart: true, privacy: true, tunnel: true, camera: true };
+    pub const NONE: Permissions = Permissions { control: false, clipboard: false, files: false, sound: false, restart: false, privacy: false, tunnel: false, camera: false, terminal: false };
+    pub const FULL: Permissions = Permissions { control: true, clipboard: true, files: true, sound: true, restart: true, privacy: true, tunnel: true, camera: true, terminal: true };
 }
 
 /// Unattended access: a password (only a key derived from it is kept) and optionally a
@@ -57,7 +67,24 @@ pub struct Unattended {
     /// base32 TOTP secret; empty = no second factor
     pub totp: String,
     pub perms: Permissions,
+    /// devices that passed the TOTP code once and need only the password since
+    pub trusted: Vec<Trusted>,
 }
+
+/// A trusted device (AnyDesk/RustDesk: "trust this device" after the second factor).
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct Trusted {
+    /// the viewer's ManyDesk ID, its name then and when it was trusted (ms)
+    pub id: String,
+    pub name: String,
+    pub ts: i64,
+    /// hex: 32 random bytes the viewer keeps; it proves them per session (auth::trust_proof)
+    pub token: String,
+}
+
+/// At most this many trusted devices (the oldest goes).
+pub const MAX_TRUSTED: usize = 128;
 
 /// One line of the connection log.
 #[derive(Serialize, Deserialize, Clone)]
@@ -97,6 +124,8 @@ pub struct Store {
     pub autoupdate: bool,
     /// phones: a finger moves the pointer like a touchpad (off: it works where it touches)
     pub touchpad: bool,
+    /// answer ManyDesks on the local network (lan.rs)
+    pub lan_visible: bool,
 }
 
 /// TURN relay settings (Settings → TURN), as in the web build.
@@ -150,6 +179,7 @@ impl Default for Store {
             turn: TurnCfg { provider: "cloudflare".into(), ..Default::default() },
             autoupdate: true,
             touchpad: true,
+            lan_visible: true,
         }
     }
 }
@@ -203,8 +233,8 @@ impl Store {
     /// Most recent first, at most 12.
     pub fn remember(&mut self, id: &str, name: &str, os: &str) {
         let prev = self.recent.iter().position(|r| r.id == id).map(|i| self.recent.remove(i));
-        let (thumb, auth) = prev.map(|r| (r.thumb, r.auth)).unwrap_or_default();
-        self.recent.insert(0, Recent { id: id.into(), name: name.into(), os: os.into(), ts: crate::rv::now_ms(), thumb, auth });
+        let (thumb, auth, trust, macs, ip) = prev.map(|r| (r.thumb, r.auth, r.trust, r.macs, r.ip)).unwrap_or_default();
+        self.recent.insert(0, Recent { id: id.into(), name: name.into(), os: os.into(), ts: crate::rv::now_ms(), thumb, auth, trust, macs, ip });
         self.recent.truncate(12);
         self.save();
     }

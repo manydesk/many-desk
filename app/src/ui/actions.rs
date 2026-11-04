@@ -97,6 +97,42 @@ impl App {
             self.core.set_lock_on_end(key, l);
         }
         ui.separator();
+        // the remote display's resolution (asked for when the menu opens)
+        section(ui, t("res.title"));
+        if live && perms.control {
+            self.core.want_modes(key);
+            let modes = self.core.tabs.iter().find(|t| t.key == key).and_then(|t| t.modes.clone()).unwrap_or_default();
+            if modes.virtual_ok && !modes.asked {
+                let mut vd = modes.vd_on;
+                if ui.checkbox(&mut vd, t("vd.add")).on_hover_text(t("vd.hint")).changed() {
+                    self.core.set_vdisplay(key, vd);
+                    ui.close();
+                }
+            }
+            if modes.asked {
+                ui.add(egui::Spinner::new().size(14.0).color(th::MUTED));
+            } else if modes.list.is_empty() {
+                ui.label(text(t("res.none"), 12.5, W::Regular, th::MUTED));
+            } else {
+                egui::ScrollArea::vertical().id_salt(("res", key)).max_height(170.0).show(ui, |ui| {
+                    for m in &modes.list {
+                        let cur = modes.cur.is_some_and(|c| c.w == m.w && c.h == m.h);
+                        let label = if m.hz > 0 { format!("{} × {}  ·  {} Hz", m.w, m.h, m.hz) } else { format!("{} × {}", m.w, m.h) };
+                        if ui.selectable_label(cur, label).clicked() && !cur {
+                            self.core.set_mode(key, Some(*m));
+                            ui.close();
+                        }
+                    }
+                });
+                if modes.changed && ui.button(t("res.orig")).clicked() {
+                    self.core.set_mode(key, None);
+                    ui.close();
+                }
+            }
+        } else {
+            ui.label(text(t("act.needPerm"), 12.5, W::Regular, th::MUTED));
+        }
+        ui.separator();
         if ui.add_enabled(live && self.last_pic.contains_key(&key), egui::Button::new(t("act.screenshot"))).clicked() {
             self.screenshot(key);
         }

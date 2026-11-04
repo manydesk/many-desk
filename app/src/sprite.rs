@@ -18,6 +18,7 @@ pub fn inner(name: &str) -> &'static str {
         "shrink" => r##"<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>"##,
         "power" => r##"<path d="M12 3v9M6.3 6.3a8 8 0 1 0 11.4 0"/>"##,
         "mouse" => r##"<rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 7v4"/>"##,
+        "terminal" => r##"<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/>"##,
         "clip" => r##"<rect x="6" y="4" width="12" height="17" rx="1.5"/><path d="M9 4V3h6v1M9 10h6M9 14h6"/>"##,
         "speaker" => r##"<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>"##,
         "share" => r##"<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M12 13V7M9 10l3-3 3 3M8 20h8"/>"##,

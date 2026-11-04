@@ -1,4 +1,5 @@
-// Clipboard beyond text: pictures and copied files go to the other side's clipboard too.
+// Clipboard beyond plain text: formatted text (HTML, as Word, browsers and Office put it
+// there) goes along with its text, on the control stream ("clip": text, html). Pictures and copied files go to the other side's clipboard too.
 // They travel over the file stream as a small batch whose id starts with "clip-img-",
 // "clip-files-" or "clip-paste-"; the receiver keeps them in a temp folder and puts that on
 // its clipboard (Ctrl+V / Cmd+V then pastes them there). Text stays on the control stream
@@ -83,21 +84,41 @@ fn change_count() -> Option<u64> {
     None
 }
 
+/// Formatted text bigger than this goes as plain text only.
+const MAX_HTML: usize = 4 << 20;
+
 #[cfg(mobile)]
-pub fn set_text(text: &str) {
+pub fn set_text(text: &str, _html: Option<&str>) {
     let mut ours = OURS.lock().unwrap();
     crate::phone::set_clipboard_text(text);
     ours.text = Some(text.to_string());
 }
 
+/// Puts text on the clipboard, formatted too when `html` comes with it (an app that
+/// takes formatting pastes that, the others the text).
 #[cfg(not(mobile))]
-pub fn set_text(text: &str) {
+pub fn set_text(text: &str, html: Option<&str>) {
     let mut ours = OURS.lock().unwrap();
     if let Ok(mut c) = arboard::Clipboard::new() {
-        if c.set_text(text.to_string()).is_ok() {
+        let set = match html {
+            Some(h) => c.set().html(h, Some(text)).is_ok(),
+            None => c.set_text(text.to_string()).is_ok(),
+        };
+        if set {
             *ours = Ours { text: Some(text.to_string()), seq: change_count() };
         }
     }
+}
+
+/// The formatted version of the text on this computer's clipboard, if there is one.
+#[cfg(mobile)]
+pub fn local_html() -> Option<String> {
+    None
+}
+
+#[cfg(not(mobile))]
+pub fn local_html() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get().html().ok().filter(|h| !h.is_empty() && h.len() <= MAX_HTML)
 }
 
 /// Where received clipboard batches live (the newest few are kept for pasting).
@@ -194,7 +215,8 @@ pub fn start_watch() {
                         last_text = t.clone();
                         last_img = None;
                         if !echo && ours_text.as_ref() != Some(&t) {
-                            bus::emit("clip", json!({ "text": t }));
+                            let html = if active { c.get().html().ok().filter(|h| !h.is_empty() && h.len() <= MAX_HTML) } else { None };
+                            bus::emit("clip", json!({ "text": t, "html": html }));
                         }
                     }
                     continue;

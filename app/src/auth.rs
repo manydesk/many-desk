@@ -51,6 +51,31 @@ pub fn verify(key_hex: &str, totp: &str, nonce: &str, host_fp: &str, viewer_fp: 
     [-30i64, 0, 30].iter().any(|d| ok(Some(totp_at(&secret, (now + d) as u64))))
 }
 
+// ---- trusted devices: a token the host gave out, proven like the password ----
+
+fn trust_mac(token: &[u8], nonce: &str, host_fp: &str, viewer_fp: &str) -> Hmac<Sha256> {
+    let mut mac = <Hmac<Sha256>>::new_from_slice(token).expect("hmac key");
+    mac.update(b"manydesk-trust-v1");
+    for part in [nonce, host_fp, viewer_fp] {
+        mac.update(&(part.len() as u32).to_be_bytes());
+        mac.update(part.as_bytes());
+    }
+    mac
+}
+
+pub fn new_trust_token() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
+pub fn trust_proof(token_hex: &str, nonce: &str, host_fp: &str, viewer_fp: &str) -> String {
+    hex::encode(trust_mac(&hex::decode(token_hex).unwrap_or_default(), nonce, host_fp, viewer_fp).finalize().into_bytes())
+}
+
+pub fn trust_ok(token_hex: &str, nonce: &str, host_fp: &str, viewer_fp: &str, given: &str) -> bool {
+    let (Ok(token), Ok(given)) = (hex::decode(token_hex), hex::decode(given)) else { return false };
+    token.len() == 32 && trust_mac(&token, nonce, host_fp, viewer_fp).verify_slice(&given).is_ok()
+}
+
 // ---- TOTP (RFC 6238: HMAC-SHA1, 30 s, 6 digits) ----
 
 pub fn totp_at(secret: &[u8], unix: u64) -> u32 {
@@ -137,5 +162,14 @@ mod tests {
         let p2 = proof(&k, "n1", "hostfp", "viewfp", Some(code));
         assert!(verify(&hex::encode(k), &secret, "n1", "hostfp", "viewfp", &p2));
         assert!(!verify(&hex::encode(k), &secret, "n1", "hostfp", "viewfp", &p));
+    }
+
+    #[test]
+    fn trust_binds_session() {
+        let tok = new_trust_token();
+        let p = trust_proof(&tok, "n1", "hostfp", "viewfp");
+        assert!(trust_ok(&tok, "n1", "hostfp", "viewfp", &p));
+        assert!(!trust_ok(&tok, "n2", "hostfp", "viewfp", &p));
+        assert!(!trust_ok(&new_trust_token(), "n1", "hostfp", "viewfp", &p));
     }
 }

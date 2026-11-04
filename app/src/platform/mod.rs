@@ -1,6 +1,8 @@
 // Platform specifics that don't fit the shared modules.
 #[cfg(target_os = "linux")]
 pub mod xinput;
+pub mod display;
+pub mod vdisplay;
 pub mod perms;
 pub mod system;
 pub mod update;

@@ -16,6 +16,8 @@ use crate::fm::{self, FileManager, Pane, Transfer};
 
 mod actions;
 mod clip;
+mod display;
+mod term;
 mod tunnel;
 pub use actions::{DrawStroke, Reconnect};
 pub use tunnel::Tunnel;
@@ -173,6 +175,11 @@ pub struct Tab {
     /// the host's displays and the one shown (switchable from the toolbar)
     pub screens: Vec<RemoteScreen>,
     pub screen: Option<u32>,
+    /// the resolutions of the display shown (Actions → Resolution)
+    pub modes: Option<display::RemoteModes>,
+    /// the remote shell, and whether its window is up (instead of the picture)
+    pub term: Option<term::TermView>,
+    pub term_open: bool,
     /// how the remote picture sits in the stage, and the scroll offset (points) in 1:1
     pub view: ViewMode,
     pub pan: egui::Vec2,
@@ -253,6 +260,10 @@ pub struct AuthAsk {
     pub password: String,
     pub code: String,
     pub remember: bool,
+    /// ask the host to trust this device (TOTP: no code next time)
+    pub trust: bool,
+    /// the host trusts this device already: the code is not asked
+    pub trusted: Option<String>,
     pub error: String,
     /// a proof is on its way (deriving the key takes a moment)
     pub busy: bool,
@@ -333,6 +344,8 @@ pub struct Host {
     pub screen: Option<Screen>,
     /// downloads the viewer is taking from the file manager, by batch (set to stop one)
     fm_cancel: HashMap<String, Arc<AtomicBool>>,
+    /// shells the viewer opened (Actions → Terminal), by its id
+    terms: HashMap<u32, term::HostTerm>,
     pub privacy: bool,
     lock_on_end: bool,
     /// the viewer's whiteboard strokes on this screen
@@ -394,6 +407,14 @@ pub struct Core {
     next_tunnel: u32,
     /// viewer: the key derived for a tab's password prompt, kept until the host says ok
     auth_keys: HashMap<u32, String>,
+    /// direct IP: the address asked who it is, and since when
+    ip_wait: Option<(std::net::IpAddr, String, Instant)>,
+    /// host: displays whose resolution a viewer changed, and their mode before
+    mode_orig: HashMap<u32, crate::platform::display::Mode>,
+    /// host: the virtual display a viewer added (gone with the last session)
+    vdisplay: Option<crate::platform::vdisplay::VDisplay>,
+    /// the LAN was last asked who is there
+    lan_scan: Instant,
 }
 
 impl Core {
@@ -415,6 +436,7 @@ impl Core {
             }
         });
         clip::start_watch();
+        crate::lan::start(rv.clone(), &store.my_id, &hostname(), platform(), store.lan_visible);
         let mut core = Core {
             store,
             rv,
@@ -449,6 +471,10 @@ impl Core {
             tunnels: Vec::new(),
             next_tunnel: 0,
             auth_keys: HashMap::new(),
+            ip_wait: None,
+            mode_orig: HashMap::new(),
+            vdisplay: None,
+            lan_scan: Instant::now(),
         };
         // Test hook: MANYDESK_NOTHUMBS=1 skips the display pictures (two instances on one Mac
         // would otherwise hold ScreenCaptureKit up for each other).
@@ -544,9 +570,10 @@ impl Core {
             }
         }
         let now = Instant::now();
-        // Requests wait for the first rendezvous channel (e.g. right after start).
-        if self.rv_status.0 > 0 {
-            for i in 0..self.tabs.len() {
+        // Requests wait for the first rendezvous channel (e.g. right after start), or go
+        // over the LAN alone to a computer that is there.
+        for i in 0..self.tabs.len() {
+            if self.rv_status.0 > 0 || crate::lan::knows(&self.tabs[i].peer_id) {
                 if let Some(req) = self.tabs[i].outbox.take() {
                     let id = self.tabs[i].peer_id.clone();
                     self.send(&rv::topic_for_id(&id), &rv::key_for_id(&id), req);
@@ -559,6 +586,14 @@ impl Core {
         }
         self.tick_reconnect();
         self.update_clip_active();
+        if self.lan_scan.elapsed() > Duration::from_secs(15) {
+            self.lan_scan = now;
+            crate::lan::scan();
+        }
+        if self.ip_wait.as_ref().is_some_and(|(_, _, at)| at.elapsed() > Duration::from_secs(4)) {
+            let (ip, _, _) = self.ip_wait.take().unwrap();
+            self.toast(tf("lan.noAnswer", &[("ip", &ip.to_string())]), true);
+        }
         // Viewer handshakes that got no answer.
         for i in 0..self.tabs.len() {
             if self.tabs[i].hs.as_ref().is_some_and(|h| h.host_peer.is_none() && now > h.deadline) {
@@ -610,7 +645,7 @@ impl Core {
             }
             "viewer:ready" => self.on_viewer_ready(v),
             "host:offered" => self.on_host_offered(v),
-            "clip" => self.on_local_clipboard(v["text"].as_str().unwrap_or("")),
+            "clip" => self.on_local_clipboard(v["text"].as_str().unwrap_or(""), v["html"].as_str()),
             "screens:thumbs" => {
                 for t in serde_json::from_value::<Vec<Screen>>(v).unwrap_or_default() {
                     if let Some(s) = self.screens.iter_mut().find(|s| s.id == t.id) {
@@ -673,6 +708,7 @@ impl Core {
             "fm:progress" | "fm:done" => self.on_fm_upload(name, &v),
             "privacy:check" => self.privacy_check(),
             "clip:files" | "clip:image" => self.on_local_clip(name, &v),
+            "lan:peer" => self.on_lan_peer(&v),
             "clip:paste" => self.clip_paste_now(v["sid"].as_u64().unwrap_or(0) as u32),
             "toast" => self.toast(v["text"].as_str().unwrap_or(""), v["error"].as_bool().unwrap_or(false)),
             "camera:error" => self.on_camera_error(&v),
@@ -718,6 +754,16 @@ impl Core {
     // ------------------------------------------------- viewer: connect by ID ---
 
     pub fn connect(&mut self, id: &str) {
+        // direct IP (as RustDesk): ask that address who it is, then connect to that ID
+        if let Some(ip) = parse_ip(id) {
+            if let Some(p) = crate::lan::peers().into_iter().find(|p| p.ip == ip) {
+                return self.connect(&p.id);
+            }
+            let q = rv::random_topic()[..12].to_string();
+            crate::lan::query(ip, &q);
+            self.ip_wait = Some((ip, q, Instant::now()));
+            return self.toast(tf("lan.asking", &[("ip", &ip.to_string())]), false);
+        }
         let id = rv::normalize_id(id);
         if id.len() != 9 {
             return self.toast(t("err.badId"), true);
@@ -765,6 +811,9 @@ impl Core {
             texture: None,
             screens: Vec::new(),
             screen: None,
+            modes: None,
+            term: None,
+            term_open: false,
             thumb_saved: false,
             // Test hook: MANYDESK_VIEW=actual starts in 1:1 (unscaled picture).
             view: if std::env::var("MANYDESK_VIEW").as_deref() == Ok("actual") { ViewMode::Actual } else { ViewMode::Fit },
@@ -958,13 +1007,17 @@ impl Core {
     /// (with TOTP only the code is asked for).
     fn try_saved_auth(&mut self, key: u32) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.key == key) else { return };
-        let saved = self.store.recent.iter().find(|r| r.id == tab.peer_id).and_then(|r| r.auth.clone());
+        let r = self.store.recent.iter().find(|r| r.id == tab.peer_id);
+        let (saved, trust) = (r.and_then(|r| r.auth.clone()), r.and_then(|r| r.trust.clone()));
         let Some(a) = tab.auth.as_mut() else { return };
+        if a.totp {
+            a.trusted = trust;
+        }
         if let Some((salt, k)) = saved.filter(|(salt, _)| *salt == a.salt && !a.tried_saved) {
             a.tried_saved = true;
             let _ = salt;
             self.auth_keys.insert(key, k);
-            if !a.totp {
+            if !a.totp || a.trusted.is_some() {
                 self.send_auth(key);
             }
         }
@@ -975,7 +1028,7 @@ impl Core {
         let Some(s) = self.session(self.tabs.iter().find(|t| t.key == key).and_then(|t| t.sid)) else { return };
         let Some(tab) = self.tabs.iter_mut().find(|t| t.key == key) else { return };
         let Some(a) = tab.auth.as_mut() else { return };
-        let code = if a.totp {
+        let code = if a.totp && a.trusted.is_none() {
             match a.code.trim().parse::<u32>() {
                 Ok(c) if a.code.trim().len() == 6 => Some(c),
                 _ => {
@@ -989,6 +1042,7 @@ impl Core {
         a.busy = true;
         a.error.clear();
         let (nonce, salt, password) = (a.nonce.clone(), a.salt.clone(), std::mem::take(&mut a.password));
+        let (trusted, trust) = (a.trusted.clone(), a.totp && a.trusted.is_none() && a.trust);
         let saved = if password.is_empty() { self.auth_keys.get(&key).cloned() } else { None };
         crate::rt::spawn(async move {
             let k = match saved {
@@ -996,7 +1050,8 @@ impl Core {
                 None => hex::encode(crate::rt::spawn_blocking(move || crate::auth::derive(&password, &salt)).await.unwrap_or_default()),
             };
             let proof = crate::auth::proof(&hex::decode(&k).unwrap_or_default(), &nonce, &s.peer_fingerprint(), s.fingerprint(), code);
-            let _ = s.send_text(false, &json!({ "t": "auth", "proof": proof }).to_string()).await;
+            let tt = trusted.map(|tok| crate::auth::trust_proof(&tok, &nonce, &s.peer_fingerprint(), s.fingerprint()));
+            let _ = s.send_text(false, &json!({ "t": "auth", "proof": proof, "tt": tt, "trust": trust }).to_string()).await;
             bus::emit("viewer:authkey", json!({ "tab": key, "k": k }));
         });
     }
@@ -1061,7 +1116,7 @@ impl Core {
         let shared = self.tabs.iter().find(|t| t.key == key).is_some_and(|t| t.remote.clipboard);
         if let Some(text) = text.filter(|t| shared && !t.is_empty() && t.len() <= 1 << 20) {
             self.clip_last = text.to_string();
-            out.push(json!({ "t": "clip", "text": text }));
+            out.push(json!({ "t": "clip", "text": text, "html": clip::local_html() }));
         }
         out.push(json!({ "t": "key", "code": "KeyV", "d": true }));
     }
@@ -1407,6 +1462,7 @@ impl Core {
             pointer: None,
             screen: shown,
             fm_cancel: HashMap::new(),
+            terms: HashMap::new(),
             privacy: false,
             lock_on_end: false,
             strokes: Vec::new(),
@@ -1460,6 +1516,7 @@ impl Core {
             c.store(true, Ordering::Relaxed);
         }
         self.on_host_closed(&h);
+        self.restore_modes();
         if let Some(t0) = h.live_since {
             self.store.log(LogEntry { ts: rv::now_ms(), dir: "in".into(), id: h.req.from.clone(), name: h.req.name.clone(), secs: t0.elapsed().as_secs(), unattended: h.unattended });
         }
@@ -1783,6 +1840,9 @@ impl Core {
                 if let Ok(pw) = std::env::var("MANYDESK_TESTPASSWORD") {
                     if let Some(a) = self.tabs.iter_mut().find(|t| t.key == key).and_then(|t| t.auth.as_mut()).filter(|a| !a.busy) {
                         a.password = pw;
+                        // MANYDESK_TESTCODE=<6 digits>, MANYDESK_TESTTRUST=1: the TOTP code, and trust this device
+                        a.code = std::env::var("MANYDESK_TESTCODE").unwrap_or_default();
+                        a.trust = std::env::var_os("MANYDESK_TESTTRUST").is_some();
                         self.send_auth(key);
                     }
                 }
@@ -1793,11 +1853,20 @@ impl Core {
                     a.nonce = m["nonce"].as_str().unwrap_or(&a.nonce).to_string();
                     a.error = tf("auth.wrong", &[("n", &m["left"].as_u64().unwrap_or(0).to_string())]);
                 }
+                // a trust the host no longer has: the code is asked again
+                let untrusted = tab.auth.as_mut().is_some_and(|a| a.trusted.take().is_some());
                 let id = tab.peer_id.clone();
                 if let Some(r) = self.store.recent.iter_mut().find(|r| r.id == id) {
-                    if r.auth.take().is_some() {
+                    if r.auth.take().is_some() | (untrusted && r.trust.take().is_some()) {
                         self.store.save();
                     }
+                }
+            }
+            Some("trust") => {
+                let id = tab.peer_id.clone();
+                if let (Some(tok), Some(r)) = (m["token"].as_str().filter(|t| t.len() == 64), self.store.recent.iter_mut().find(|r| r.id == id)) {
+                    r.trust = Some(tok.to_string());
+                    self.store.save();
                 }
             }
             Some("authok") => {
@@ -1817,6 +1886,10 @@ impl Core {
                     self.set_capture(None);
                 }
             }
+            Some("modes") => {
+                self.viewer_modes(i, &m);
+            }
+            Some("term") => self.viewer_term(i, &m),
             Some("screens") => {
                 if std::env::var_os("MANYDESK_DEBUG").is_some() {
                     eprintln!("[screens] {m}");
@@ -1870,7 +1943,7 @@ impl Core {
                 if tab.remote.clipboard && self.active == Some(tab.key) {
                     if let Some(text) = m["text"].as_str() {
                         self.clip_last = text.to_string();
-                        clip::set_text(text);
+                        clip::set_text(text, m["html"].as_str());
                     }
                 }
             }
@@ -1902,9 +1975,25 @@ impl Core {
                     let Some(s) = self.session(sid) else { return };
                     let un = &self.store.unattended;
                     let nonce = self.hosts[i].auth.as_ref().map(|a| a.nonce.clone()).unwrap_or_default();
-                    let ok = crate::auth::verify(&un.key, &un.totp, &nonce, s.fingerprint(), &s.peer_fingerprint(), m["proof"].as_str().unwrap_or(""));
+                    let (hfp, vfp, from) = (s.fingerprint().to_string(), s.peer_fingerprint(), self.hosts[i].req.from.clone());
+                    // a trusted device proves its token instead of the TOTP code
+                    let trusted = !un.totp.is_empty() && m["tt"].as_str().is_some_and(|tt| un.trusted.iter().any(|d| d.id == from && crate::auth::trust_ok(&d.token, &nonce, &hfp, &vfp, tt)));
+                    let totp = if trusted { "" } else { un.totp.as_str() };
+                    let ok = crate::auth::verify(&un.key, totp, &nonce, &hfp, &vfp, m["proof"].as_str().unwrap_or(""));
                     if ok {
                         let perms = un.perms;
+                        if !trusted && !un.totp.is_empty() && m["trust"].as_bool() == Some(true) && !from.is_empty() {
+                            let token = crate::auth::new_trust_token();
+                            let name = self.hosts[i].req.name.clone();
+                            let list = &mut self.store.unattended.trusted;
+                            list.retain(|d| d.id != from);
+                            list.push(crate::store::Trusted { id: from, name, ts: rv::now_ms(), token: token.clone() });
+                            if list.len() > crate::store::MAX_TRUSTED {
+                                list.remove(0);
+                            }
+                            self.store.save();
+                            self.ctl(sid, json!({ "t": "trust", "token": token }));
+                        }
                         self.authorize(key, perms, true);
                         return;
                     }
@@ -1965,10 +2054,10 @@ impl Core {
                 if self.hosts[i].perms.clipboard {
                     if let Some(text) = m["text"].as_str() {
                         if std::env::var_os("MANYDESK_TESTNOINJECT").is_some() {
-                            eprintln!("[clip] {:?}", text.chars().take(40).collect::<String>());
+                            eprintln!("[clip] {:?} html {}", text.chars().take(40).collect::<String>(), m["html"].as_str().map_or(0, |h| h.len()));
                         }
                         self.clip_last = text.to_string();
-                        clip::set_text(text);
+                        clip::set_text(text, m["html"].as_str());
                     }
                 }
             }
@@ -1977,6 +2066,10 @@ impl Core {
                 self.close_host(key, false);
             }
             Some(t @ ("fls" | "fget" | "fcancel" | "fmk" | "frm" | "fmv")) => self.host_fm(i, t, &m),
+            Some("modes") => self.host_modes(i),
+            Some("setmode") => self.host_setmode(i, &m),
+            Some("vdisplay") => self.host_vdisplay(i, &m),
+            Some("term") => self.host_term(i, &m),
             Some(t @ ("restart" | "privacy" | "special" | "lockend" | "draw" | "drawclear" | "switch")) => {
                 self.host_action(i, t, &m);
             }
@@ -2293,6 +2386,9 @@ impl Core {
     pub fn fm_toggle(&mut self, key: u32) {
         let Some(tab) = self.tab(key) else { return };
         tab.fm.open = !tab.fm.open;
+        if tab.fm.open {
+            tab.term_open = false;
+        }
         if !tab.fm.open {
             return;
         }
@@ -2446,15 +2542,62 @@ impl Core {
 
     // ------------------------------------------------- clipboard ---
 
-    fn on_local_clipboard(&mut self, text: &str) {
+    fn on_local_clipboard(&mut self, text: &str, html: Option<&str>) {
         if text == self.clip_last || text.is_empty() || text.len() > 1 << 20 {
             return;
         }
         self.clip_last = text.to_string();
-        let msg = json!({ "t": "clip", "text": text });
+        let msg = json!({ "t": "clip", "text": text, "html": html });
         for sid in self.clip_targets(false) {
             self.ctl(sid, msg.clone());
         }
+    }
+
+    // ------------------------------------------------- local network ---
+
+    /// A ManyDesk answered on the LAN: a known one is online (and can be woken later); a
+    /// direct IP we asked about is connected to.
+    fn on_lan_peer(&mut self, v: &Value) {
+        let id = v["id"].as_str().unwrap_or("").to_string();
+        let ip = v["ip"].as_str().unwrap_or("").to_string();
+        if let Some(r) = self.store.recent.iter_mut().find(|r| r.id == id) {
+            let macs: Vec<String> = v["macs"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect()).unwrap_or_default();
+            if (!macs.is_empty() && r.macs != macs) || r.ip != ip {
+                if !macs.is_empty() {
+                    r.macs = macs;
+                }
+                r.ip = ip.clone();
+                self.store.save();
+            }
+            let busy = self.presence.get(&id).is_some_and(|(at, b)| *b && at.elapsed() < PRESENCE_FRESH);
+            self.presence.insert(id.clone(), (Instant::now(), busy));
+        }
+        if self.ip_wait.as_ref().is_some_and(|(w, q, _)| w.to_string() == ip || v["q"].as_str() == Some(q.as_str())) {
+            self.ip_wait = None;
+            self.connect(&id);
+        }
+    }
+
+    /// Wake-on-LAN for a recent computer (its network cards are known from the LAN).
+    pub fn wake(&mut self, id: &str) {
+        let Some(r) = self.store.recent.iter().find(|r| r.id == id) else { return };
+        let name = if r.name.is_empty() { rv::format_id(id) } else { r.name.clone() };
+        if r.macs.is_empty() {
+            return self.toast(t("lan.noMac"), true);
+        }
+        if crate::lan::wake(&r.macs, r.ip.parse().ok()) {
+            self.toast(tf("lan.woken", &[("who", &name)]), false);
+            // it takes a while to boot: ask again for a minute
+            self.last_poll = None;
+        } else {
+            self.toast(t("lan.wakeFailed"), true);
+        }
+    }
+
+    pub fn set_lan_visible(&mut self, on: bool) {
+        self.store.lan_visible = on;
+        self.store.save();
+        crate::lan::set_me(&self.name, on);
     }
 
     // ------------------------------------------------- presence ---
@@ -2731,4 +2874,11 @@ fn unique(p: PathBuf) -> PathBuf {
     (1..1000).map(|i| p.with_file_name(format!("{stem} ({i}){ext}"))).find(|c| !c.exists()).unwrap_or(p)
 }
 
-
+/// An address typed where an ID goes: "192.168.1.20", "fe80::1", "[::1]" (direct IP).
+fn parse_ip(s: &str) -> Option<std::net::IpAddr> {
+    let s = s.trim().trim_start_matches('[').trim_end_matches(']');
+    if !s.contains(['.', ':']) {
+        return None;
+    }
+    s.parse().ok()
+}

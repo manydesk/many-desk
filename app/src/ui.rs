@@ -20,6 +20,7 @@ use crate::rv;
 use crate::theme::{self as th, Btn, Icons, W};
 
 mod actions;
+mod term;
 use actions::{ActDialog, Board};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -253,6 +254,29 @@ impl eframe::App for App {
         if self.core.pending.is_some() && std::env::var_os("MANYDESK_TESTACCEPT").is_some() {
             let perms = self.core.store.unattended.perms;
             self.core.decide(true, perms);
+        }
+        // MANYDESK_TESTTERM=<command>: opens the terminal, runs it, prints the screen
+        if let Ok(cmd) = std::env::var("MANYDESK_TESTTERM") {
+            static T0: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            static TSTEP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+            if let Some(key) = self.core.tabs.iter().find(|t| t.state == TabState::Live && t.remote.terminal).map(|t| t.key) {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                let since = T0.lock().unwrap().get_or_insert_with(Instant::now).elapsed();
+                let step = TSTEP.load(SeqCst);
+                if step == 0 && since > Duration::from_secs(3) {
+                    self.toggle_term(key);
+                    TSTEP.store(1, SeqCst);
+                } else if step == 1 && since > Duration::from_secs(6) {
+                    if let Some(term) = self.core.tab(key).and_then(|t| t.term.as_ref()) {
+                        term.send_keys(format!("{cmd}\r").as_bytes());
+                    }
+                    TSTEP.store(2, SeqCst);
+                } else if step == 2 && since > Duration::from_secs(9) {
+                    let screen = self.core.tabs.iter().find(|t| t.key == key).and_then(|t| t.term.as_ref()).map(|t| t.parser.screen().contents()).unwrap_or_default();
+                    eprintln!("[testterm] screen:\n{}", screen.trim_end());
+                    TSTEP.store(3, SeqCst);
+                }
+            }
         }
         let Ok(text) = std::env::var("MANYDESK_TESTPASTE") else { return };
         let Some(key) = self.core.tabs.iter().find(|t| t.state == TabState::Live && t.remote.control).map(|t| t.key) else { return };
@@ -532,7 +556,8 @@ impl App {
                 .min_size(input.size())
                 .align(egui::Align2::LEFT_CENTER)
                 .show(ui);
-            if out.response.changed() {
+            // an IP address (direct connection on the LAN or a VPN) stays as typed
+            if out.response.changed() && !self.address.contains(['.', ':']) {
                 // digits only, grouped 3-3-3 like the web field; the cursor stays after the
                 // same digit it was after (otherwise typing in the middle scrambles the order)
                 let cursor: usize = out.cursor_range.map(|r| r.primary.index.into()).unwrap_or(usize::MAX);
@@ -793,6 +818,7 @@ impl App {
         ui.add_space(18.0);
         self.page_title(ui, "recent.title");
         self.recent_grid(ui);
+        self.lan_list(ui);
     }
 
     fn page_title(&self, ui: &mut Ui, key: &str) {
@@ -824,6 +850,40 @@ impl App {
         }
         self.page_title(ui, "recent.title");
         self.recent_grid(ui);
+        self.lan_list(ui);
+    }
+
+    /// ManyDesks heard on the local network (AnyDesk's Discovery): a click connects.
+    fn lan_list(&mut self, ui: &mut Ui) {
+        let peers = crate::lan::peers();
+        if peers.is_empty() {
+            return;
+        }
+        ui.add_space(22.0);
+        self.page_title(ui, "lan.title");
+        let mut connect = None;
+        for p in peers {
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 52.0), Sense::click());
+            let hover = resp.hovered();
+            ui.painter().rect(r, th::RADIUS, if hover { th::SURFACE_2 } else { th::SURFACE }, Stroke::new(1.0, if hover { th::ACCENT } else { th::BORDER }), StrokeKind::Inside);
+            self.icons.paint(ui, "monitor", Rect::from_center_size(Pos2::new(r.left() + 24.0, r.center().y), Vec2::splat(20.0)), th::ACCENT);
+            let name = if p.name.is_empty() { rv::format_id(&p.id) } else { p.name.clone() };
+            ui.painter().text(Pos2::new(r.left() + 46.0, r.center().y - 1.0), Align2::LEFT_BOTTOM, name, th::font(13.5, W::Semibold), th::TEXT);
+            let os = crate::core::os_name(&p.os);
+            let sub = format!("{} · {}{}", rv::format_id(&p.id), p.ip, if os.is_empty() { String::new() } else { format!(" · {os}") });
+            ui.painter().text(Pos2::new(r.left() + 46.0, r.center().y + 2.0), Align2::LEFT_TOP, sub, th::mono(11.5, W::Regular), th::MUTED);
+            ui.painter().circle_filled(Pos2::new(r.right() - 20.0, r.center().y), 4.5, th::OK);
+            if hover {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.on_hover_text(t("tt.connect")).clicked() {
+                connect = Some(p.id.clone());
+            }
+            ui.add_space(8.0);
+        }
+        if let Some(id) = connect {
+            self.core.connect(&id);
+        }
     }
 
     fn recent_grid(&mut self, ui: &mut Ui) {
@@ -849,6 +909,7 @@ impl App {
         let (area, _) = ui.allocate_exact_size(Vec2::new(width, rows as f32 * (tile_h + gap) - gap), Sense::hover());
         let mut connect = None;
         let mut forget = None;
+        let mut wake = None;
         for (i, r) in recents.iter().enumerate() {
             let (cx, cy) = ((i % cols) as f32, (i / cols) as f32);
             let rect = Rect::from_min_size(area.min + Vec2::new(cx * (tw + gap), cy * (tile_h + gap)), Vec2::new(tw, tile_h));
@@ -940,6 +1001,19 @@ impl App {
                     removed = true;
                 }
             }
+            // Wake-on-LAN for a computer that is off (its network cards came from the LAN)
+            if state == "offline" && !r.macs.is_empty() && !removed {
+                let g = ui.painter().layout_no_wrap(t("lan.wake"), th::font(11.5, W::Semibold), Color32::WHITE);
+                let wr = Rect::from_min_size(Pos2::new(thumb.right() - 8.0 - (26.0 + g.size().x + 10.0), thumb.bottom() - 8.0 - 24.0), Vec2::new(26.0 + g.size().x + 10.0, 24.0));
+                let wresp = ui.interact(wr, Id::unique(("tile-wake", &r.id)), Sense::click()).on_hover_text(t("tt.wake"));
+                ui.painter().rect_filled(wr, 12.0, if wresp.hovered() { th::ACCENT_HOVER } else { th::ACCENT });
+                self.icons.paint(ui, "power", Rect::from_center_size(Pos2::new(wr.left() + 15.0, wr.center().y), Vec2::splat(13.0)), Color32::WHITE);
+                ui.painter().galley(Pos2::new(wr.left() + 26.0, wr.center().y - g.size().y / 2.0), g, Color32::WHITE);
+                if wresp.clicked() {
+                    wake = Some(r.id.clone());
+                    removed = true;
+                }
+            }
             if hover {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -949,6 +1023,8 @@ impl App {
         }
         if let Some(id) = forget {
             self.core.store.forget(&id);
+        } else if let Some(id) = wake {
+            self.core.wake(&id);
         } else if let Some(id) = connect {
             self.core.connect(&id);
         }
@@ -1069,6 +1145,10 @@ impl App {
             if th::checkbox(ui, &mut self.core.store.presence, &t("share.presence")).changed() {
                 self.core.store.save();
             }
+            let mut lan = self.core.store.lan_visible;
+            if th::checkbox(ui, &mut lan, &t("lan.visible")).changed() {
+                self.core.set_lan_visible(lan);
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
@@ -1127,9 +1207,25 @@ impl App {
                     ui.label(text(t("un.totpOn"), 12.5, W::Regular, th::MUTED));
                     if th::btn(ui, &t("un.totpOff"), Btn::Normal).clicked() {
                         self.core.store.unattended.totp.clear();
+                        self.core.store.unattended.trusted.clear();
                         self.core.store.save();
                     }
                 });
+                // devices that gave the code once ("trust this device")
+                ui.add_space(8.0);
+                let n = self.core.store.unattended.trusted.len();
+                ui.horizontal(|ui| {
+                    let label = if n == 0 { t("un.trustedNone") } else { tf("un.trusted", &[("n", &n.to_string())]) };
+                    ui.label(text(label, 12.5, W::Regular, th::MUTED));
+                    if n > 0 && th::btn(ui, &t("un.trustedClear"), Btn::Normal).clicked() {
+                        self.core.store.unattended.trusted.clear();
+                        self.core.store.save();
+                    }
+                });
+                if n > 0 {
+                    let names: Vec<String> = self.core.store.unattended.trusted.iter().rev().take(5).map(|d| format!("{} · {}", d.name, d.id)).collect();
+                    ui.label(text(names.join("\n"), 12.0, W::Regular, th::MUTED));
+                }
             } else if let Some(secret) = self.totp_new.clone() {
                 th::hint(ui, &t("un.totpHint"));
                 ui.add_space(8.0);
@@ -1612,6 +1708,14 @@ impl App {
             self.core.send_view(key, vw, vh);
             self.upload_frame(&ctx, i, key);
             let tab = &self.core.tabs[i];
+            if tab.state == TabState::Live && tab.term_open {
+                let t_stage = if compact(&ctx) { Rect::from_min_max(stage.min, Pos2::new(stage.right(), stage.bottom() - 84.0)) } else { stage };
+                self.terminal(ui, t_stage, key);
+                self.fs_toolbar(&ctx, stage, key);
+                self.session_fab(ui, stage, key);
+                return;
+            }
+            let tab = &self.core.tabs[i];
             if tab.state == TabState::Live && tab.fm.open {
                 // a phone: the menu button keeps a strip of its own under the file manager
                 let fm_stage = if compact(&ctx) { Rect::from_min_max(stage.min, Pos2::new(stage.right(), stage.bottom() - 84.0)) } else { stage };
@@ -1908,7 +2012,7 @@ impl App {
                             submit = true;
                         }
                     });
-                    if a.totp {
+                    if a.totp && a.trusted.is_none() {
                         field(ui, &t("auth.code"), |ui| {
                             let r = ui.add(egui::TextEdit::singleline(&mut a.code).char_limit(6).frame(egui::Frame::NONE).font(th::mono(15.0, W::Semibold)).desired_width(f32::INFINITY));
                             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1917,6 +2021,9 @@ impl App {
                         });
                     }
                     th::checkbox(ui, &mut a.remember, &t("auth.remember"));
+                    if a.totp && a.trusted.is_none() {
+                        th::checkbox(ui, &mut a.trust, &t("auth.trust"));
+                    }
                     if !a.error.is_empty() {
                         ui.add_space(8.0);
                         ui.label(text(&a.error, 12.5, W::Regular, th::DANGER));
@@ -1953,6 +2060,7 @@ impl App {
         let cam_on = tab.cams.mine.is_some();
         let (screens, cur_screen, view) = (tab.screens.clone(), tab.screen, tab.view);
         let (fm_open, fm_busy) = (tab.fm.open, tab.fm.transfers.iter().filter(|t| !t.finished).count());
+        let (term_ok, term_on) = (tab.remote.terminal, tab.term_open);
         let (privacy_on, board_on) = (tab.privacy, self.boards.get(&key).is_some_and(|b| b.on));
         // a phone: the bar scrolls sideways, the name is in the tab already
         let narrow = compact(ui.ctx());
@@ -1992,6 +2100,9 @@ impl App {
             th::badge(ui, r.rect, fm_busy);
             if r.clicked() && live {
                 self.core.fm_toggle(key);
+            }
+            if term_ok && th::tbbtn(ui, &self.icons, "terminal", term_on, false, &t("tt.term")).clicked() && live {
+                self.toggle_term(key);
             }
             // a phone has no keyboard until asked for: typing into the remote screen
             if cfg!(mobile) && th::tbbtn(ui, &self.icons, "keyboard", self.soft_keyboard, false, &t("tt.keyboard")).clicked() && live {
@@ -2360,6 +2471,7 @@ impl App {
         let mut items: Vec<(&'static str, String, bool)> = Vec::new();
         if self.fab_open {
             let (fm_open, chat_open, live) = self.core.tabs.iter().find(|t| t.key == key).map(|t| (t.fm.open, t.chat.open, t.state == TabState::Live)).unwrap_or((false, false, false));
+            let (term_ok, term_on) = self.core.tabs.iter().find(|t| t.key == key).map(|t| (t.remote.terminal, t.term_open)).unwrap_or((false, false));
             let (mic_on, cam_on) = self.core.tabs.iter().find(|t| t.key == key).map(|t| (t.mic.is_some(), t.cams.mine.is_some())).unwrap_or((false, false));
             items.push(("power", t("tt.disconnect"), false));
             items.push(("home", t("home"), false));
@@ -2367,6 +2479,9 @@ impl App {
                 items.push(("more", t("tt.actions"), false));
                 items.push(("chat", t("tt.chat"), chat_open));
                 items.push(("file", t("tt.fm"), fm_open));
+                if term_ok {
+                    items.push(("terminal", t("tt.term"), term_on));
+                }
                 items.push(("mic", t(if mic_on { "tt.micOn" } else { "tt.mic" }), mic_on));
                 items.push(("camera", t(if cam_on { "tt.camOn" } else { "tt.cam" }), cam_on));
                 if !self.remote_is_phone(key) {
@@ -2436,6 +2551,10 @@ impl App {
             }
             Some("file") => {
                 self.core.fm_toggle(key);
+                self.fab_open = false;
+            }
+            Some("terminal") => {
+                self.toggle_term(key);
                 self.fab_open = false;
             }
             Some("chat") => {
@@ -3812,6 +3931,7 @@ fn perm_toggles(ui: &mut Ui, icons: &Icons, p: &mut crate::store::Permissions) -
             ("power", "perm.restart", &mut p.restart),
             ("shield", "perm.privacy", &mut p.privacy),
             ("share", "perm.tunnel", &mut p.tunnel),
+            ("terminal", "perm.terminal", &mut p.terminal),
         ] {
             changed |= th::permtoggle(ui, icons, icon, &t(key), v).changed();
         }
