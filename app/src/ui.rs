@@ -94,6 +94,8 @@ pub struct App {
     fab_open: bool,
     /// A Cmd/Ctrl+C/X/V press went to the remote side; its release goes too.
     shortcut_down: bool,
+    /// Cmd/Ctrl+V sent this side's copied files instead (its release stays here)
+    files_pasted: bool,
     fab_rects: Vec<Rect>,
     /// The other side's camera window per session (size, folded), and where the camera
     /// windows are this frame (the pointer there is not for the host).
@@ -213,6 +215,7 @@ impl App {
             zoom: HashMap::new(),
             fab_open: false,
             shortcut_down: false,
+            files_pasted: false,
             fab_rects: Vec::new(),
             pips: HashMap::new(),
             pip_rects: Vec::new(),
@@ -2139,7 +2142,14 @@ impl App {
                 // or as nothing at all when the clipboard holds files
                 egui::Event::Key { key: k, physical_key, pressed: false, modifiers, .. } if matches!(physical_key.unwrap_or(k), egui::Key::C | egui::Key::X | egui::Key::V) && (self.shortcut_down || modifiers.command) => {
                     let code = keys::code(physical_key.unwrap_or(k)).unwrap_or("KeyV");
+                    if std::mem::take(&mut self.files_pasted) {
+                        continue;
+                    }
                     if !std::mem::take(&mut self.shortcut_down) {
+                        // copied files: they go over and the host pastes them
+                        if code == "KeyV" && self.core.paste_files(key) {
+                            continue;
+                        }
                         out.push(json!({ "t": "key", "code": code, "d": true }));
                     }
                     out.push(json!({ "t": "key", "code": code, "d": false }));
@@ -2159,6 +2169,8 @@ impl App {
                 }
                 // text copied here a moment ago: it goes first, so the other side pastes it
                 // and not what it had (the clipboard watcher would be up to 0.7 s late)
+                // (files copied in Finder come as their names: those files go instead)
+                egui::Event::Paste(_) | egui::Event::PasteImage(_) if self.core.paste_files(key) => self.files_pasted = true,
                 egui::Event::Paste(text) => {
                     self.shortcut_down = true;
                     self.core.paste(key, Some(&text), &mut out);

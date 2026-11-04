@@ -1,7 +1,14 @@
 // Clipboard beyond text: pictures and copied files go to the other side's clipboard too.
-// They travel over the file stream as a small batch whose id starts with "clip-img-" or
-// "clip-files-"; the receiver keeps them in a temp folder and puts that on its clipboard
-// (Ctrl+V / Cmd+V then pastes them there). Text stays on the control stream ("clip").
+// They travel over the file stream as a small batch whose id starts with "clip-img-",
+// "clip-files-" or "clip-paste-"; the receiver keeps them in a temp folder and puts that on
+// its clipboard (Ctrl+V / Cmd+V then pastes them there). Text stays on the control stream
+// ("clip").
+//
+// Files copied on the viewer's side wait for a paste, as in AnyDesk: Ctrl+V / Cmd+V in the
+// session sends them ("clip-paste-", shown with the file manager's copies), and once they
+// are in, the host puts them on its clipboard and pastes them itself. Files copied on the
+// host go over to the viewer right away (up to MAX_FILES_BYTES): the viewer pastes them
+// outside ManyDesk, where nothing tells us when.
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +19,9 @@ use super::*;
 /// Files on the clipboard are sent along only up to this much.
 const MAX_FILES_BYTES: u64 = 256 << 20;
 const MAX_FILES: usize = 2000;
+/// Pasted into a session (the copy shows, and can be stopped, in the file manager).
+const MAX_PASTE_BYTES: u64 = 4 << 30;
+const MAX_PASTE_FILES: usize = 20000;
 /// A picture bigger than this (RGBA) is not sent.
 #[cfg_attr(mobile, allow(dead_code))] // pictures and files: desktops only
 const MAX_IMAGE_BYTES: usize = 64 << 20;
@@ -224,11 +234,12 @@ fn signature(w: usize, h: usize, px: &[u8]) -> u64 {
 }
 
 impl Core {
-    /// Sessions the clipboard goes to: hosts that allow it, and the session in front.
+    /// Sessions the clipboard goes to: hosts that allow it, and the session in front (not
+    /// files: those wait for a paste there, see `paste_files`).
     pub(super) fn clip_targets(&self, files: bool) -> Vec<Option<u32>> {
         let mut out: Vec<Option<u32>> = self.hosts.iter().filter(|h| h.state == HostState::Live && h.perms.clipboard && (!files || h.perms.files)).map(|h| h.sid).collect();
         if let Some(t) = self.active.and_then(|k| self.tabs.iter().find(|t| t.key == k)) {
-            if t.state == TabState::Live && t.remote.clipboard && (!files || t.remote.files) {
+            if t.state == TabState::Live && t.remote.clipboard && !files {
                 out.push(t.sid);
             }
         }
@@ -258,7 +269,7 @@ impl Core {
         crate::rt::spawn(async move {
             if files {
                 let p = paths.clone();
-                let (bytes, count) = tokio::task::spawn_blocking(move || fm::walk(&p).iter().fold((0u64, 0usize), |(b, n), (path, _, d)| (b + if *d { 0 } else { std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) }, n + 1))).await.unwrap_or((u64::MAX, 0));
+                let (bytes, count) = tokio::task::spawn_blocking(move || size_of(&p)).await.unwrap_or((u64::MAX, 0));
                 if bytes > MAX_FILES_BYTES || count > MAX_FILES {
                     bus::emit("toast", json!({ "text": t("clip.tooBig"), "error": true }));
                     return;
@@ -271,9 +282,69 @@ impl Core {
         });
     }
 
+    /// Cmd/Ctrl+V into session `key` while this side's clipboard holds files: sends them,
+    /// and the host pastes them when they are in. False: no files here (or the session
+    /// takes none), the key goes over as usual.
+    pub fn paste_files(&mut self, key: u32) -> bool {
+        let Some(tab) = self.tabs.iter().find(|t| t.key == key) else { return false };
+        if tab.state != TabState::Live || !tab.remote.clipboard || !tab.remote.files {
+            return false;
+        }
+        let paths = local_files();
+        if paths.is_empty() {
+            return false;
+        }
+        let sid = tab.sid;
+        let Some(s) = self.session(sid) else { return false };
+        let shown: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let name = fm::summary(&shown, |n| tf("fm.items", &[("n", &n.to_string())]));
+        let batch = format!("clip-paste-{}", &rv::random_topic()[..16]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tab = self.tab(key).unwrap();
+        // dest: no folder of the file manager, so finishing it refreshes none
+        tab.fm.transfers.push(fm::Transfer { id: batch.clone(), name: name.clone(), upload: true, dest: "\0clip".into(), ..Default::default() });
+        tab.fm.cancels.insert(batch.clone(), cancel.clone());
+        let sid = sid.unwrap_or(0);
+        crate::rt::spawn(async move {
+            let p = paths.clone();
+            let (bytes, count) = tokio::task::spawn_blocking(move || size_of(&p)).await.unwrap_or((u64::MAX, 0));
+            let r = if bytes > MAX_PASTE_BYTES || count > MAX_PASTE_FILES {
+                Err(t("clip.tooBig"))
+            } else {
+                bus::emit("toast", json!({ "text": tf("clip.pasting", &[("f", &name)]) }));
+                let id = batch.clone();
+                fm::send_batch(s, paths, batch.clone(), None, cancel, |done, total| {
+                    bus::emit("fm:progress", json!({ "sid": sid, "id": id, "done": done, "total": total }));
+                })
+                .await
+            };
+            if let Err(e) = &r {
+                bus::emit("toast", json!({ "text": e, "error": true }));
+            }
+            bus::emit("fm:done", json!({ "sid": sid, "id": batch, "x": matches!(r, Ok(false)), "e": r.err().unwrap_or_default() }));
+        });
+        true
+    }
+
+    /// Files pasted from the viewer are on this computer's clipboard now: Cmd/Ctrl+V here
+    /// (the viewer's own keys went up long ago).
+    pub(super) fn clip_paste_now(&mut self, sid: u32) {
+        let Some(h) = self.hosts.iter().find(|h| h.sid == Some(sid) && h.state == HostState::Live && h.perms.control) else { return };
+        let Some(screen) = h.screen.clone() else { return };
+        let m = if cfg!(target_os = "macos") { "MetaLeft" } else { "ControlLeft" };
+        for (code, d) in [(m, true), ("KeyV", true), ("KeyV", false), (m, false)] {
+            let msg = json!({ "t": "key", "code": code, "d": d });
+            if std::env::var_os("MANYDESK_TESTNOINJECT").is_some() {
+                eprintln!("[clip] paste {msg}");
+                continue;
+            }
+            self.input.handle(&screen, &msg);
+        }
+    }
+
     /// Whether this side takes a clipboard batch from session `sid`.
     pub(super) fn clip_allowed(&self, sid: u32, batch: &str) -> bool {
-        let files = batch.starts_with("clip-files-");
+        let files = batch.starts_with("clip-files-") || batch.starts_with("clip-paste-");
         if let Some(t) = self.tabs.iter().find(|t| t.sid == Some(sid)) {
             return t.remote.clipboard && (!files || t.remote.files);
         }
@@ -282,24 +353,50 @@ impl Core {
 
     /// A clipboard batch arrived complete: put it on this computer's clipboard (off the UI
     /// thread — decoding a big picture takes a while).
-    pub(super) fn clip_received(&mut self, batch: &str) {
+    pub(super) fn clip_received(&mut self, sid: u32, batch: &str) {
         let batch = batch.to_string();
-        std::thread::spawn(move || put_received(&batch));
+        std::thread::spawn(move || {
+            if put_received(&batch) && batch.starts_with("clip-paste-") {
+                bus::emit("clip:paste", json!({ "sid": sid }));
+            }
+        });
     }
 }
 
+/// Bytes and entries under `paths` (folders recursively).
+fn size_of(paths: &[PathBuf]) -> (u64, usize) {
+    fm::walk(paths).iter().fold((0u64, 0usize), |(b, n), (path, _, d)| (b + if *d { 0 } else { std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) }, n + 1))
+}
+
+/// The files on this computer's clipboard (read only when pasting).
 #[cfg(mobile)]
-fn put_received(_batch: &str) {}
+fn local_files() -> Vec<PathBuf> {
+    Vec::new()
+}
 
 #[cfg(not(mobile))]
-fn put_received(batch: &str) {
-    let Some(dir) = clip_dir(batch) else { return };
+fn local_files() -> Vec<PathBuf> {
+    // Test hook: MANYDESK_TESTPASTEFILES=<path>[:<path>…] stands in for copied files.
+    if let Some(v) = std::env::var_os("MANYDESK_TESTPASTEFILES") {
+        return std::env::split_paths(&v).collect();
+    }
+    arboard::Clipboard::new().ok().and_then(|mut c| c.get().file_list().ok()).unwrap_or_default()
+}
+
+#[cfg(mobile)]
+fn put_received(_batch: &str) -> bool {
+    false
+}
+
+#[cfg(not(mobile))]
+fn put_received(batch: &str) -> bool {
+    let Some(dir) = clip_dir(batch) else { return false };
     prune(&dir);
-    let Ok(mut c) = arboard::Clipboard::new() else { return };
+    let Ok(mut c) = arboard::Clipboard::new() else { return false };
     // decoded before taking OURS: the watcher waits on it
     let img = if batch.starts_with("clip-img-") {
-        let Some(png) = std::fs::read_dir(&dir).ok().and_then(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).next()) else { return };
-        let Ok(img) = image::open(&png) else { return };
+        let Some(png) = std::fs::read_dir(&dir).ok().and_then(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).next()) else { return false };
+        let Ok(img) = image::open(&png) else { return false };
         Some(img.to_rgba8())
     } else {
         None
@@ -318,4 +415,5 @@ fn put_received(batch: &str) {
             quiet(2500);
         }
     }
+    set
 }

@@ -673,6 +673,7 @@ impl Core {
             "fm:progress" | "fm:done" => self.on_fm_upload(name, &v),
             "privacy:check" => self.privacy_check(),
             "clip:files" | "clip:image" => self.on_local_clip(name, &v),
+            "clip:paste" => self.clip_paste_now(v["sid"].as_u64().unwrap_or(0) as u32),
             "toast" => self.toast(v["text"].as_str().unwrap_or(""), v["error"].as_bool().unwrap_or(false)),
             "camera:error" => self.on_camera_error(&v),
             _ => {}
@@ -2157,7 +2158,7 @@ impl Core {
                 let (cancelled, e) = (m["x"].as_bool().unwrap_or(false), m["e"].as_str().unwrap_or("").to_string());
                 if clip {
                     if !cancelled && e.is_empty() && self.clip_allowed(sid, &batch) {
-                        self.clip_received(&batch);
+                        self.clip_received(sid, &batch);
                     }
                     return;
                 }
