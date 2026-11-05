@@ -41,6 +41,11 @@ pub struct App {
     icons: Icons,
     page: Page,
     address: String,
+    /// the address bar's suggestions (AnyDesk's autocomplete): the highlighted one, closed
+    /// with Esc until the text changes, the pointer over the list (it keeps it open)
+    ac_sel: Option<usize>,
+    ac_closed: bool,
+    ac_hover: bool,
     fullscreen: bool,
     tb_hide_at: Option<Instant>,
     thumbs: HashMap<String, (usize, TextureHandle, TextureHandle)>,
@@ -185,6 +190,9 @@ impl App {
             icons: Icons::default(),
             page,
             address: String::new(),
+            ac_sel: None,
+            ac_closed: false,
+            ac_hover: false,
             fullscreen: false,
             tb_hide_at: None,
             thumbs: HashMap::new(),
@@ -249,6 +257,12 @@ impl eframe::App for App {
         if ctx.cumulative_pass_nr() == 3 {
             if let Ok(text) = std::env::var("MANYDESK_TESTCOPY") {
                 ctx.copy_text(text);
+            }
+            // MANYDESK_TESTADDR=<text>: typed into the address bar (its suggestions show)
+            if let Ok(text) = std::env::var("MANYDESK_TESTADDR") {
+                self.ac_sel = default_pick(&text);
+                self.address = text;
+                ctx.memory_mut(|m| m.request_focus(Id::unique("rv-peer-id")));
             }
             // MANYDESK_TESTCONNECT=<id>: connects; MANYDESK_TESTACCEPT=1: accepts every request
             if let Ok(id) = std::env::var("MANYDESK_TESTCONNECT") {
@@ -576,8 +590,13 @@ impl App {
                 .min_size(input.size())
                 .align(egui::Align2::LEFT_CENTER)
                 .show(ui);
-            // an IP address (direct connection on the LAN or a VPN) stays as typed
-            if out.response.changed() && !self.address.contains(['.', ':']) {
+            if out.response.changed() {
+                self.ac_closed = false;
+                self.ac_sel = default_pick(&self.address);
+            }
+            // an IP address (direct connection on the LAN or a VPN) and a name being looked
+            // up in the list stay as typed
+            if out.response.changed() && !self.address.contains(['.', ':']) && !is_name_query(&self.address) {
                 // digits only, grouped 3-3-3 like the web field; the cursor stays after the
                 // same digit it was after (otherwise typing in the middle scrambles the order)
                 let cursor: usize = out.cursor_range.map(|r| r.primary.index.into()).unwrap_or(usize::MAX);
@@ -590,6 +609,7 @@ impl App {
                 submit = true;
             }
         });
+        let picked = self.address_suggestions(ui, ab, focused);
         let gr = ui.interact(go, Id::unique("rv-connect"), Sense::click()).on_hover_text(t("tt.connect"));
         ui.painter().rect_filled(go, 4.0, if gr.hovered() { th::ACCENT_HOVER } else { th::ACCENT });
         self.icons.paint(ui, "arrow", Rect::from_center_size(go.center(), Vec2::splat(18.0)), Color32::WHITE);
@@ -608,10 +628,87 @@ impl App {
                 mode = Some(m);
             }
         }
-        if let Some(m) = mode.filter(|_| !self.address.trim().is_empty()) {
+        // a suggestion clicked connects; with one highlighted, Enter and the buttons take it
+        let target = match (picked, self.ac_sel) {
+            (Some(id), _) => {
+                mode.get_or_insert(crate::core::SessMode::Desktop);
+                Some(id)
+            }
+            (None, Some(i)) if !self.ac_closed => suggestions(&self.core, &self.address).get(i).map(|s| s.id.clone()),
+            _ => None,
+        };
+        if let Some(m) = mode.filter(|_| !self.address.trim().is_empty() || target.is_some()) {
             let a = std::mem::take(&mut self.address);
-            self.core.connect_mode(&a, m);
+            self.ac_sel = None;
+            self.core.connect_mode(&target.unwrap_or(a), m);
         }
+    }
+
+    /// The list under the address bar while typing: recent and LAN computers that match.
+    /// Returns the ID clicked.
+    fn address_suggestions(&mut self, ui: &mut Ui, ab: Rect, focused: bool) -> Option<String> {
+        let list = suggestions(&self.core, &self.address);
+        if list.is_empty() || self.ac_closed || !(focused || self.ac_hover) {
+            self.ac_hover = false;
+            return None;
+        }
+        // ↑ ↓ move, Esc closes (the text field keeps the keys it uses itself)
+        if focused {
+            let (down, up, esc) = ui.input(|i| (i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::Escape)));
+            let n = list.len();
+            if down {
+                self.ac_sel = Some(self.ac_sel.map_or(0, |s| (s + 1).min(n - 1)));
+            }
+            if up {
+                self.ac_sel = self.ac_sel.and_then(|s| s.checked_sub(1));
+            }
+            if esc {
+                self.ac_closed = true;
+                return None;
+            }
+        }
+        if self.ac_sel.is_some_and(|s| s >= list.len()) {
+            self.ac_sel = Some(list.len() - 1);
+        }
+        let mut picked = None;
+        let resp = egui::Area::new(Id::unique("rv-suggest")).order(egui::Order::Foreground).fixed_pos(ab.left_bottom() + Vec2::new(0.0, 6.0)).show(ui.ctx(), |ui| {
+            egui::Frame::new().fill(th::SURFACE).stroke(Stroke::new(1.0, th::BORDER)).corner_radius(8).shadow(th::shadow_lg()).inner_margin(Margin::same(4)).show(ui, |ui| {
+                ui.set_width(ab.width() - 8.0);
+                for (n, s) in list.iter().enumerate() {
+                    let (r, row) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 46.0), Sense::click());
+                    let hot = row.hovered() || self.ac_sel == Some(n);
+                    if hot {
+                        ui.painter().rect_filled(r, 6.0, if self.ac_sel == Some(n) { th::ACCENT_SOFT } else { th::SURFACE_2 });
+                    }
+                    if row.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let state = self.core.presence_of(&s.id);
+                    self.icons.paint(ui, "monitor", Rect::from_center_size(Pos2::new(r.left() + 20.0, r.center().y), Vec2::splat(18.0)), if s.lan || state == "online" { th::ACCENT } else { th::MUTED });
+                    if s.lan || state == "online" {
+                        ui.painter().circle_filled(Pos2::new(r.left() + 27.0, r.center().y + 6.0), 3.5, th::OK);
+                    }
+                    let name = if s.name.is_empty() { rv::format_id(&s.id) } else { s.name.clone() };
+                    let tag = if s.lan { t("lan.title") } else { t("recent.title") };
+                    let tg = ui.painter().layout_no_wrap(tag, th::font(11.0, W::Medium), th::MUTED);
+                    let mut job = egui::text::LayoutJob::simple_singleline(name, th::font(13.5, W::Semibold), th::TEXT);
+                    job.wrap = egui::text::TextWrapping::truncate_at_width((r.width() - 40.0 - tg.size().x - 24.0).max(60.0));
+                    let ng = ui.painter().layout_job(job);
+                    ui.painter().galley(Pos2::new(r.left() + 40.0, r.center().y - 1.0 - ng.size().y), ng, th::TEXT);
+                    let sub = if s.ip.is_empty() { rv::format_id(&s.id) } else { format!("{} · {}", rv::format_id(&s.id), s.ip) };
+                    ui.painter().text(Pos2::new(r.left() + 40.0, r.center().y + 2.0), Align2::LEFT_TOP, sub, th::mono(11.5, W::Regular), th::MUTED);
+                    ui.painter().galley(Pos2::new(r.right() - 12.0 - tg.size().x, r.center().y - tg.size().y / 2.0), tg, th::MUTED);
+                    if row.clicked() {
+                        picked = Some(s.id.clone());
+                    }
+                }
+            });
+        });
+        self.ac_hover = ui.rect_contains_pointer(resp.response.rect);
+        if picked.is_some() {
+            self.ac_hover = false;
+        }
+        picked
     }
 
     // ================================================================ home ===
@@ -4154,6 +4251,64 @@ fn reformat_id(edited: &str, cursor: usize) -> (String, usize) {
     (text, at)
 }
 
+/// A computer the address bar suggests.
+struct Suggestion {
+    id: String,
+    name: String,
+    ip: String,
+    lan: bool,
+}
+
+/// Letters in the address bar (and not a whole ID pasted with them): a name is looked up.
+fn is_name_query(q: &str) -> bool {
+    q.chars().any(|c| c.is_alphabetic()) && q.chars().filter(|c| c.is_ascii_digit()).count() < 9
+}
+
+/// Highlighted at first: the best match, unless what is typed is already a whole ID or an IP.
+fn default_pick(q: &str) -> Option<usize> {
+    let digits = q.chars().filter(|c| c.is_ascii_digit()).count();
+    let whole = (digits == 9 && !is_name_query(q)) || q.contains(['.', ':']);
+    (!q.trim().is_empty() && !whole).then_some(0)
+}
+
+/// Recent and LAN computers matching the address bar: by digits of the ID, by name, or by
+/// the start of the LAN address (AnyDesk's autocomplete). At most six.
+fn suggestions(core: &crate::core::Core, q: &str) -> Vec<Suggestion> {
+    let q = q.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let digits: String = q.chars().filter(|c| c.is_ascii_digit()).collect();
+    let low = q.to_lowercase();
+    let name_q = is_name_query(q);
+    let hit = |id: &str, name: &str, ip: &str| {
+        if name_q {
+            name.to_lowercase().contains(&low)
+        } else if q.contains('.') {
+            ip.starts_with(q)
+        } else {
+            !digits.is_empty() && id.contains(&digits)
+        }
+    };
+    let lan = crate::lan::peers();
+    let mut out: Vec<Suggestion> = Vec::new();
+    for r in &core.store.recent {
+        let peer = lan.iter().find(|p| p.id == r.id);
+        let ip = peer.map(|p| p.ip.to_string()).unwrap_or_default();
+        if hit(&r.id, &r.name, &ip) {
+            out.push(Suggestion { id: r.id.clone(), name: r.name.clone(), ip, lan: peer.is_some() });
+        }
+    }
+    for p in &lan {
+        let ip = p.ip.to_string();
+        if !out.iter().any(|s| s.id == p.id) && hit(&p.id, &p.name, &ip) {
+            out.push(Suggestion { id: p.id.clone(), name: p.name.clone(), ip, lan: true });
+        }
+    }
+    out.truncate(6);
+    out
+}
+
 /// The session's tag in the toolbar: what it can do (a desktop) or what it is.
 fn mode_tag(mode: crate::core::SessMode, control: bool) -> String {
     match mode {
@@ -4282,7 +4437,21 @@ fn reveal(p: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::reformat_id;
+    use super::{default_pick, is_name_query, reformat_id};
+
+    #[test]
+    fn address_queries() {
+        // letters: a name is looked up (a pasted "ID: 123 456 789" is still an ID)
+        assert!(is_name_query("shuk"));
+        assert!(!is_name_query("677 725"));
+        assert!(!is_name_query("ID: 677 725 472"));
+        // the best match is highlighted, unless a whole ID or an IP is typed
+        assert_eq!(default_pick("67"), Some(0));
+        assert_eq!(default_pick("Mac"), Some(0));
+        assert_eq!(default_pick("677 725 472"), None);
+        assert_eq!(default_pick("192.168.1.20"), None);
+        assert_eq!(default_pick("  "), None);
+    }
 
     /// Types `keys` one by one at the cursor, like the field does.
     fn type_keys(keys: &str) -> (String, usize) {
