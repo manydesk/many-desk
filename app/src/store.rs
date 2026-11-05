@@ -185,6 +185,12 @@ impl Default for Store {
 }
 
 fn path() -> PathBuf {
+    // Test hook: MANYDESK_CONFIG_DIR=<dir> keeps a test copy's settings (and ID) apart from
+    // the installed app's (Windows has no HOME to point elsewhere).
+    if let Some(dir) = std::env::var_os("MANYDESK_CONFIG_DIR").map(PathBuf::from) {
+        let _ = std::fs::create_dir_all(&dir);
+        return dir.join("settings.json");
+    }
     let dir = directories::ProjectDirs::from("az", "manydesk", "ManyDesk")
         .map(|d| d.config_dir().to_path_buf())
         .unwrap_or_else(|| std::env::temp_dir().join("manydesk"));

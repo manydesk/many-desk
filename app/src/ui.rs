@@ -298,6 +298,41 @@ impl eframe::App for App {
                 }
             }
         }
+        // MANYDESK_TESTTYPE=<text>: typed into the focused field one key a frame, from 5 s
+        if let Ok(text) = std::env::var("MANYDESK_TESTTYPE") {
+            static TYPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            static T0: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+            let since = T0.lock().unwrap().get_or_insert_with(Instant::now).elapsed();
+            ctx.request_repaint_after(Duration::from_millis(80));
+            let n = TYPED.load(SeqCst);
+            // MANYDESK_TESTCLICK=x,y: a click there first (points), as the mouse does it
+            static CLICKED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+            if let Some((x, y)) = std::env::var("MANYDESK_TESTCLICK").ok().and_then(|v| v.split_once(',').and_then(|(a, b)| Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?)))) {
+                let c = CLICKED.load(SeqCst);
+                if since > Duration::from_secs(4) && c < 3 {
+                    let pos = Pos2::new(x, y);
+                    match c {
+                        0 => raw.events.push(egui::Event::PointerMoved(pos)),
+                        1 => raw.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }),
+                        _ => raw.events.push(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }),
+                    }
+                    CLICKED.store(c + 1, SeqCst);
+                    if c == 2 {
+                        eprintln!("[testtype] clicked at {pos:?}");
+                    }
+                }
+            }
+            if since > Duration::from_secs(5) {
+                if let Some(c) = text.chars().nth(n) {
+                    raw.events.push(egui::Event::Text(c.to_string()));
+                    TYPED.store(n + 1, SeqCst);
+                    eprintln!("[testtype] typed {c:?}, focus {:?}", ctx.memory(|m| m.focused()));
+                } else if n == text.chars().count() {
+                    TYPED.store(n + 1, SeqCst);
+                    eprintln!("[testtype] field now {:?}", self.address);
+                }
+            }
+        }
         let Ok(text) = std::env::var("MANYDESK_TESTPASTE") else { return };
         let Some(key) = self.core.tabs.iter().find(|t| t.state == TabState::Live && t.remote.control).map(|t| t.key) else { return };
         ctx.request_repaint_after(Duration::from_millis(100));

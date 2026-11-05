@@ -110,6 +110,36 @@ fn spawn_shell(rows: u16, cols: u16) -> Result<(HostTerm, Box<dyn Read + Send>),
     Ok((HostTerm { writer, master: pair.master, child }, reader))
 }
 
+/// A question the program in the terminal asks the terminal.
+#[derive(Debug, PartialEq)]
+enum Query {
+    /// ESC [ 6 n: where is the cursor
+    Cursor,
+    /// ESC [ c / ESC [ 0 c: what are you
+    Device,
+    /// ESC [ 5 n: are you there
+    Status,
+}
+
+fn queries(d: &[u8]) -> Vec<Query> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 < d.len() + 1 {
+        if d[i] == 0x1b && d.get(i + 1) == Some(&b'[') {
+            let rest = &d[i + 2..];
+            if rest.starts_with(b"6n") {
+                out.push(Query::Cursor);
+            } else if rest.starts_with(b"5n") {
+                out.push(Query::Status);
+            } else if rest.starts_with(b"c") || rest.starts_with(b"0c") {
+                out.push(Query::Device);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 impl Core {
     // ------------------------------------------------------------- host side ---
 
@@ -188,6 +218,22 @@ impl Core {
             Some("out") => {
                 if let Ok(d) = B64.decode(m["d"].as_str().unwrap_or("")) {
                     term.parser.process(&d);
+                    // what a terminal answers by itself: Windows' ConPTY asks where the cursor
+                    // is before it shows anything (and waits for the answer); shells ask too
+                    let mut reply = Vec::new();
+                    for q in queries(&d) {
+                        match q {
+                            Query::Cursor => {
+                                let (r, c) = term.parser.screen().cursor_position();
+                                reply.extend_from_slice(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
+                            }
+                            Query::Device => reply.extend_from_slice(b"\x1b[?1;2c"),
+                            Query::Status => reply.extend_from_slice(b"\x1b[0n"),
+                        }
+                    }
+                    if !reply.is_empty() {
+                        term.send_keys(&reply);
+                    }
                 }
             }
             Some("exit") => term.ended = Some(m["e"].as_str().unwrap_or("").to_string()),
@@ -225,5 +271,17 @@ impl Core {
         if terminal_only {
             self.close_tab(key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{queries, Query};
+
+    #[test]
+    fn terminal_queries() {
+        assert_eq!(queries(b"\x1b[6n"), vec![Query::Cursor]);
+        assert_eq!(queries(b"abc\x1b[?25l\x1b[6n\x1b[c"), vec![Query::Cursor, Query::Device]);
+        assert_eq!(queries(b"\x1b[31mred\x1b[0m"), vec![]);
     }
 }

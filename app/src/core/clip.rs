@@ -118,7 +118,23 @@ pub fn local_html() -> Option<String> {
 
 #[cfg(not(mobile))]
 pub fn local_html() -> Option<String> {
-    arboard::Clipboard::new().ok()?.get().html().ok().filter(|h| !h.is_empty() && h.len() <= MAX_HTML)
+    arboard::Clipboard::new().ok()?.get().html().ok().map(|h| html_fragment(&h)).filter(|h| !h.is_empty() && h.len() <= MAX_HTML)
+}
+
+/// Windows' clipboard HTML ("HTML Format") starts with a header of offsets; when the
+/// clipboard library can't take the fragment out (PowerShell writes them oddly), it is done
+/// here: what is between the fragment markers, or else everything from the first tag.
+#[cfg_attr(mobile, allow(dead_code))]
+fn html_fragment(h: &str) -> String {
+    if !h.starts_with("Version:") {
+        return h.to_string();
+    }
+    if let (Some(a), Some(b)) = (h.find("<!--StartFragment-->"), h.find("<!--EndFragment-->")) {
+        if a < b {
+            return h[a + "<!--StartFragment-->".len()..b].trim().to_string();
+        }
+    }
+    h.find('<').map_or(String::new(), |i| h[i..].to_string())
 }
 
 /// Where received clipboard batches live (the newest few are kept for pasting).
@@ -198,6 +214,9 @@ pub fn start_watch() {
                 let quiet = echo || is_quiet();
                 // files first: a copied file also puts its name on the clipboard as text
                 let files = if active { c.get().file_list().unwrap_or_default() } else { Vec::new() };
+                if std::env::var_os("MANYDESK_DEBUG").is_some() && (!files.is_empty() || !last_files.is_empty()) {
+                    eprintln!("[clip] watcher: {} files (was {}), quiet {quiet}, active {active}", files.len(), last_files.len());
+                }
                 if !files.is_empty() {
                     if files != last_files {
                         last_files = files.clone();
@@ -210,12 +229,26 @@ pub fn start_watch() {
                     continue;
                 }
                 last_files.clear();
+                // formatted text with no plain text beside it (some apps put only HTML there):
+                // its plain text is made from the HTML
+                let html_only = if active && c.get_text().map_or(true, |t| t.is_empty()) { c.get().html().ok().map(|h| html_fragment(&h)).filter(|h| !h.is_empty() && h.len() <= MAX_HTML) } else { None };
+                if let Some(h) = html_only {
+                    let t = html_text(&h);
+                    if !t.is_empty() && t != last_text {
+                        last_text = t.clone();
+                        last_img = None;
+                        if !echo && ours_text.as_ref() != Some(&t) {
+                            bus::emit("clip", json!({ "text": t, "html": h }));
+                        }
+                    }
+                    continue;
+                }
                 if let Ok(t) = c.get_text() {
                     if t != last_text {
                         last_text = t.clone();
                         last_img = None;
                         if !echo && ours_text.as_ref() != Some(&t) {
-                            let html = if active { c.get().html().ok().filter(|h| !h.is_empty() && h.len() <= MAX_HTML) } else { None };
+                            let html = if active { c.get().html().ok().map(|h| html_fragment(&h)).filter(|h| !h.is_empty() && h.len() <= MAX_HTML) } else { None };
                             bus::emit("clip", json!({ "text": t, "html": html }));
                         }
                     }
@@ -242,6 +275,40 @@ pub fn start_watch() {
             }
         })
         .ok();
+}
+
+/// The plain text of an HTML fragment: tags out (a line break for block ends), scripts and
+/// styles dropped, the common entities decoded, spaces collapsed.
+#[cfg_attr(mobile, allow(dead_code))]
+fn html_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let Some(gt) = rest[lt..].find('>') else { break };
+        let closing = rest[lt + 1..].starts_with('/');
+        let tag = rest[lt + 1..lt + gt].trim_start_matches('/').to_ascii_lowercase();
+        let name: String = tag.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        rest = &rest[lt + gt + 1..];
+        match name.as_str() {
+            "script" | "style" if !closing => {
+                let close = format!("</{name}");
+                rest = rest.to_ascii_lowercase().find(&close).map_or("", |i| &rest[i..]);
+            }
+            "br" | "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => out.push('\n'),
+            _ => {}
+        }
+    }
+    if !rest.contains('<') {
+        out.push_str(rest);
+    }
+    let out = out.replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&");
+    let lines: Vec<String> = out.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    let mut text = lines.join("\n");
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
+    }
+    text.trim().to_string()
 }
 
 /// A cheap fingerprint: size and a sample of the pixels.
@@ -284,6 +351,9 @@ impl Core {
             return;
         }
         let targets: Vec<Arc<Session>> = self.clip_targets(files).into_iter().filter_map(|sid| self.session(sid)).collect();
+        if std::env::var_os("MANYDESK_DEBUG").is_some() {
+            eprintln!("[clip] local {name}: {} paths to {} sessions", paths.len(), targets.len());
+        }
         if targets.is_empty() {
             return;
         }
@@ -299,7 +369,10 @@ impl Core {
             }
             for s in targets {
                 let batch = format!("clip-{kind}-{}", &rv::random_topic()[..16]);
-                let _ = fm::send_batch(s, paths.clone(), batch, None, Arc::new(AtomicBool::new(false)), |_, _| {}).await;
+                let r = fm::send_batch(s, paths.clone(), batch.clone(), None, Arc::new(AtomicBool::new(false)), |_, _| {}).await;
+                if std::env::var_os("MANYDESK_DEBUG").is_some() {
+                    eprintln!("[clip] sent {batch}: {r:?}");
+                }
             }
         });
     }
@@ -376,6 +449,9 @@ impl Core {
     /// A clipboard batch arrived complete: put it on this computer's clipboard (off the UI
     /// thread — decoding a big picture takes a while).
     pub(super) fn clip_received(&mut self, sid: u32, batch: &str) {
+        if std::env::var_os("MANYDESK_DEBUG").is_some() {
+            eprintln!("[clip] received {batch}");
+        }
         let batch = batch.to_string();
         std::thread::spawn(move || {
             if put_received(&batch) && batch.starts_with("clip-paste-") {
@@ -438,4 +514,23 @@ fn put_received(batch: &str) -> bool {
         }
     }
     set
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{html_fragment, html_text};
+
+    #[test]
+    fn windows_html_header() {
+        let h = "Version:0.9\r\nStartHTML:000000185\r\nEndHTML:000000357\r\n<html><body><!--StartFragment--><b>x</b> y<!--EndFragment--></body></html>";
+        assert_eq!(html_fragment(h), "<b>x</b> y");
+        assert_eq!(html_fragment("<b>plain</b>"), "<b>plain</b>");
+    }
+
+    #[test]
+    fn plain_text_of_html() {
+        assert_eq!(html_text("<b>bold</b> plain"), "bold plain");
+        assert_eq!(html_text("<html><head><style>p{x:1}</style></head><body><p>one</p><p>two &amp; three</p></body></html>"), "one\n\ntwo & three");
+        assert_eq!(html_text("a<br>b&nbsp;c"), "a\nb c");
+    }
 }
