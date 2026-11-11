@@ -154,15 +154,11 @@ win() {
   cp "$APP/target/x86_64-pc-windows-gnu/release/manydesk.exe" "$OUT/ManyDesk-$VERSION-win-x64.exe"
 }
 
-linux() {
-  for arch in ${ARCHS:-amd64 arm64}; do
-    local IMAGE="md-linux-dev-$arch"
-    docker build -q --platform "linux/$arch" -t "$IMAGE" "$ROOT/docker/linux" >/dev/null
-    docker run --rm --platform "linux/$arch" -v "$ROOT:/src" -v "md-cargo-$arch:/root/.cargo/registry" -v "md-target-native-$arch:/src/app/target" \
-      -e VERSION="$VERSION" -e ARCH="$arch" -e MANYDESK_BUILD="$MANYDESK_BUILD" "$IMAGE" bash -c '
+# The .deb and .tar.gz, built where this runs (SRC: the repository there).
+LINUX_BUILD='
         set -e
-        cd /src/app && cargo build --release
-        P=/tmp/pkg; rm -rf $P
+        cd "$SRC/app" && cargo build --release
+        P=/tmp/manydesk-pkg; rm -rf $P
         mkdir -p $P/DEBIAN $P/usr/bin $P/usr/share/applications $P/usr/share/icons/hicolor/256x256/apps
         install -m755 target/release/manydesk $P/usr/bin/manydesk
         install -m644 assets/icon.png $P/usr/share/icons/hicolor/256x256/apps/manydesk.png
@@ -185,9 +181,22 @@ Depends: libgl1, libxkbcommon0, libxkbcommon-x11-0, libgtk-3-0, libpipewire-0.3-
 Recommends: gstreamer1.0-plugins-bad
 Description: ManyDesk remote desktop (native, peer-to-peer)
 EOF
-        dpkg-deb --root-owner-group -b $P /src/dist-native/ManyDesk-$VERSION-linux-$ARCH.deb >/dev/null
-        tar -C target/release -czf /src/dist-native/ManyDesk-$VERSION-linux-$ARCH.tar.gz manydesk
-      '
+        dpkg-deb --root-owner-group -b $P "$SRC/dist-native/ManyDesk-$VERSION-linux-$ARCH.deb" >/dev/null
+        tar -C target/release -czf "$SRC/dist-native/ManyDesk-$VERSION-linux-$ARCH.tar.gz" manydesk
+'
+
+# MANYDESK_LINUX_NATIVE=1: on this Linux machine, for its own architecture (CI runners; the
+# packages docker/linux/Dockerfile lists must be installed). Otherwise in Docker, per ARCHS.
+linux() {
+  if [ -n "${MANYDESK_LINUX_NATIVE:-}" ]; then
+    SRC="$ROOT" VERSION="$VERSION" ARCH="$(dpkg --print-architecture)" bash -c "$LINUX_BUILD"
+    return
+  fi
+  for arch in ${ARCHS:-amd64 arm64}; do
+    local IMAGE="md-linux-dev-$arch"
+    docker build -q --platform "linux/$arch" -t "$IMAGE" "$ROOT/docker/linux" >/dev/null
+    docker run --rm --platform "linux/$arch" -v "$ROOT:/src" -v "md-cargo-$arch:/root/.cargo/registry" -v "md-target-native-$arch:/src/app/target" \
+      -e SRC=/src -e VERSION="$VERSION" -e ARCH="$arch" -e MANYDESK_BUILD="$MANYDESK_BUILD" "$IMAGE" bash -c "$LINUX_BUILD"
   done
 }
 

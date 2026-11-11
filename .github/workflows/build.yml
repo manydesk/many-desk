@@ -1,0 +1,147 @@
+# Builds every package on each push to main and each pull request; for a v* tag also
+# publishes them as a GitHub Release (the tag must match app/Cargo.toml's version).
+#
+# Secrets (optional):
+#   ANDROID_KEYSTORE_B64   base64 of the APK signing keystore (scripts/build-android.sh; without
+#                          it each run signs with a new key and phones can't update in place)
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }} (and tests)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config clang nasm cmake \
+            libgtk-3-dev libssl-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxrandr-dev libxdo-dev \
+            libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev libxtst-dev libxi-dev \
+            libxkbcommon-dev libgl1-mesa-dev libasound2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: Tests
+        if: matrix.arch == 'amd64'
+        working-directory: app
+        run: cargo test --release --lib
+      - name: Package
+        run: MANYDESK_LINUX_NATIVE=1 bash scripts/package-native.sh linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist-native/*.deb
+            dist-native/*.tar.gz
+
+  windows:
+    name: Windows x64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 cmake nasm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: Package
+        run: bash scripts/package-native.sh win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist-native/*.exe
+
+  macos:
+    name: macOS universal
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: Package
+        # ad hoc signature: there is no Developer ID in CI
+        env:
+          MANYDESK_SIGN_ID: "-"
+        run: bash scripts/package-native.sh mac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist-native/*.dmg
+
+  android:
+    name: Android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - name: Package
+        env:
+          # all ABIs for a release, one for the everyday build
+          ABIS: ${{ env.RELEASE == 'true' && 'arm64-v8a armeabi-v7a x86_64' || 'arm64-v8a' }}
+          MANYDESK_ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: bash scripts/build-android.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist-native/*.apk
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the version
+        run: |
+          v="$(grep -m1 '^version' app/Cargo.toml | cut -d'"' -f2)"
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, but app/Cargo.toml says $v"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* --title "ManyDesk ${GITHUB_REF_NAME#v}" --generate-notes

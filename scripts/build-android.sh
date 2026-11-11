@@ -24,7 +24,8 @@ rm -rf "$B" && mkdir -p "$B/classes" "$B/lib"
 
 # 1. Rust → lib/<abi>/libmanydesk.so, with the NDK's clang for the C parts (ring, openh264,
 # opus through CMake) and as the linker
-TC="$NDK/toolchains/llvm/prebuilt/darwin-x86_64"
+# the NDK ships x86_64 host tools (they run on Apple Silicon through Rosetta)
+TC="$NDK/toolchains/llvm/prebuilt/$(uname -s | tr '[:upper:]' '[:lower:]')-x86_64"
 PFLAG=()
 [ "$PROFILE" = release ] && PFLAG=(--release)
 for abi in $ABIS; do
@@ -62,6 +63,10 @@ javac -source 11 -target 11 -classpath "$PLATFORM" -d "$B/classes" $(find "$SRC/
 
 # 4. align and sign (a local key; a store release needs its own)
 KEY="$ROOT/android/debug.keystore"
+# CI: the signing key comes from a secret (base64), so every build can update the last one
+if [ ! -f "$KEY" ] && [ -n "${MANYDESK_ANDROID_KEYSTORE_B64:-}" ]; then
+  printf '%s' "$MANYDESK_ANDROID_KEYSTORE_B64" | base64 -d > "$KEY"
+fi
 [ -f "$KEY" ] || keytool -genkeypair -keystore "$KEY" -storepass android -keypass android -alias manydesk \
   -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=ManyDesk Local" >/dev/null 2>&1
 "$BT/zipalign" -f -p 4 "$B/base.apk" "$B/aligned.apk"
