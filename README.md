@@ -1,206 +1,182 @@
+<div align="center">
+
+<img src="app/assets/icon.png" alt="ManyDesk" width="112">
+
 # ManyDesk
 
-AnyDesk tipli uzaq masaüstü tətbiqi — **öz serveri olmadan, birbaşa P2P**. Rust ilə yazılmış tək native tətbiqdir (egui interfeysi, öz QUIC protokolu). Kompüterlər bir-birini public Nostr relay-ləri, MQTT brokerləri və ya yerli şəbəkə ilə tapır. Görüntü, idarəetmə, səs və fayllar birbaşa iki kompüter arasında gedir.
+**Remote desktop without servers.**<br>
+Fast, end-to-end encrypted, peer-to-peer remote access for macOS, Windows, Linux and Android.
 
-| Platforma | Paket | Qeyd |
+[![Build](https://github.com/manydesk/many-desk/actions/workflows/build.yml/badge.svg)](https://github.com/manydesk/many-desk/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/manydesk/many-desk?sort=semver&display_name=tag)](https://github.com/manydesk/many-desk/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-555)
+
+[**Download**](https://github.com/manydesk/many-desk/releases/latest) ·
+[Website](https://manydesk.github.io) ·
+[How it works](#how-it-works) ·
+[Security](#security) ·
+[Build from source](#building-from-source)
+
+</div>
+
+---
+
+ManyDesk is a remote desktop application in the spirit of AnyDesk, with one fundamental difference: **there is no ManyDesk server**. Computers find each other through public, independent networks, then connect directly over an encrypted QUIC link. Nothing you see, type or transfer passes through infrastructure we operate, because there is none.
+
+It is a single native application written in Rust, with one code base for every platform.
+
+## Highlights
+
+- **No account, no server.** Each computer gets a permanent 9-digit address. Share it, accept the request, and you are connected.
+- **Three kinds of session:** full **desktop** control, **file transfer** only, or a **terminal** only. The last two never capture the screen.
+- **Built for speed.** Hardware H.264 (VideoToolbox, Media Foundation), a dedicated stream per video frame, and adaptive quality. An idle screen costs almost no bandwidth.
+- **End-to-end encrypted.** TLS 1.3 with certificates pinned in both directions and a 6-digit code to verify that nobody is in the middle.
+- **Unattended access** with a password, optional TOTP two-factor authentication and trusted devices. On Windows, a system service keeps the computer reachable at the sign-in screen.
+- **Works on the local network without internet**, accepts a plain IP address instead of an ID, and can switch sleeping computers on with Wake-on-LAN.
+
+## Features
+
+| | |
+|---|---|
+| **Screen & control** | Multi-monitor, fit / 1:1 / stretch view, full-screen mode, key or text keyboard modes, automatic Cmd ↔ Ctrl mapping between macOS and Windows, remote resolution change, virtual displays (macOS) |
+| **Communication** | Two-way voice (Opus), cameras on both sides, per-session chat |
+| **Files & clipboard** | Two-pane file manager with drag and drop; two-way clipboard for text, rich text (HTML), images, files and folders — paste copied files straight into the remote session |
+| **Session actions** | Ctrl+Alt+Del and special keys, remote restart with automatic reconnect, privacy mode, lock on disconnect, whiteboard, screenshots, switch sides, TCP tunnels |
+| **Access control** | Per-viewer permissions changeable during the session, allow-list of IDs, up to 5 simultaneous viewers with color-coded pointers on the host |
+| **Discovery** | Recent sessions with live online status, autocomplete in the address bar, LAN discovery, direct IP, Wake-on-LAN |
+| **Languages** | English, Azerbaijani, Russian, Turkish |
+
+## Download
+
+Get the latest version from the [**Releases**](https://github.com/manydesk/many-desk/releases/latest) page. The app checks for updates on start and offers to install them.
+
+| Platform | Package | Requirements |
 |---|---|---|
-| macOS 13+ | `ManyDesk-<v>-mac-universal.dmg` | Apple Silicon + Intel |
-| Windows 10/11 (64-bit) | `ManyDesk-<v>-win-x64.exe` | tək fayl, quraşdırma tələb etmir |
-| Linux (amd64, arm64) | `.deb`, `.tar.gz` | X11 və Wayland |
-| Android 8.0+ | `ManyDesk-<v>-android.apk` | həm idarə edir, həm ekranını paylaşır |
-| iOS | mənbədən (`scripts/build-ios.sh`) | yalnız idarə edir (iOS ekran paylaşımına icazə vermir) |
+| macOS | `ManyDesk-<version>-mac-universal.dmg` | macOS 13 or later, Apple Silicon and Intel |
+| Windows | `ManyDesk-<version>-win-x64.exe` | Windows 10 or 11, 64-bit. Single executable, no installation needed |
+| Linux | `.deb` or `.tar.gz`, amd64 and arm64 | X11 or Wayland |
+| Android | `ManyDesk-<version>-android.apk` | Android 8.0 or later |
+| iOS | Build from source | Controller only: iOS does not allow apps to share the screen |
 
-## İmkanlar
+Every release lists `SHA256SUMS` and carries signed build provenance, so you can verify a download came from this repository's CI:
 
-**Sessiya növləri** (AnyDesk-in "File Transfer"-i və RustDesk-in terminalı kimi)
-- **Masaüstü:** uzaq ekranı görmək və idarə etmək.
-- **Fayl ötürmə:** masaüstünü göstərmədən iki panelli fayl meneceri.
-- **Terminal:** masaüstünü göstərmədən uzaq kompüterdə shell (macOS/Linux-da login shell, Windows-da PowerShell).
+```bash
+gh attestation verify ManyDesk-<version>-mac-universal.dmg -R manydesk/many-desk
+```
 
-Ünvan sətrindəki fayl/terminal düymələri, son sessiya kartlarının ⋯ menyusu və ya sağ klik (telefonda uzun basma) ilə açılır. Fayl və terminal sessiyalarında host ekranı tutmur və yalnız həmin rejimin icazəsini verir.
+## Getting started
 
-**Ekran və idarəetmə**
-- H.264 video: yalnız dəyişən hissələr göndərilir, sabit ekran demək olar ki, trafik tutmur. Keyfiyyət: Avtomatik / Sürət / Balans / Keyfiyyət.
-- Çox monitor (Ctrl+Alt+Shift+←/→), görünüş: pəncərəyə sığdır / 1:1 / dartılmış, tam ekran (Ctrl+Alt+Shift+F).
-- Siçan, klaviatura (düymələr və ya "mətn" rejimi), Mac ↔ Windows arasında Cmd ↔ Ctrl avtomatik dəyişir.
-- Uzaq ekranın ölçüsünü dəyişmək (sessiya bitəndə geri qayıdır), macOS-da **virtual ekran** əlavə etmək (monitoru olmayan Mac üçün).
-- Telefonda touchpad və birbaşa toxunma rejimləri.
+1. Install ManyDesk on both computers. Your address appears under **This desk**.
+2. On the controlling side, type the other computer's address into the address bar and press **Connect**. Use the folder or terminal buttons next to it for a file transfer or terminal session.
+3. On the other computer, review the request and the permissions, then press **Accept**.
+4. Optionally, compare the 6-digit security code shown on both screens.
 
-**Səs, kamera, söhbət**
-- İki tərəfli səs (Opus) və hər iki tərəfin kamerası (kiçik pəncərədə).
-- Hər sessiyanın öz yazılı söhbəti.
+For unattended access, set a password (and optionally TOTP) under **Settings → Unattended access**.
 
-**Fayllar və klipbord**
-- Fayl meneceri (yükləmə/endirmə, qovluq yaratmaq, ad dəyişmək, silmək) və drag & drop.
-- İki tərəfli klipbord: mətn, formatlı mətn (HTML), şəkil, fayl və qovluqlar. Kopyalanan fayllar AnyDesk kimi sessiyada Ctrl/Cmd+V basılanda göndərilir və uzaq tərəfdə özü yapışdırılır.
+### Permissions
 
-**Sessiya hərəkətləri** (⋯ menyusu)
-- Ctrl+Alt+Del / Force Quit, kilid, Cmd/Alt+Tab və digər xüsusi düymələr.
-- Uzaq kompüteri yenidən başlatmaq və avtomatik yenidən qoşulmaq.
-- Məxfilik rejimi (hostun ekranı gizlədilir, yerli siçan və klaviatura bloklanır), sessiya bitəndə kilidləmək.
-- Lövhə (uzaq ekranda çəkmək), ekran görüntüsü, tərəfləri dəyişmək.
-- TCP tunel: yerli port → uzaq kompüterdən `host:port`.
+| Platform | What the host needs |
+|---|---|
+| macOS | **Screen Recording**, **Accessibility** (for remote control) and **Local Network** (for LAN discovery) |
+| Windows | Nothing by default. Install the service from Settings to be reachable at the sign-in screen |
+| Android | ManyDesk's **Accessibility** service for remote control. On Android 13+ sideloaded apps may first need *App info → ⋮ → Allow restricted settings* |
+| Linux | On Wayland, the desktop portal asks once for screen sharing |
 
-**Nəzarətsiz giriş**
-- Parol (kompüterdə yalnız PBKDF2 açarı saxlanılır), istəyə görə TOTP ikinci faktoru.
-- "Bu cihaza etibar et": TOTP kodu bir dəfə daxil edildikdən sonra o cihazdan bir daha soruşulmur. Host etibarlı cihazları silə bilər.
-- Windows xidməti: kimsə daxil olmadıqda da (giriş ekranında) kompüterə qoşulmaq olur.
-
-**Tapmaq və qoşulmaq**
-- 9 rəqəmli ID. Ünvan sətrində son sessiyalardan və yerli şəbəkədən avtomatik tamamlama (ID, ad və ya IP ilə).
-- Son sessiyalar kartlarında canlı status: onlayn / məşğul / oflayn.
-- **Yerli şəbəkə:** eyni şəbəkədəki ManyDesk-lər avtomatik görünür, internet olmadan da qoşulmaq olur. ID əvəzinə IP yazmaq olar (birbaşa IP). Sönülü kompüteri **Wake-on-LAN** ilə yandırmaq olar.
-- Host eyni anda 5 viewer qəbul edir. Hər viewer-in öz kartı, icazələri və rəngli siçan etiketi var.
-
-## Arxitektura
+## How it works
 
 ```
  Host                                                         Viewer
- ┌─────────────────────┐  sorğu → Qəbul et → təklif → cavab   ┌─────────────────────┐
- │ ekran tutma         │ ◀── Nostr + MQTT + yerli şəbəkə ───▶ │ ID: 482 913 557     │
- │ H.264 kodlayıcı     │     (imzalı, şifrəli, bir neçə KB)   │ H.264 dekoder       │
- │ input injeksiyası ◀─┼── ekran / input / səs / fayl ────────┼── siçan, klaviatura │
- └──────────┬──────────┘   (birbaşa QUIC, TLS 1.3, P2P)        └──────────┬──────────┘
-            │          yalnız öz public ünvanını öyrənmək üçün            │
-            └──────────▶  public STUN serverləri  ◀───────────────────────┘
-                (lazım olanda TURN relay: Cloudflare və ya öz serveriniz)
+ ┌─────────────────────┐   request → accept → offer → answer  ┌─────────────────────┐
+ │ screen capture      │ ◀── Nostr · MQTT · local network ──▶ │ address 482 913 557 │
+ │ H.264 encoder       │     (signed, encrypted, a few KB)    │ H.264 decoder       │
+ │ input injection   ◀─┼── video · input · audio · files ─────┼── mouse, keyboard   │
+ └──────────┬──────────┘   (direct QUIC, TLS 1.3, P2P)        └──────────┬──────────┘
+            │            discover the public address only               │
+            └──────────▶  public STUN servers  ◀────────────────────────┘
+                (only when no direct path exists: a TURN relay)
 ```
 
-- **Görüş nöqtəsi (rendezvous):** qısa qoşulma mesajları **11 Nostr relay**, **4 MQTT broker** və **yerli şəbəkə** (UDP broadcast, port 21140) ilə paralel ötürülür. Hər mesaj Schnorr (secp256k1) ilə imzalanır və tətbiq imzanı özü yoxlayır. İlk sorğu ID-dən törədilən açarla, sonrakılar təsadüfi sessiya açarı ilə şifrələnir. Dəqiq vaxt şəbəkədən (Cloudflare) öyrənilir, ona görə səhv sistem saatı mane olmur.
-- **MDP:** ManyDesk-in öz protokolu. UDP deşik açma (hole punching) ilə alınmış birbaşa yol üzərində QUIC (TLS 1.3, BBR) işləyir. Hər video kadr ayrıca axında gedir: itən paket yalnız həmin kadrı gecikdirir. Səs datagramlarla, idarəetmə və fayllar ayrı axınlarla ötürülür.
-- **Video:**
+**Rendezvous.** A connection starts with a short handshake carried in parallel by 11 public Nostr relays, 4 MQTT brokers and the local network. Every message is signed (Schnorr, secp256k1) and verified by the app, so a relay can neither forge nor alter it. The first request is encrypted with a key derived from the target's address, everything after with a random session key. Delivery by any one network is enough, so blocking one does not break ManyDesk.
 
-  | | Tutma | Kodlama | Dekodlama |
-  |---|---|---|---|
-  | macOS | ScreenCaptureKit | VideoToolbox (aparat) | VideoToolbox |
-  | Windows | DXGI | Media Foundation (Quick Sync / NVENC / AMF), yoxdursa OpenH264 | Media Foundation (DXVA) |
-  | Linux | X11 MIT-SHM / Wayland portal | OpenH264 | VA-API (GStreamer) |
-  | Android | MediaProjection | OpenH264 | OpenH264 |
+**MDP transport.** The session itself runs on MDP, ManyDesk's own protocol: QUIC (TLS 1.3, BBR congestion control) over a UDP path established by hole punching. Each video frame travels on its own stream, so a lost packet only delays that frame. Frames made obsolete by a newer keyframe are dropped instead of delivered late. Control and files use separate streams; voice uses datagrams.
 
-- **Input:** macOS-da kiçik Swift köməkçisi (`native/InputHelper.swift`, CoreGraphics), Windows-da Go köməkçisi (`native/win/`, `SendInput`, exe-nin içindədir), Linux-da XTest, Android-də AccessibilityService.
+**Video pipeline.**
 
-## Təhlükəsizlik
+| | Capture | Encode | Decode |
+|---|---|---|---|
+| macOS | ScreenCaptureKit | VideoToolbox (hardware) | VideoToolbox |
+| Windows | DXGI Desktop Duplication | Media Foundation (Quick Sync, NVENC, AMF), OpenH264 fallback | Media Foundation (DXVA) |
+| Linux | X11 MIT-SHM, Wayland portal | OpenH264 | VA-API via GStreamer |
+| Android | MediaProjection | OpenH264 | OpenH264 |
 
-- Sessiyanın bütün trafiki uçdan-uca şifrələnir. Hər tərəf öz sertifikatını yaradır, barmaq izi şifrəli görüş mesajı ilə ötürülür və QUIC/TLS yalnız həmin sertifikatı qəbul edir (hər iki istiqamətdə pin).
-- 6 rəqəmli təhlükəsizlik kodu hər iki sertifikatdan hesablanır. Hər iki ekranda eyni rəqəmlər görünürsə, araya kimsə girməyib.
-- Nəzarətsiz giriş parolu şəbəkədə getmir: viewer `HMAC(PBKDF2(parol), nonce | host | viewer | TOTP)` ilə sübut göndərir, 3 səhv cəhddən sonra bağlantı kəsilir.
-- TURN relay trafiki görsə də, məzmunu oxuya bilmir.
-- Host hər sorğunu "Qəbul et" ilə təsdiqləyir (və ya nəzarətsiz giriş parolu). Hər viewer-in icazələri ayrıca seçilir və sessiya zamanı dəyişdirilə bilər. İstəyə görə yalnız siyahıdakı ID-lərə icazə vermək olar.
+Quality adapts per viewer: resolution follows the viewer's window, and frame rate and bitrate step down under CPU or network pressure before resolution does, which keeps text readable.
 
-## Layihənin quruluşu
+**NAT traversal.** Most connections are direct. Behind carrier-grade or symmetric NAT (common on mobile networks), configure a TURN relay under **Settings → TURN relay**. Cloudflare Realtime TURN (1,000 GB per month free) is supported with short-lived credentials, as is any standard TURN server. Only one side needs it.
 
-```
-app/                  Rust tətbiqi (bütün platformalar)
-  src/ui.rs, ui/      interfeys (egui): ana ekran, sessiya, fayl meneceri, terminal, ayarlar
-  src/core.rs, core/  sessiyalar, sorğular, icazələr, klipbord, ekran rejimləri, terminal, tunellər
-  src/mdp/            QUIC protokolu, NAT keçidi, TLS pin, TURN müştərisi
-  src/rendezvous.rs   Nostr + MQTT görüş nöqtəsi
-  src/lan.rs          yerli şəbəkə: kəşf, birbaşa IP, Wake-on-LAN
-  src/media/          ekran tutma, H.264 kodlama/dekodlama, kamera
-  src/platform/       icazələr, Windows xidməti, ekran rejimləri, virtual ekran
-  src/android.rs, ios.rs  telefon körpüləri
-  assets/i18n.json    tərcümələr (az, en, ru, tr)
-android/              Android qabığı (Java: ekran tutma, AccessibilityService, bildirişlər)
-ios/                  iOS qabığı
-native/               macOS və Windows input köməkçiləri
-scripts/              build skriptləri
-docker/               Linux build mühiti
-```
+## Security
 
-## Build
+- **End-to-end encryption.** Each side generates a certificate per session. Fingerprints travel inside the encrypted rendezvous, and QUIC accepts exactly those certificates in both directions.
+- **Verification.** The 6-digit security code is derived from both certificates. Matching codes on both screens rule out a man in the middle.
+- **Authentication.** The unattended-access password never crosses the network. The host stores only a PBKDF2-SHA256 key, and the viewer proves knowledge with an HMAC over a fresh nonce bound to both certificates (plus the TOTP code when enabled). Three failed attempts close the connection.
+- **Least privilege.** Every capability — control, clipboard, files, audio, camera, terminal, restart, privacy mode, tunnels — is a separate permission the host grants per viewer and can revoke at any time.
+- **Relays see nothing.** Rendezvous networks and TURN relays only carry encrypted traffic.
 
-Hamısı Mac-dən qurulur.
+Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
-Tələblər:
-- Rust (rustup)
-- Mac üçün: Xcode Command Line Tools
-- Windows üçün: `mingw-w64`, `cmake`, Go (input köməkçisi)
-- Linux üçün: Docker
-- Android üçün: `scripts/setup-android.sh` hər şeyi quraşdırır
-- iOS üçün: tam Xcode
+## Building from source
 
-Mac, Windows və Linux paketləri (`dist-native/`-ə):
+ManyDesk is a single Rust application in [`app/`](app). All desktop and Android packages can be built from a Mac.
+
+**Requirements:** Rust (via rustup), Xcode Command Line Tools; for Windows `mingw-w64`, CMake and Go; for Linux Docker; for Android run `scripts/setup-android.sh`; for iOS full Xcode.
 
 ```bash
-scripts/package-native.sh mac win
-```
+# run during development
+cd app && cargo run --release
 
-```bash
-scripts/package-native.sh --bump minor mac win linux
-```
+# tests
+cd app && cargo test --release --lib
 
-`--bump major|minor|patch` versiyanı `app/Cargo.toml`-da artırır. Qayda: yeni funksiya `minor`, düzəliş `patch`. Hər build-ə tarix əsaslı build nömrəsi də yazılır (`manydesk --version`).
-
-Android və iOS:
-
-```bash
+# packages into dist-native/
+scripts/package-native.sh mac win linux
 scripts/build-android.sh
-```
-
-```bash
 scripts/build-ios.sh
 ```
 
-İnkişaf zamanı birbaşa işə salmaq:
+`scripts/package-native.sh --bump minor|patch` raises the version in `app/Cargo.toml` first. On macOS, packages are signed with a stable local identity so that Screen Recording and Accessibility permissions survive updates; set `MANYDESK_SIGN_ID` to use a Developer ID instead.
 
-```bash
-cd app && cargo run --release
+### Continuous integration
+
+Every push and pull request builds and tests all platforms with GitHub Actions. Pushing a `v<version>` tag that matches `app/Cargo.toml` publishes a release with all packages, checksums, build provenance attestations and the update manifest the app reads.
+
+### Project layout
+
+```
+app/                   the application (Rust)
+  src/ui.rs, ui/       interface (egui)
+  src/core.rs, core/   sessions, requests, permissions, clipboard, terminal, tunnels
+  src/mdp/             QUIC transport, NAT traversal, certificate pinning, TURN client
+  src/rendezvous.rs    Nostr and MQTT rendezvous
+  src/lan.rs           LAN discovery, direct IP, Wake-on-LAN
+  src/media/           capture, H.264 encode and decode, camera
+  src/platform/        permissions, Windows service, display modes, updates
+  assets/i18n.json     translations
+android/  ios/         platform shells
+native/                macOS and Windows input helpers
+scripts/               build and packaging
 ```
 
-macOS imzası: Ekran yazılışı və Əlçatanlıq icazələri tətbiqin imzasına bağlıdır. `package-native.sh` ilk dəfə keychain-də "ManyDesk Local Signing" sertifikatı yaradır və bütün build-ləri onunla imzalayır, ona görə yenidən build-dən sonra icazələr itmir. Developer ID varsa: `MANYDESK_SIGN_ID="Developer ID Application: …"`.
+## Known limitations
 
-### Test üçün mühit dəyişənləri
+- Packages are not yet signed with an Apple Developer ID or a Windows code-signing certificate. On macOS, if the downloaded app is reported as damaged, run `xattr -dr com.apple.quarantine /Applications/ManyDesk.app`. On Windows, SmartScreen may ask you to confirm: *More info → Run anyway*.
+- iOS can only control other computers.
+- Virtual displays are available on macOS only.
+- Wake-on-LAN reaches computers on the same network, after they have been seen there once.
 
-Eyni Mac-də bir neçə nüsxəni ayrı ayarlarla işə salmaq olar (`HOME=<qovluq>`, Windows-da `MANYDESK_CONFIG_DIR=<qovluq>`). Avtomatik testlər üçün:
+## Contributing
 
-| Dəyişən | Nə edir |
-|---|---|
-| `MANYDESK_AUTOCONNECT=<ID>` | açılan kimi qoşulur (`MANYDESK_AUTOMODE=files\|terminal` ilə rejim) |
-| `MANYDESK_AUTOACCEPT=1`, `MANYDESK_AUTOFULL=1` | sorğuları qəbul edir (bütün icazələrlə) |
-| `MANYDESK_TESTNOINJECT=1` | uzaq input-u icra etmir, log-a yazır |
-| `MANYDESK_SYNTH=1` | ekran əvəzinə sintetik test şəkli |
-| `MANYDESK_TESTNORELAY=1` | relay-lər olmadan, yalnız yerli şəbəkə |
-| `MANYDESK_TESTPASTE`, `MANYDESK_TESTPASTEFILES`, `MANYDESK_TESTTERM`, `MANYDESK_TESTTYPE`, `MANYDESK_TESTCLICK` | yapışdırma, terminal, yazma və kliki təqlid edir |
-| `MANYDESK_DEBUG=1` | ətraflı log |
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and guidelines.
 
-## Platforma qeydləri
+## License
 
-**macOS**
-- Host üçün icazələr: **Ekran yazılışı**, **Əlçatanlıq** (idarəetmə üçün), **Yerli şəbəkə** (LAN kəşfi və Wake-on-LAN üçün).
-- Paket Apple Developer ID ilə notarizasiya olunmayıb. İnternetdən yüklənəndə "damaged" xətası çıxarsa, `/Applications`-a köçürdükdən sonra:
-
-  ```bash
-  xattr -dr com.apple.quarantine /Applications/ManyDesk.app
-  ```
-
-**Windows**
-- İlk açılışda Firewall şəbəkə icazəsi soruşa bilər: "Private networks" üçün icazə verin.
-- Fayl imzasızdır, SmartScreen çıxarsa: **More info → Run anyway**.
-- Kimsə daxil olmadıqda da qoşulmaq üçün Ayarlarda Windows xidmətini quraşdırın (administrator icazəsi lazımdır). Ctrl+Alt+Del də xidmət vasitəsilə göndərilir.
-
-**Android**
-- İdarə edilmək üçün ManyDesk-in Əlçatanlıq xidmətini yandırın. Android 13+ APK-dan quraşdırılanda bəzi telefonlarda (Samsung, Xiaomi) əvvəlcə Tətbiq məlumatı → ⋮ → "Məhdud ayarlara icazə ver" lazımdır.
-
-**Linux**
-- Wayland-də ekran desktop portalı ilə tutulur (ilk dəfə sistem soruşur).
-
-## Mobil internet və TURN relay
-
-Mobil operatorlar (Azercell, Bakcell, Nar və s.) CGNAT / simmetrik NAT işlədir, ona görə yalnız STUN ilə birbaşa yol tapılmaya bilər. Həll TURN relay-dir.
-
-**Tövsiyə: Cloudflare Realtime TURN** (ayda 1000 GB pulsuz):
-1. [dash.cloudflare.com](https://dash.cloudflare.com)-da pulsuz hesab açın.
-2. **Realtime → TURN Server → Create**, sonra *Turn Token ID* və *API Token*-i kopyalayın.
-3. ManyDesk → Ayarlar → **TURN relay** → "Cloudflare" → açarları yapışdırın → **Yoxla** → **Yadda saxla**.
-
-Tətbiq bu açarla müvəqqəti (24 saatlıq) giriş məlumatı alır. Yalnız bir tərəfdə ayarlamaq kifayətdir. Alternativ: "Digər TURN (əl ilə)", yəni öz coturn serveriniz və ya başqa provayder.
-
-Relay yalnız birbaşa yol tapılmayanda istifadə olunur. Trafik relay-dən keçsə də uçdan-uca şifrəli qalır.
-
-## Məhdudiyyətlər
-
-- Paketlər Apple Developer ID / Windows kod imzası ilə imzalanmayıb.
-- iOS yalnız viewer-dir: iOS başqa tətbiqlərə ekranı tutmağa icazə vermir.
-- Virtual ekran yalnız macOS-dadır (Windows-da imzalı drayver lazımdır).
-- Wake-on-LAN yalnız eyni şəbəkədən işləyir və kompüterin şəbəkə kartı bir dəfə yerli şəbəkədə görünməlidir.
-- Avtomatik yeniləmə hazırdır, amma manifest ünvanı (`platform/update.rs`) hələ təyin olunmayıb.
+ManyDesk is licensed under the [Apache License 2.0](LICENSE).

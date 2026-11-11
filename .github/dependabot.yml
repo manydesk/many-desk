@@ -1,0 +1,24 @@
+# Weekly dependency updates: Rust crates (app/) and the pinned GitHub Actions.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /app
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # one pull request for the routine minor and patch bumps
+      cargo-minor:
+        update-types: [minor, patch]
+    labels: [dependencies]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [dependencies, ci]

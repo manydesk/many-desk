@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work as it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ManyDesk version
+      description: Shown at the bottom of the sidebar, e.g. "0.19.1 · build 20261105.1519".
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Which side
+      options: [Viewer (controlling), Host (being controlled), Both]
+    validations:
+      required: true
+  - type: input
+    id: platforms
+    attributes:
+      label: Operating systems
+      description: Both sides, e.g. "macOS 15.4 → Windows 11 24H2".
+    validations:
+      required: true
+  - type: textarea
+    id: network
+    attributes:
+      label: Network
+      description: Same LAN, different networks, mobile data, VPN, TURN relay configured?
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Settings → Diagnostics → copy the log. Remove anything you do not want to share.
+      render: text
