@@ -28,6 +28,13 @@ Most features involve two computers. Two copies can run on one machine with sepa
 - **Security first.** Anything that widens what a viewer can do must be behind a host permission.
 - **One topic per pull request**, with a description of how you tested it.
 
+## How changes land
+
+- `main` takes changes only through pull requests. Nobody pushes to it directly, the maintainer included.
+- Open a pull request from a branch of your fork. CI builds and tests every platform; for outside contributors it starts once the maintainer approves the run.
+- The maintainer ([CODEOWNERS](.github/CODEOWNERS)) reviews, approves and merges. A push after the approval needs a new one, and review threads must be resolved.
+- Releases are cut by the maintainer: a `v<version>` tag on `main` builds and publishes every package. Only the maintainer can create, move or delete release tags.
+
 ## Reporting bugs and security issues
 
 Use the issue templates for bugs and ideas. Report security vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
