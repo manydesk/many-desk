@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Points apt on a GitHub runner at a list of Ubuntu mirrors, tried in order.
-# Canonical's own servers (archive, security, ports) send requests from Azure to
-# azure.archive.ubuntu.com; when that mirror is down, every job that installs packages
-# hangs on apt-get until it times out. Independent mirrors go first, Canonical last.
+# Points apt on a GitHub runner at one working Ubuntu mirror.
+# Canonical's servers (archive, security, ports) send runners in Azure to
+# azure.archive.ubuntu.com and hang when that is down, and apt's mirror lists spread
+# requests over every entry, so one dead entry stalls the whole update. Instead: probe
+# independent mirrors in order and use the first that answers, Canonical never.
 set -euo pipefail
 src=/etc/apt/sources.list.d/ubuntu.sources
 if grep -q ubuntu-ports "$src"; then
-  path=ubuntu-ports
-  canonical=http://ports.ubuntu.com/ubuntu-ports/
-  mirrors="http://mirrors.ocf.berkeley.edu/$path/ http://mirrors.mit.edu/$path/"
+  candidates="http://mirrors.ocf.berkeley.edu/ubuntu-ports/ http://mirrors.mit.edu/ubuntu-ports/ http://ftp.tsukuba.wide.ad.jp/Linux/ubuntu-ports/"
 else
-  path=ubuntu
-  canonical=http://archive.ubuntu.com/ubuntu/
-  mirrors="http://mirrors.edge.kernel.org/$path/ http://mirrors.ocf.berkeley.edu/$path/ http://mirrors.mit.edu/$path/"
+  candidates="http://mirrors.edge.kernel.org/ubuntu/ http://mirrors.ocf.berkeley.edu/ubuntu/ http://mirrors.mit.edu/ubuntu/"
 fi
-printf '%s\n' $mirrors "$canonical" | sudo tee /etc/apt/manydesk-mirrors.txt
-sudo sed -i -E 's#^URIs: .*#URIs: mirror+file:/etc/apt/manydesk-mirrors.txt#' "$src"
-printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
-grep -n '^URIs' "$src"
+. /etc/os-release
+for m in $candidates; do
+  if curl -fsS --max-time 10 -o /dev/null "${m}dists/${VERSION_CODENAME}-security/InRelease"; then
+    echo "apt mirror: $m"
+    sudo sed -i -E "s#^URIs: .*#URIs: $m#" "$src"
+    printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
+    exit 0
+  fi
+  echo "apt mirror $m does not answer, next"
+done
+echo "::warning::no independent Ubuntu mirror answered; keeping the runner's own"
