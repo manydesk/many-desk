@@ -73,7 +73,10 @@ jobs:
         run: |
           # The runners' Azure mirror goes down now and then (DNS included): use Ubuntu's own
           # archive, retry, and never hang for long.
+          # (the sources point at /etc/apt/apt-mirrors.txt, the Azure mirror first in it)
+          [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
           sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
           printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config clang nasm cmake \
@@ -108,7 +111,10 @@ jobs:
         run: |
           # The runners' Azure mirror goes down now and then (DNS included): use Ubuntu's own
           # archive, retry, and never hang for long.
+          # (the sources point at /etc/apt/apt-mirrors.txt, the Azure mirror first in it)
+          [ -f /etc/apt/apt-mirrors.txt ] && sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
           sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+          cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
           printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' | sudo tee /etc/apt/apt.conf.d/80-retries > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mingw-w64 cmake nasm
