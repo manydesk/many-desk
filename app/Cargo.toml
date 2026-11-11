@@ -37,7 +37,7 @@ if-addrs = "0.13"
 socket2 = { version = "0.6", features = ["all"] }
 bytes = "1"
 openh264 = "0.9"
-resvg = { version = "0.45", default-features = false }
+resvg = { version = "0.49", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cpal = "0.18"
 audiopus_sys = { version = "0.2", features = ["static"] }
