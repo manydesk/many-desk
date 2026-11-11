@@ -1781,7 +1781,8 @@ impl App {
     fn check_update(&mut self, manual: bool) {
         *self.update.lock().unwrap() = Some((t("start.checking"), None));
         let slot = self.update.clone();
-        let cur = env!("CARGO_PKG_VERSION").to_string();
+        // MANYDESK_UPDATE_CURRENT=<version>: check as that version, to try the update path
+        let cur = std::env::var("MANYDESK_UPDATE_CURRENT").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
         crate::rt::spawn(async move {
             let msg = match crate::platform::update::check(&cur).await {
                 Ok(Some(u)) => {

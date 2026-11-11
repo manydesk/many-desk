@@ -103,7 +103,14 @@ pub async fn check(current: &str) -> Result<Option<Update>, String> {
     }
     let c = client(20)?;
     match get_json(&c, &format!("https://api.github.com/repos/{REPO}/releases?per_page=20")).await {
-        Ok(list) if list.is_array() => return Ok(pick(&list, current)),
+        Ok(list) if list.is_array() => {
+            let u = pick(&list, current);
+            match &u {
+                Some(u) => eprintln!("[update] {current} -> {} available: {}", u.version, u.url),
+                None => eprintln!("[update] {current} is the newest for {}", asset_key()),
+            }
+            return Ok(u);
+        }
         Ok(_) => {}
         Err(e) => eprintln!("[update] release list: {e}; trying the manifest"),
     }
@@ -130,6 +137,15 @@ fn sum_for(sums: &str, name: &str) -> Option<String> {
 
 /// Downloads the installer to Downloads and opens it (the OS/user does the rest).
 pub async fn download_and_open(u: &Update) -> Result<std::path::PathBuf, String> {
+    let dir = directories::UserDirs::new().and_then(|u| u.download_dir().map(|d| d.to_path_buf())).unwrap_or_else(std::env::temp_dir);
+    let path = download(u, &dir).await?;
+    open_path(&path)?;
+    Ok(path)
+}
+
+/// Downloads the package into `dir` and checks it against the release's SHA256SUMS;
+/// nothing is written when it does not match.
+pub async fn download(u: &Update, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
     let url = u.url.as_str();
     // Only https downloads from GitHub.
     if !url.starts_with("https://github.com/") && !url.starts_with("https://objects.githubusercontent.com/") {
@@ -137,7 +153,6 @@ pub async fn download_and_open(u: &Update) -> Result<std::path::PathBuf, String>
     }
     let name = url.rsplit('/').next().filter(|n| !n.is_empty() && !n.contains("..")).ok_or("bad name")?;
     let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || ".-_".contains(*c)).collect();
-    let dir = directories::UserDirs::new().and_then(|u| u.download_dir().map(|d| d.to_path_buf())).unwrap_or_else(std::env::temp_dir);
     let path = dir.join(&name);
     let client = client(600)?;
     let bytes = client.get(url).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?.bytes().await.map_err(|e| e.to_string())?;
@@ -146,11 +161,11 @@ pub async fn download_and_open(u: &Update) -> Result<std::path::PathBuf, String>
         let list = client.get(sums).send().await.map_err(|e| e.to_string())?.error_for_status().map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
         let want = sum_for(&list, &name).ok_or_else(|| format!("{name} is not in SHA256SUMS"))?;
         if hex::encode(Sha256::digest(&bytes)) != want {
-            return Err(format!("{name}: checksum mismatch, not opened"));
+            return Err(format!("{name}: checksum mismatch, not saved"));
         }
     }
     tokio::fs::write(&path, &bytes).await.map_err(|e| e.to_string())?;
-    open_path(&path)?;
+    eprintln!("[update] saved {} ({} bytes, checksum {})", path.display(), bytes.len(), if u.sums.is_some() { "ok" } else { "not published" });
     Ok(path)
 }
 
@@ -207,5 +222,24 @@ mod tests {
         assert_eq!(sum_for(s, "ManyDesk-0.20.0-win-x64.exe").as_deref(), Some("aa11"));
         assert_eq!(sum_for(s, "ManyDesk-0.20.0-mac-universal.dmg").as_deref(), Some("bb22"));
         assert_eq!(sum_for(s, "other"), None);
+    }
+
+    /// Against the real GitHub releases: an older build finds the newest release, and its
+    /// package downloads and matches SHA256SUMS. `cargo test --release --lib -- --ignored live_`
+    #[test]
+    #[ignore = "network"]
+    fn live_update_from_github() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let u = check("0.0.1").await.expect("check").expect("an update for 0.0.1");
+            println!("found {} at {} (sums: {:?})", u.version, u.url, u.sums);
+            assert!(u.sums.is_some(), "the release has SHA256SUMS");
+            let dir = std::env::temp_dir().join(format!("manydesk-update-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = download(&u, &dir).await.expect("download and checksum");
+            println!("downloaded and verified {} ({} bytes)", path.display(), std::fs::metadata(&path).unwrap().len());
+            assert!(check(&u.version).await.expect("check").is_none(), "the newest version itself is up to date");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }
