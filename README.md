@@ -1,226 +1,206 @@
 # ManyDesk
 
-macOS və Windows üçün AnyDesk tipli uzaq masaüstü tətbiqi — **serversiz, mərkəzsiz (P2P)**, yalnız **public STUN** serverlərindən istifadə edir.
+AnyDesk tipli uzaq masaüstü tətbiqi — **öz serveri olmadan, birbaşa P2P**. Rust ilə yazılmış tək native tətbiqdir (egui interfeysi, öz QUIC protokolu). Kompüterlər bir-birini public Nostr relay-ləri, MQTT brokerləri və ya yerli şəbəkə ilə tapır. Görüntü, idarəetmə, səs və fayllar birbaşa iki kompüter arasında gedir.
+
+| Platforma | Paket | Qeyd |
+|---|---|---|
+| macOS 13+ | `ManyDesk-<v>-mac-universal.dmg` | Apple Silicon + Intel |
+| Windows 10/11 (64-bit) | `ManyDesk-<v>-win-x64.exe` | tək fayl, quraşdırma tələb etmir |
+| Linux (amd64, arm64) | `.deb`, `.tar.gz` | X11 və Wayland |
+| Android 8.0+ | `ManyDesk-<v>-android.apk` | həm idarə edir, həm ekranını paylaşır |
+| iOS | mənbədən (`scripts/build-ios.sh`) | yalnız idarə edir (iOS ekran paylaşımına icazə vermir) |
 
 ## İmkanlar
 
-- Ekran paylaşımı (çox monitor dəstəyi, ekran seçimi) — yalnız dəyişən hissələr ötürülür, VP9 ekran-məzmunu rejimi
-- Keyfiyyət rejimləri: ⚡ Sürət (az trafik) / ⚖️ Balans / ✨ Keyfiyyət — viewer sessiya zamanı dəyişir
-- **Səsli danışıq** (iki tərəfli, exo/küy azaldılması ilə) və **yazılı söhbət** hər sessiyanın içində
-- Uzaqdan siçan və klaviatura idarəetməsi (klik, cüt klik, sağ klik, sürükləmə, scroll, Cmd/Shift/Alt/Ctrl qısayolları)
-- Mübadilə buferinin (clipboard) iki tərəfli sinxronizasiyası
-- İki tərəfli fayl ötürülməsi (düymə və ya uzaq ekrana drag & drop) → `~/Downloads/ManyDesk`
-- Host tərəfdə idarəetmə və buferi sessiya zamanı söndürüb-yandırmaq
-- 6 rəqəmli təhlükəsizlik kodu (MITM yoxlaması), canlı statistika (marşrut, RTT, fps, bitrate)
-- Sessiya zamanı ekranın yuxuya getməsinin qarşısı alınır
+**Sessiya növləri** (AnyDesk-in "File Transfer"-i və RustDesk-in terminalı kimi)
+- **Masaüstü:** uzaq ekranı görmək və idarə etmək.
+- **Fayl ötürmə:** masaüstünü göstərmədən iki panelli fayl meneceri.
+- **Terminal:** masaüstünü göstərmədən uzaq kompüterdə shell (macOS/Linux-da login shell, Windows-da PowerShell).
 
-## Dil
+Ünvan sətrindəki fayl/terminal düymələri, son sessiya kartlarının ⋯ menyusu və ya sağ klik (telefonda uzun basma) ilə açılır. Fayl və terminal sessiyalarında host ekranı tutmur və yalnız həmin rejimin icazəsini verir.
 
-Azərbaycanca, English, Русский, Türkçe. Defolt — əməliyyat sisteminin dili (macOS, Windows, Linux üçün eyni üsulla: `app.getPreferredSystemLanguages()`); dəstəklənməyən dildə English. Ayarlar → Dil ilə dərhal dəyişir. Diaqnostika jurnalı texniki olduğu üçün ingiliscədir.
+**Ekran və idarəetmə**
+- H.264 video: yalnız dəyişən hissələr göndərilir, sabit ekran demək olar ki, trafik tutmur. Keyfiyyət: Avtomatik / Sürət / Balans / Keyfiyyət.
+- Çox monitor (Ctrl+Alt+Shift+←/→), görünüş: pəncərəyə sığdır / 1:1 / dartılmış, tam ekran (Ctrl+Alt+Shift+F).
+- Siçan, klaviatura (düymələr və ya "mətn" rejimi), Mac ↔ Windows arasında Cmd ↔ Ctrl avtomatik dəyişir.
+- Uzaq ekranın ölçüsünü dəyişmək (sessiya bitəndə geri qayıdır), macOS-da **virtual ekran** əlavə etmək (monitoru olmayan Mac üçün).
+- Telefonda touchpad və birbaşa toxunma rejimləri.
 
-## Trafik optimallaşdırması
+**Səs, kamera, söhbət**
+- İki tərəfli səs (Opus) və hər iki tərəfin kamerası (kiçik pəncərədə).
+- Hər sessiyanın öz yazılı söhbəti.
 
-Ekran video kodeki ilə ötürülür. Kodek yalnız ilk kadrı tam göndərir, sonrakı kadrlarda **ancaq əvvəlki kadrdan fərqlənən bloklar** (hərəkət vektorları + qalıq) ötürülür. Ekran dəyişmirsə, yeni kadr ümumiyyətlə yaranmır.
+**Fayllar və klipbord**
+- Fayl meneceri (yükləmə/endirmə, qovluq yaratmaq, ad dəyişmək, silmək) və drag & drop.
+- İki tərəfli klipbord: mətn, formatlı mətn (HTML), şəkil, fayl və qovluqlar. Kopyalanan fayllar AnyDesk kimi sessiyada Ctrl/Cmd+V basılanda göndərilir və uzaq tərəfdə özü yapışdırılır.
 
-Ölçülmüş nəticələr (1920×1080 mətnli ekran):
+**Sessiya hərəkətləri** (⋯ menyusu)
+- Ctrl+Alt+Del / Force Quit, kilid, Cmd/Alt+Tab və digər xüsusi düymələr.
+- Uzaq kompüteri yenidən başlatmaq və avtomatik yenidən qoşulmaq.
+- Məxfilik rejimi (hostun ekranı gizlədilir, yerli siçan və klaviatura bloklanır), sessiya bitəndə kilidləmək.
+- Lövhə (uzaq ekranda çəkmək), ekran görüntüsü, tərəfləri dəyişmək.
+- TCP tunel: yerli port → uzaq kompüterdən `host:port`.
 
-| Vəziyyət | Trafik |
-|---|---|
-| Sabit ekran | ~0 kbit/s |
-| Yazı yazmaq (VP9) | ~1.4 Mbit/s |
-| Scroll, "Balans" | ~2.1 Mbit/s |
-| Scroll, "⚡ Sürət" (yarım ölçü, 20 fps) | ~0.36 Mbit/s |
+**Nəzarətsiz giriş**
+- Parol (kompüterdə yalnız PBKDF2 açarı saxlanılır), istəyə görə TOTP ikinci faktoru.
+- "Bu cihaza etibar et": TOTP kodu bir dəfə daxil edildikdən sonra o cihazdan bir daha soruşulmur. Host etibarlı cihazları silə bilər.
+- Windows xidməti: kimsə daxil olmadıqda da (giriş ekranında) kompüterə qoşulmaq olur.
 
-- **VP9** üstün tutulur (mətn və UI üçün VP8-dən xeyli səmərəli). Dəstəklənmirsə AV1 → H.264 → VP8.
-- Bant genişliyi azalanda WebRTC bitrate-i avtomatik aşağı salır (congestion control).
-- Statistika sətrində kodek, cari bitrate və sessiyanın ümumi trafiki (MB) görünür.
-
-## Səs və söhbət
-
-- Səs kanalı ilk kodun içində əvvəlcədən razılaşdırılır, ona görə mikrofonu açmaq/bağlamaq yeni kod mübadiləsi tələb etmir.
-- Mikrofon defolt olaraq bağlıdır; 🎤 düyməsi ilə açılır. Qarşı tərəfin mikrofonu açıq olanda 🔊 göstərilir.
-- Söhbət 💬 düyməsi ilə açılır; oxunmamış mesaj sayı göstərilir, pəncərə fokusda deyilsə bildiriş gəlir.
-- Söhbət yalnız yaddaşda saxlanılır və sessiya bitəndə silinir. Hər şey DTLS/SRTP ilə şifrələnir.
+**Tapmaq və qoşulmaq**
+- 9 rəqəmli ID. Ünvan sətrində son sessiyalardan və yerli şəbəkədən avtomatik tamamlama (ID, ad və ya IP ilə).
+- Son sessiyalar kartlarında canlı status: onlayn / məşğul / oflayn.
+- **Yerli şəbəkə:** eyni şəbəkədəki ManyDesk-lər avtomatik görünür, internet olmadan da qoşulmaq olur. ID əvəzinə IP yazmaq olar (birbaşa IP). Sönülü kompüteri **Wake-on-LAN** ilə yandırmaq olar.
+- Host eyni anda 5 viewer qəbul edir. Hər viewer-in öz kartı, icazələri və rəngli siçan etiketi var.
 
 ## Arxitektura
 
 ```
- Host (ekranı paylaşan)                                   Viewer (idarə edən)
- ┌───────────────────────┐  sorğu → Qəbul et → dəvət → cavab  ┌───────────────────────┐
- │ getDisplayMedia       │ ◀──── Nostr relay-lər + MQTT ─────▶ │ ünvan: 482 913 557    │
- │ RTCPeerConnection     │   (imzalı, şifrəli, bir neçə KB)    │ RTCPeerConnection     │
- │ input helper ◀────────┼──── ekran / input / səs / fayl ─────┼── siçan/klaviatura    │
- └──────────┬────────────┘      (birbaşa P2P, DTLS/SRTP)       └──────────┬────────────┘
-            │        yalnız öz public IP-ni öyrənmək üçün                  │
-            └────────────▶  public STUN serverləri  ◀──────────────────────┘
-                 (lazım olanda: TURN relay — Cloudflare / öz serveriniz)
+ Host                                                         Viewer
+ ┌─────────────────────┐  sorğu → Qəbul et → təklif → cavab   ┌─────────────────────┐
+ │ ekran tutma         │ ◀── Nostr + MQTT + yerli şəbəkə ───▶ │ ID: 482 913 557     │
+ │ H.264 kodlayıcı     │     (imzalı, şifrəli, bir neçə KB)   │ H.264 dekoder       │
+ │ input injeksiyası ◀─┼── ekran / input / səs / fayl ────────┼── siçan, klaviatura │
+ └──────────┬──────────┘   (birbaşa QUIC, TLS 1.3, P2P)        └──────────┬──────────┘
+            │          yalnız öz public ünvanını öyrənmək üçün            │
+            └──────────▶  public STUN serverləri  ◀───────────────────────┘
+                (lazım olanda TURN relay: Cloudflare və ya öz serveriniz)
 ```
 
-- **Öz serverimiz yoxdur.** Qoşulma mesajları (SDP + ICE namizədləri, `deflate` ilə sıxılmış) public Nostr relay-ləri və MQTT brokerləri ilə ötürülür — aşağıdakı "ID ilə qoşulma" bölməsinə baxın.
-- **Public STUN.** 83 public STUN serveri yoxlanıldı (56-sı işləyir); defolt siyahıda müxtəlif provayder, ölkə və portlardan 15-i var: Google (19302, 3478), Cloudflare (3478, **443**), Nextcloud (**443**), Metered (**80**), Twilio, Telnyx, BlackBerry, Framasoft, T-Online, IPFire, Zadarma, Sipnet, Xiaomi. Bir provayderi və ya 19302/3478 portlarını bloklayan şəbəkələr qalanlarına çatır. Ayarlarda dəyişmək olar (yalnız `stun:` ünvanları).
-- **Şifrələmə.** Bütün trafik WebRTC DTLS/SRTP ilə uçdan-uca şifrələnir. Təhlükəsizlik kodu hər iki tərəfin DTLS sertifikat barmaq izlərindən (SHA-256) hesablanır; hər iki ekranda eyni rəqəmlər görünürsə, kodlar yolda dəyişdirilməyib.
-- **Kanallar:** video track (ekran), `ctl` data channel (input, bufer, icazələr), `file` data channel (64 KB-lıq hissələr, backpressure ilə).
-- **Input injeksiyası:** kiçik native helper, Electron onu stdin üzərindən JSON əmrlərlə idarə edir.
-  - macOS: `native/InputHelper.swift` — CoreGraphics `CGEvent` (universal: Intel + Apple Silicon)
-  - Windows: `native/win/inputhelper_windows.go` — `SendInput` + `SetCursorPos`, scan-code əsaslı klaviatura, per-monitor DPI dəstəyi
-- **Mac ↔ Windows:** platformalar fərqlidirsə, viewer Cmd ↔ Ctrl düymələrini avtomatik dəyişir (Mac-dən Cmd+C → Windows-da Ctrl+C və əksinə).
+- **Görüş nöqtəsi (rendezvous):** qısa qoşulma mesajları **11 Nostr relay**, **4 MQTT broker** və **yerli şəbəkə** (UDP broadcast, port 21140) ilə paralel ötürülür. Hər mesaj Schnorr (secp256k1) ilə imzalanır və tətbiq imzanı özü yoxlayır. İlk sorğu ID-dən törədilən açarla, sonrakılar təsadüfi sessiya açarı ilə şifrələnir. Dəqiq vaxt şəbəkədən (Cloudflare) öyrənilir, ona görə səhv sistem saatı mane olmur.
+- **MDP:** ManyDesk-in öz protokolu. UDP deşik açma (hole punching) ilə alınmış birbaşa yol üzərində QUIC (TLS 1.3, BBR) işləyir. Hər video kadr ayrıca axında gedir: itən paket yalnız həmin kadrı gecikdirir. Səs datagramlarla, idarəetmə və fayllar ayrı axınlarla ötürülür.
+- **Video:**
+
+  | | Tutma | Kodlama | Dekodlama |
+  |---|---|---|---|
+  | macOS | ScreenCaptureKit | VideoToolbox (aparat) | VideoToolbox |
+  | Windows | DXGI | Media Foundation (Quick Sync / NVENC / AMF), yoxdursa OpenH264 | Media Foundation (DXVA) |
+  | Linux | X11 MIT-SHM / Wayland portal | OpenH264 | VA-API (GStreamer) |
+  | Android | MediaProjection | OpenH264 | OpenH264 |
+
+- **Input:** macOS-da kiçik Swift köməkçisi (`native/InputHelper.swift`, CoreGraphics), Windows-da Go köməkçisi (`native/win/`, `SendInput`, exe-nin içindədir), Linux-da XTest, Android-də AccessibilityService.
+
+## Təhlükəsizlik
+
+- Sessiyanın bütün trafiki uçdan-uca şifrələnir. Hər tərəf öz sertifikatını yaradır, barmaq izi şifrəli görüş mesajı ilə ötürülür və QUIC/TLS yalnız həmin sertifikatı qəbul edir (hər iki istiqamətdə pin).
+- 6 rəqəmli təhlükəsizlik kodu hər iki sertifikatdan hesablanır. Hər iki ekranda eyni rəqəmlər görünürsə, araya kimsə girməyib.
+- Nəzarətsiz giriş parolu şəbəkədə getmir: viewer `HMAC(PBKDF2(parol), nonce | host | viewer | TOTP)` ilə sübut göndərir, 3 səhv cəhddən sonra bağlantı kəsilir.
+- TURN relay trafiki görsə də, məzmunu oxuya bilmir.
+- Host hər sorğunu "Qəbul et" ilə təsdiqləyir (və ya nəzarətsiz giriş parolu). Hər viewer-in icazələri ayrıca seçilir və sessiya zamanı dəyişdirilə bilər. İstəyə görə yalnız siyahıdakı ID-lərə icazə vermək olar.
+
+## Layihənin quruluşu
 
 ```
-src/main/main.js      Electron main: pəncərə, icazələr, ekran mənbəyi, bufer, fayl yazma
-src/main/input.js     Normallaşdırılmış koordinatları ekran nöqtələrinə çevirir, helper-i idarə edir
-src/main/keymap.js    KeyboardEvent.code → macOS virtual keycode
-src/main/keymap-win.js KeyboardEvent.code → Windows scan code
-src/renderer/rtc.js   WebRTC sessiyası, kod kodlaşdırma, SAS, fayl ötürmə, statistika
-src/renderer/app.js   İnterfeys məntiqi
-native/InputHelper.swift
-native/win/inputhelper_windows.go
+app/                  Rust tətbiqi (bütün platformalar)
+  src/ui.rs, ui/      interfeys (egui): ana ekran, sessiya, fayl meneceri, terminal, ayarlar
+  src/core.rs, core/  sessiyalar, sorğular, icazələr, klipbord, ekran rejimləri, terminal, tunellər
+  src/mdp/            QUIC protokolu, NAT keçidi, TLS pin, TURN müştərisi
+  src/rendezvous.rs   Nostr + MQTT görüş nöqtəsi
+  src/lan.rs          yerli şəbəkə: kəşf, birbaşa IP, Wake-on-LAN
+  src/media/          ekran tutma, H.264 kodlama/dekodlama, kamera
+  src/platform/       icazələr, Windows xidməti, ekran rejimləri, virtual ekran
+  src/android.rs, ios.rs  telefon körpüləri
+  assets/i18n.json    tərcümələr (az, en, ru, tr)
+android/              Android qabığı (Java: ekran tutma, AccessibilityService, bildirişlər)
+ios/                  iOS qabığı
+native/               macOS və Windows input köməkçiləri
+scripts/              build skriptləri
+docker/               Linux build mühiti
 ```
 
-## İşə salma
+## Build
 
-Tələblər: Node.js 18+; macOS helper üçün Xcode Command Line Tools (`swiftc`), Windows helper üçün Go 1.20+.
+Hamısı Mac-dən qurulur.
+
+Tələblər:
+- Rust (rustup)
+- Mac üçün: Xcode Command Line Tools
+- Windows üçün: `mingw-w64`, `cmake`, Go (input köməkçisi)
+- Linux üçün: Docker
+- Android üçün: `scripts/setup-android.sh` hər şeyi quraşdırır
+- iOS üçün: tam Xcode
+
+Mac, Windows və Linux paketləri (`dist-native/`-ə):
 
 ```bash
-npm install
+scripts/package-native.sh mac win
 ```
 
 ```bash
-npm start
+scripts/package-native.sh --bump minor mac win linux
 ```
 
-Windows-da (Go lazımdır, Git Bash ilə):
+`--bump major|minor|patch` versiyanı `app/Cargo.toml`-da artırır. Qayda: yeni funksiya `minor`, düzəliş `patch`. Hər build-ə tarix əsaslı build nömrəsi də yazılır (`manydesk --version`).
+
+Android və iOS:
 
 ```bash
-npm run start:win
-```
-
-Paketləmə (hamısı Mac-dən qurula bilir):
-
-```bash
-npm run dist
+scripts/build-android.sh
 ```
 
 ```bash
-npm run dist:win
+scripts/build-ios.sh
 ```
 
-| Fayl | Platforma |
+İnkişaf zamanı birbaşa işə salmaq:
+
+```bash
+cd app && cargo run --release
+```
+
+macOS imzası: Ekran yazılışı və Əlçatanlıq icazələri tətbiqin imzasına bağlıdır. `package-native.sh` ilk dəfə keychain-də "ManyDesk Local Signing" sertifikatı yaradır və bütün build-ləri onunla imzalayır, ona görə yenidən build-dən sonra icazələr itmir. Developer ID varsa: `MANYDESK_SIGN_ID="Developer ID Application: …"`.
+
+### Test üçün mühit dəyişənləri
+
+Eyni Mac-də bir neçə nüsxəni ayrı ayarlarla işə salmaq olar (`HOME=<qovluq>`, Windows-da `MANYDESK_CONFIG_DIR=<qovluq>`). Avtomatik testlər üçün:
+
+| Dəyişən | Nə edir |
 |---|---|
-| `ManyDesk-<v>-arm64.dmg` / `.zip` | Mac, Apple Silicon (M1/M2/M3…) |
-| `ManyDesk-<v>-x64.dmg` / `.zip` | Mac, Intel |
-| `ManyDesk-<v>-win-x64.exe` | Windows 10/11 installer |
-| `ManyDesk-<v>-win-x64-portable.exe` | Windows, quraşdırmadan işləyən |
+| `MANYDESK_AUTOCONNECT=<ID>` | açılan kimi qoşulur (`MANYDESK_AUTOMODE=files\|terminal` ilə rejim) |
+| `MANYDESK_AUTOACCEPT=1`, `MANYDESK_AUTOFULL=1` | sorğuları qəbul edir (bütün icazələrlə) |
+| `MANYDESK_TESTNOINJECT=1` | uzaq input-u icra etmir, log-a yazır |
+| `MANYDESK_SYNTH=1` | ekran əvəzinə sintetik test şəkli |
+| `MANYDESK_TESTNORELAY=1` | relay-lər olmadan, yalnız yerli şəbəkə |
+| `MANYDESK_TESTPASTE`, `MANYDESK_TESTPASTEFILES`, `MANYDESK_TESTTERM`, `MANYDESK_TESTTYPE`, `MANYDESK_TESTCLICK` | yapışdırma, terminal, yazma və kliki təqlid edir |
+| `MANYDESK_DEBUG=1` | ətraflı log |
 
-Minimum: macOS 13, Windows 10 (64-bit).
+## Platforma qeydləri
 
-## Paylaşma və "damaged" xətası
+**macOS**
+- Host üçün icazələr: **Ekran yazılışı**, **Əlçatanlıq** (idarəetmə üçün), **Yerli şəbəkə** (LAN kəşfi və Wake-on-LAN üçün).
+- Paket Apple Developer ID ilə notarizasiya olunmayıb. İnternetdən yüklənəndə "damaged" xətası çıxarsa, `/Applications`-a köçürdükdən sonra:
 
-Tətbiq Apple Developer ID ilə imzalanmadığı üçün internetdən (WhatsApp, Telegram, brauzer) yüklənəndə macOS onu karantinə qoyur. Bu zaman "ManyDesk.app is damaged" və ya "Apple could not verify…" xətası çıxa bilər. Həll yolu — tətbiqi `/Applications`-a köçürdükdən sonra:
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/ManyDesk.app
+  ```
 
-```bash
-xattr -dr com.apple.quarantine /Applications/ManyDesk.app
-```
+**Windows**
+- İlk açılışda Firewall şəbəkə icazəsi soruşa bilər: "Private networks" üçün icazə verin.
+- Fayl imzasızdır, SmartScreen çıxarsa: **More info → Run anyway**.
+- Kimsə daxil olmadıqda da qoşulmaq üçün Ayarlarda Windows xidmətini quraşdırın (administrator icazəsi lazımdır). Ctrl+Alt+Del də xidmət vasitəsilə göndərilir.
 
-Və ya System Settings → Privacy & Security → **Open Anyway**. Bu xəbərdarlığın tam aradan qalxması üçün ödənişli Apple Developer hesabı ilə imzalayıb notarizasiya etmək lazımdır.
+**Android**
+- İdarə edilmək üçün ManyDesk-in Əlçatanlıq xidmətini yandırın. Android 13+ APK-dan quraşdırılanda bəzi telefonlarda (Samsung, Xiaomi) əvvəlcə Tətbiq məlumatı → ⋮ → "Məhdud ayarlara icazə ver" lazımdır.
 
-## İstifadə
-
-İnterfeys AnyDesk-in iş axınını izləyir (öz ikonları və brendi ilə):
-
-- **Sol panel → "Bu masa":** bu kompüterin 9 rəqəmli ünvanı (məs. `482 913 557`) və relay statusu.
-- **Yuxarıda "Uzaq ünvanı daxil edin":** qarşı tərəfin ünvanını yazıb → (Qoşul).
-- **Sessiya tabı:** qoşulma başlayan kimi açılır ("Qəbul etməsi gözlənilir…"), qoşulduqdan sonra uzaq ekran + alət paneli (söhbət, mikrofon, fayl, keyfiyyət, tam ekran, ayrıl).
-- **Qəbul pəncərəsi (host):** "… ekranınıza qoşulmaq istəyir", icazə düymələri (klaviatura/siçan, bufer) → **Qəbul et / Rədd et**. Eyni anda gələn sorğular növbəyə düşür və bir-bir göstərilir.
-- **Host çox-sessiyalıdır:** eyni anda 5 nəfərə qədər qoşula bilər. Hər qoşulan üçün sağ altda ayrıca kart: öz təhlükəsizlik kodu, öz icazələri (klaviatura/siçan, bufer), statistika, söhbət, mikrofon, fayl, **Ayır**. Kartı kiçiltmək olar.
-- **Ana səhifə → "Son sessiyalar":** əvvəlki bağlantıların şəkilli plitələri; klik → yenidən qoşulma. Hər plitədə canlı status: 🟢 **Onlayn**, 🟠 **Məşğul** (o kompüter maksimum sayda qoşulanı qəbul edib), ⚪ **Oflayn**.
-- **Söhbət** ayrıca sütunda açılır — uzaq ekran, alət paneli və bağlantı məlumatı onun altında qalmır.
-- **Bir neçə kompüterə eyni anda qoşulmaq:** hər yeni ünvan ayrıca tabda açılır (tabda ad + ünvanın son 3 rəqəmi, oxunmamış mesaj sayı, vəziyyət nöqtəsi).
-- **Tam ekran (AnyDesk kimi):** alət panelindəki düymə və ya **Ctrl+Alt+Shift+F** — pəncərə bütün monitoru tutur, yalnız uzaq ekran qalır; alət paneli siçan ekranın yuxarı kənarında dayananda sürüşüb açılır. Eyni qısayol normal rejimə qaytarır. Esc uzaq kompüterə gedir (tam ekrandan çıxarmır).
-
-#### Onlayn status necə işləyir
-
-Server olmadan: hər 45 saniyədən bir siyahıdakı ünvanlara ID kanalları (Nostr + MQTT) ilə kiçik şifrəli "ping" gedir; həmin kompüterdə ManyDesk açıqdırsa, "pong" (ad + məşğulluq) ilə cavab verir. Cavab 100 saniyədən köhnədirsə — oflayn. Ping-i yalnız ünvanı bilən göndərə bilər, cavablar sürət baxımından məhdudlaşdırılıb. "Ekran paylaşımı → Ünvanımı bilənlər onlayn olub-olmadığımı görə bilsin" söndürülsə, kompüter həmişə oflayn görünür (qoşulma sorğuları yenə gəlir).
-
-## Sessiyaların izolyasiyası
-
-Hər sessiya tamamilə ayrıdır — öz WebRTC bağlantısı, öz şifrələmə açarları və təhlükəsizlik kodu, öz video/audio elementi, öz söhbəti və statistikası:
-
-| | Aktiv (görünən) tab | Fon tabları |
-|---|---|---|
-| Görüntü | göstərilir | arxada qəbul olunmağa davam edir |
-| Uzaq səs | eşidilir | **susdurulur** |
-| Sizin mikrofonunuz | yalnız bu sessiyaya gedir | **trek söndürülür**, qarşı tərəfə "mikrofon bağlı" bildirilir; taba qayıdanda bərpa olunur |
-| Klaviatura / siçan | yalnız bu sessiyaya | heç nə getmir; tab dəyişəndə basılı düymələr buraxılır |
-| Mübadilə buferi | yalnız bu sessiya ilə | nə oxuya, nə yaza bilər |
-| Söhbət | öz tarixçəsi | öz tarixçəsi + oxunmamış sayı tabda; mesajlar heç vaxt başqa sessiyaya düşmür |
-| Fayl | yalnız bu sessiyaya | — |
-
-Host tərəfində də hər qoşulan ayrıdır: hər birinə ayrıca ekran axını (birinin "Sürət" seçimi digərinin keyfiyyətinə təsir etmir), ayrıca söhbət (A-nın mesajı B-yə getmir), mikrofon yalnız açıldığı istifadəçiyə gedir, icazələr hər istifadəçi üçün ayrıca seçilir. Bir viewer-in göndərdiyi bufer mətni digər viewer-lərə avtomatik ötürülmür. Klaviatura/siçan icazəsi olan bir neçə viewer eyni siçanı idarə edir — buna görə icazəni yalnız ehtiyac olana verin.
-
-**Kim nə edir:** hostun ekranında hər viewer-in hərəkəti rəngli etiketlə göstərilir — adı, ünvanı və əməliyyatı ("klikləyir", "yazır", "sürüşdürür"); klikdə dalğa effekti. Etiketin rəngi sağ altdakı kartın rəngi ilə eynidir. Etiketlər şəffaf, klikləri ötürən overlay pəncərəsindədir və **ekran tutulmasından çıxarılıb** (macOS/Windows content protection) — onları yalnız host görür, viewer-lər bir-birini görmür.
-
-Uzaq ekran həmişə **tam** ötürülür (kəsilmədən, orijinal nisbətdə) və viewer pəncərəsinin ölçüsündən asılı olmayaraq **tam görünəcək şəkildə miqyaslanır** (object-fit: contain); siçan koordinatları bu miqyasa uyğun hesablanır. "Sürət" rejimi ölçünü yarıya endirir, amma kəsmir.
-
-## ID ilə qoşulma necə işləyir
-
-Öz serverimiz yoxdur. Qısa qoşulma mesajları (bir neçə KB) **iki müstəqil public şəbəkə** ilə paralel ötürülür:
-
-- **11 Nostr relay** (müxtəlif ölkələrdə müstəqil operatorlar)
-- **4 MQTT broker** (HiveMQ, EMQX, EMQX-CN, Mosquitto — WebSocket üzərindən)
-
-Şəbəkə birini bloklasa (məs. Nostr domenləri), digəri işləyir — hər iki ssenari real yoxlanılıb. Görüntü, idarəetmə, səs, fayllar onlardan keçmir — birbaşa P2P gedir.
-
-**Saat fərqi:** kompüterlərin saatı dəqiqələrlə fərqli ola bilər (xüsusən Windows) və relay-lər belə mesajları rədd edir. Tətbiq dəqiq vaxtı şəbəkədən (Cloudflare) öyrənir və mesajları onunla imzalayır — sistem saatı 25 dəqiqə səhv olanda da 11/11 relay qəbul edir.
-
-```
-viewer ──sorğu (ID-dən törədilən açarla şifrəli)──▶ relay-lər ──▶ host: Qəbul et?
-viewer ◀──dəvət kodu (təsadüfi sessiya açarı)────── relay-lər ◀── host
-viewer ──cavab kodu─────────────────────────────▶ relay-lər ──▶ host  →  birbaşa P2P
-```
-
-- Bütün relay və brokerlərə paralel göndərilir; birinin çatdırması kifayətdir. Nostr mesajları "ephemeral"-dır, MQTT QoS 0-dır (saxlanmır). Relay-in yenə də saxladığı köhnə sorğular (yenidən başladıqdan sonra) EOSE ilə ayırd edilib atılır.
-- Hər mesaj Schnorr (secp256k1) ilə imzalanır və tətbiq imzanı özü yoxlayır — relay mesajı saxtalaşdıra bilməz.
-- ID yalnız hostu tapmaq və ilk sorğunu şifrələmək üçündür. Sonrakı mesajlar təsadüfi sessiya açarı ilə şifrələnir, hər tərəf digərinin imza açarını "pin" edir: ID-ni bilən başqa biri cavabı oxuya və ya araya cavab sala bilməz.
-- Host hər sorğunu əl ilə qəbul etməlidir; 60 saniyə cavab verilməsə, avtomatik rədd edilir.
-- ID kompüterdə saxlanılır və dəyişmir; "Yeni ID" ilə yenilənə bilər (köhnəsi işləməz).
-
-## Windows qeydləri
-
-- Xüsusi icazə lazım deyil. İlk açılışda Windows Firewall şəbəkə icazəsi soruşa bilər — "Private networks" üçün icazə verin.
-- Installer imzasızdır, ona görə SmartScreen "Windows protected your PC" göstərə bilər: **More info → Run anyway**.
-- Windows UAC pəncərələri və administrator kimi işləyən proqramlar adi istifadəçi prosesindən idarə edilə bilmir (Windows təhlükəsizlik məhdudiyyəti). Bunlar üçün ManyDesk-i "Run as administrator" ilə açın.
-
-## macOS icazələri (host tərəfdə)
-
-- **Ekran yazılışı** (System Settings → Privacy & Security → Screen Recording)
-- **Əlçatanlıq / Accessibility** — uzaqdan idarəetmə üçün
-
-`npm start` ilə işlədəndə icazələr "Electron" tətbiqinə verilir; paketlənmiş versiyada "ManyDesk"-ə. İcazə verdikdən sonra tətbiqi yenidən başladın.
+**Linux**
+- Wayland-də ekran desktop portalı ilə tutulur (ilk dəfə sistem soruşur).
 
 ## Mobil internet və TURN relay
 
-Mobil operatorlar (Azercell, Bakcell, Nar və s.) CGNAT / simmetrik NAT işlədir: hər yeni ünvan üçün təsadüfi port verilir, ona görə yalnız STUN ilə birbaşa qoşulma alınmır. Həll — TURN relay:
+Mobil operatorlar (Azercell, Bakcell, Nar və s.) CGNAT / simmetrik NAT işlədir, ona görə yalnız STUN ilə birbaşa yol tapılmaya bilər. Həll TURN relay-dir.
 
-**Tövsiyə — Cloudflare Realtime TURN (ayda 1000 GB pulsuz):**
-
+**Tövsiyə: Cloudflare Realtime TURN** (ayda 1000 GB pulsuz):
 1. [dash.cloudflare.com](https://dash.cloudflare.com)-da pulsuz hesab açın.
-2. **Realtime** (əvvəlki adı *Calls*) → **TURN Server** → **Create** → *Turn Token ID* və *API Token*-i kopyalayın.
+2. **Realtime → TURN Server → Create**, sonra *Turn Token ID* və *API Token*-i kopyalayın.
 3. ManyDesk → Ayarlar → **TURN relay** → "Cloudflare" → açarları yapışdırın → **Yoxla** → **Yadda saxla**.
 
-Tətbiq bu açarla hər sessiyadan əvvəl 24 saatlıq müvəqqəti giriş məlumatı alır (`rtc.live.cloudflare.com` API) — öz serverə ehtiyac yoxdur. **Yalnız bir tərəfdə** ayarlamaq kifayətdir.
+Tətbiq bu açarla müvəqqəti (24 saatlıq) giriş məlumatı alır. Yalnız bir tərəfdə ayarlamaq kifayətdir. Alternativ: "Digər TURN (əl ilə)", yəni öz coturn serveriniz və ya başqa provayder.
 
-**Alternativ:** "Digər TURN (əl ilə)" — [Metered Open Relay](https://www.metered.ca/tools/openrelay/) (ayda 20 GB), ExpressTURN və ya öz coturn serveriniz.
-
-Qeydiyyatsız işləyən açıq TURN serverləri artıq qalmayıb: 2026-cı ilin oktyabrında 20-dən çox məşhur ünvan yoxlanıldı (openrelay, freestun, freeturn, PeerJS-in daxili TURN-u və s.) — hamısı bağlanıb və ya DNS-dən silinib.
-
-- Relay yalnız birbaşa yol (LAN/STUN) tapılmayanda istifadə olunur — ICE həmişə birbaşa yolu üstün tutur.
-- Trafik relay-dən keçsə də DTLS/SRTP ilə uçdan-uca şifrəli qalır; relay məzmunu görmür.
-- Parol yalnız həmin kompüterdə saxlanılır; dəvət/cavab koduna yalnız relay-in ünvanı düşür.
-- Relay üzərindən qoşulanda viewer avtomatik "⚡ Sürət" rejiminə keçir (pulsuz paketin limitinə qənaət).
+Relay yalnız birbaşa yol tapılmayanda istifadə olunur. Trafik relay-dən keçsə də uçdan-uca şifrəli qalır.
 
 ## Məhdudiyyətlər
 
-- **Simmetrik NAT (mobil internet):** TURN ayarlanmayıbsa, birbaşa qoşulma alınmaya bilər — yuxarıdakı bölməyə baxın.
-- **Nəzarətsiz giriş (unattended access) yoxdur** — host hər sorğunu "Qəbul et" ilə təsdiqləməlidir, tətbiq açıq olmalıdır.
-- Kompüterin öz səsi (musiqi, video səsi) ötürülmür — yalnız mikrofon.
-- Paket yalnız ad-hoc imzalıdır (Apple Developer ID və notarizasiya yoxdur). Ətraflı: aşağıdakı "Paylaşma" bölməsi.
+- Paketlər Apple Developer ID / Windows kod imzası ilə imzalanmayıb.
+- iOS yalnız viewer-dir: iOS başqa tətbiqlərə ekranı tutmağa icazə vermir.
+- Virtual ekran yalnız macOS-dadır (Windows-da imzalı drayver lazımdır).
+- Wake-on-LAN yalnız eyni şəbəkədən işləyir və kompüterin şəbəkə kartı bir dəfə yerli şəbəkədə görünməlidir.
+- Avtomatik yeniləmə hazırdır, amma manifest ünvanı (`platform/update.rs`) hələ təyin olunmayıb.
