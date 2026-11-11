@@ -1,14 +1,7 @@
-# Dependencies and build output (rebuilt by cargo / npm / scripts/*.sh)
-node_modules/
+# Build output (rebuilt by cargo / scripts/*.sh)
 target/
 build/
-dist/
 dist-native/
-dist-tauri/
-
-# Built binaries kept out of history
-spike/ManyDeskGesture.app/
-.wintest/*.exe
 
 # OS
 .DS_Store

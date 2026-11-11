@@ -113,7 +113,7 @@ mac() {
   mkdir -p "$B/MacOS" "$B/Resources"
   lipo -create "$APP/target/aarch64-apple-darwin/release/manydesk" "$APP/target/x86_64-apple-darwin/release/manydesk" -output "$B/MacOS/manydesk"
   cp "$ROOT/build/bin/manydesk-input" "$B/MacOS/"
-  cp "$ROOT/src-tauri/icons/icon.icns" "$B/Resources/icon.icns"
+  cp "$APP/assets/icon.icns" "$B/Resources/icon.icns"
   cat > "$B/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

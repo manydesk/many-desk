@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>NSScreenCaptureUsageDescription</key><string>ManyDesk shares your screen with the user you accept.</string>
-  <key>NSMicrophoneUsageDescription</key><string>ManyDesk uses the microphone for voice chat in a session.</string>
-</dict>
-</plist>
