@@ -722,9 +722,10 @@ impl Session {
     /// shape (on change only) go over the control stream as
     /// {"t":"cur","x","y"} (0..1 on the display; {"t":"cur"} alone: not on it) and
     /// {"t":"curimg","png","w","h","hx","hy"} (size and hot spot in display pixels).
-    /// macOS hosts only; elsewhere the pointer stays in the picture.
+    /// macOS and Windows hosts; elsewhere the pointer stays in the picture. (Windows'
+    /// desktop duplication leaves the pointer out of the picture anyway.)
     pub fn cursor_apart(self: &Arc<Self>) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             if self.cursor_apart.swap(true, Ordering::SeqCst) {
                 return;
@@ -745,7 +746,10 @@ impl Session {
                         continue;
                     };
                     // position at 60 Hz, shape every 3rd look
+                    #[cfg(target_os = "macos")]
                     let (pos, shape) = crate::media::mac::cursor(id, n % 3 == 0);
+                    #[cfg(windows)]
+                    let (pos, shape) = crate::media::wincap::cursor(id, n % 3 == 0);
                     n = n.wrapping_add(1);
                     let pos = pos.map(|(x, y)| ((x * 1e4).round() / 1e4, (y * 1e4).round() / 1e4));
                     let mut msgs = Vec::new();

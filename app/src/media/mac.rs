@@ -746,17 +746,7 @@ extern "C" {
     fn CGContextRelease(ctx: *mut c_void);
 }
 
-pub struct CursorShape {
-    /// RGBA, premultiplied (as drawn), `px` × `py` pixels
-    pub rgba: Vec<u8>,
-    pub px: usize,
-    pub py: usize,
-    /// size and hot spot in the display's pixels
-    pub w: f64,
-    pub h: f64,
-    pub hx: f64,
-    pub hy: f64,
-}
+use super::CursorShape;
 
 /// Where the pointer is on display `id` (0..1 each way; None when it is on another
 /// display), and — with `shape` — what it looks like right now.

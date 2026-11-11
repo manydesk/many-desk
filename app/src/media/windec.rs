@@ -197,25 +197,41 @@ impl MfDecoder {
     }
 }
 
-/// NV12 (Y plane `pitch`×`rows`, then interleaved UV) → RGBA, BT.601 limited range.
+/// NV12 (Y plane `pitch`×`rows`, then interleaved UV) → RGBA, BT.601 limited range. Bands
+/// of rows on several threads: a 4K picture is ~33 MB of output per frame.
 pub fn nv12_to_rgba(src: &[u8], pitch: usize, rows: usize, w: usize, h: usize, out: &mut Vec<u8>) {
     out.resize(w * h * 4, 0);
     let (y_plane, uv_plane) = src.split_at(pitch * rows);
-    for y in 0..h {
-        let yr = &y_plane[y * pitch..y * pitch + w];
-        let uvr = &uv_plane[(y / 2) * pitch..];
-        let o = &mut out[y * w * 4..(y + 1) * w * 4];
-        for x in 0..w {
-            let c = (yr[x] as i32 - 16) * 298;
-            let d = uvr[x & !1] as i32 - 128;
-            let e = uvr[(x & !1) + 1] as i32 - 128;
-            let px = &mut o[x * 4..x * 4 + 4];
-            px[0] = ((c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-            px[1] = ((c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-            px[2] = ((c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-            px[3] = 255;
+    let threads = if w * h < 640 * 480 { 1 } else { std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4) };
+    // whole pairs of rows per band (a chroma row serves two)
+    let band = (h.div_ceil(threads) + 1) & !1;
+    let convert = |first: usize, o: &mut [u8]| {
+        for (r, orow) in o.chunks_exact_mut(w * 4).enumerate() {
+            let y = first + r;
+            let yr = &y_plane[y * pitch..y * pitch + w];
+            let uvr = &uv_plane[(y / 2) * pitch..];
+            for x in 0..w {
+                let c = (yr[x] as i32 - 16) * 298;
+                let d = uvr[x & !1] as i32 - 128;
+                let e = uvr[(x & !1) + 1] as i32 - 128;
+                let px = &mut orow[x * 4..x * 4 + 4];
+                px[0] = ((c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
+                px[1] = ((c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
+                px[2] = ((c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+                px[3] = 255;
+            }
         }
+    };
+    if threads == 1 {
+        convert(0, out);
+        return;
     }
+    std::thread::scope(|sc| {
+        for (i, chunk) in out.chunks_mut(band * w * 4).enumerate() {
+            let convert = &convert;
+            sc.spawn(move || convert(i * band, chunk));
+        }
+    });
 }
 
 impl Drop for MfDecoder {

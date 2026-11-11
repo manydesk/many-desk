@@ -166,6 +166,18 @@ impl Video {
                         return;
                     }
                 }
+                // Windows: DXGI duplication → GPU conversion → hardware encoder (wincap.rs), with
+                // the same fallback as macOS
+                #[cfg(windows)]
+                while !super::wincap::unsupported() && std::env::var_os("MANYDESK_SOFTWARE_CAPTURE").is_none() && std::env::var_os("MANYDESK_SYNTH").is_none() {
+                    match super::wincap::run(me.clone(), sink.clone()) {
+                        Ok(()) => return,
+                        Err(e) => eprintln!("[wincap] {e}; the portable path for now"),
+                    }
+                    if me.run(sink.clone(), Some(Instant::now() + Duration::from_secs(8))) {
+                        return;
+                    }
+                }
                 #[allow(unreachable_code)]
                 {
                     me.run(sink, None);
@@ -180,7 +192,7 @@ impl Video {
         *self.params.lock().unwrap()
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     pub(crate) fn take_keyframe(&self) -> bool {
         self.keyframe.swap(false, Ordering::Relaxed)
     }
@@ -190,12 +202,12 @@ impl Video {
         self.keyframe.load(Ordering::Relaxed)
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     pub(crate) fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     pub(crate) fn screen(&self) -> Option<&Screen> {
         self.screen.as_ref()
     }
@@ -204,7 +216,7 @@ impl Video {
     /// A frame not encoded because the path was backed up: counts as bandwidth-limited for
     /// the quality loop, without forcing a keyframe.
     /// Software path: how long a frame took against its slot.
-    fn timing(&self, took: Duration, slot: Duration) {
+    pub(crate) fn timing(&self, took: Duration, slot: Duration) {
         let mut st = self.stats.lock().unwrap();
         let now = Instant::now();
         st.timed.push(now);
@@ -311,7 +323,7 @@ impl Video {
                 enc = None;
                 #[cfg(windows)]
                 if try_hardware {
-                    match super::win::MfEncoder::new(dw, dh, p.fps, p.bitrate) {
+                    match super::win::MfEncoder::new(dw, dh, p.fps, p.bitrate, None) {
                         Ok(m) => {
                             eprintln!("[encode] Media Foundation: {}", m.name);
                             enc = Some((H264::Mf(m), p, dw, dh));
@@ -329,6 +341,8 @@ impl Video {
                     .max_frame_rate(FrameRate::from_hz(p.fps as f32))
                     .usage_type(UsageType::ScreenContentRealTime)
                     .rate_control_mode(RateControlMode::Bitrate)
+                    .num_threads(std::thread::available_parallelism().map(|n| n.get().min(4)).unwrap_or(2) as u16)
+                    .max_slice_len(super::SLICE_BYTES)
                     .skip_frames(true)
                     .intra_frame_period(IntraFramePeriod::from_num_frames((p.fps * KEY_EVERY_SECS) as u32));
                 match Encoder::with_api_config(OpenH264API::from_source(), cfg) {

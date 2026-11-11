@@ -49,7 +49,7 @@ It is a single native application written in Rust, with one code base for every 
 
 ## Download
 
-Get the latest version from the [**Releases**](https://github.com/manydesk/many-desk/releases/latest) page. The app checks for updates on start and offers to install them.
+Get the latest version from the [**Releases**](https://github.com/manydesk/many-desk/releases/latest) page. The app reads this release list on start, offers the newest version for your platform and checks the download against the release's SHA256SUMS before opening it.
 
 | Platform | Package | Requirements |
 |---|---|---|
@@ -147,7 +147,7 @@ scripts/build-ios.sh
 
 ### Continuous integration
 
-Every push and pull request builds and tests all platforms with GitHub Actions. Pushing a `v<version>` tag that matches `app/Cargo.toml` publishes a release with all packages, checksums, build provenance attestations and the update manifest the app reads.
+Every push and pull request builds and tests all platforms with GitHub Actions. Pushing a `v<version>` tag that matches `app/Cargo.toml` publishes a release with all packages, checksums, build provenance attestations and a fallback update manifest; the app finds updates in the release list itself.
 
 ### Project layout
 

@@ -3,7 +3,7 @@
 #   - the packages: macOS DMG, Windows EXE, Linux .deb/.tar.gz (amd64, arm64), Android APK
 #   - SHA256SUMS and build provenance attestations (gh attestation verify <file> -R manydesk/many-desk)
 #   - latest.json, the manifest the app checks for updates
-#     (releases/latest/download/latest.json, see app/src/platform/update.rs)
+#     (the app reads the release list first and falls back to this; see app/src/platform/update.rs)
 #
 # Secrets (the same keys as local builds, so an installed copy updates in place):
 #   ANDROID_KEYSTORE_B64      base64 of the APK signing keystore (scripts/build-android.sh)

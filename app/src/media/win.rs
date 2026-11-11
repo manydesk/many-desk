@@ -1,7 +1,12 @@
 // Windows hardware H.264: the GPU vendor's Media Foundation encoder (Intel Quick Sync,
 // NVIDIA NVENC, AMD AMF) as an asynchronous MFT, low-latency mode, no B-frames.
-// Input NV12 from system memory; output is Annex-B. Without a hardware encoder the
+// Input NV12: D3D11 textures straight from the GPU capture (wincap.rs, no copy), or
+// system memory (the portable path). Output is Annex-B. Without a hardware encoder the
 // caller keeps using OpenH264.
+//
+// Rate control: peak-constrained VBR. Screen content is mostly still with bursts (a page
+// scrolls, a window opens); CBR spreads the bits evenly and smears exactly those frames,
+// VBR lets a burst take up to PEAK × the mean for a moment and keeps text sharp.
 use std::mem::ManuallyDrop;
 
 use windows::core::Interface;
@@ -44,12 +49,20 @@ fn variant_bool(v: bool) -> VARIANT {
     var
 }
 
+/// How far above the mean bitrate a burst may go.
+const PEAK: u32 = 5; // ×0.5 → 2.5×
+
+fn peak(bitrate: u32) -> u32 {
+    bitrate.saturating_mul(PEAK) / 2
+}
+
 fn pack(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
 impl MfEncoder {
-    pub fn new(width: usize, height: usize, fps: f64, bitrate: u32) -> windows::core::Result<Self> {
+    /// `d3d`: the device manager of the GPU the frames are on (they come as textures).
+    pub fn new(width: usize, height: usize, fps: f64, bitrate: u32, d3d: Option<&IMFDXGIDeviceManager>) -> windows::core::Result<Self> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
@@ -85,6 +98,13 @@ impl MfEncoder {
             let attrs = mft.GetAttributes()?;
             attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
             let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+            if let Some(m) = d3d {
+                // textures in: the encoder must take D3D11 surfaces (before the media types)
+                if attrs.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) == 0 {
+                    return Err(windows::core::Error::from_hresult(MF_E_UNSUPPORTED_D3D_TYPE));
+                }
+                mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, m.as_raw() as usize)?;
+            }
 
             let out = MFCreateMediaType()?;
             out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -107,8 +127,12 @@ impl MfEncoder {
             let codec: Option<ICodecAPI> = mft.cast().ok();
             if let Some(c) = &codec {
                 let _ = c.SetValue(&CODECAPI_AVLowLatencyMode, &variant_bool(true));
-                let _ = c.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32));
+                // peak-constrained VBR where the encoder has it, else CBR
+                if c.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32)).is_err() {
+                    let _ = c.SetValue(&CODECAPI_AVEncCommonRateControlMode, &variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32));
+                }
                 let _ = c.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
+                let _ = c.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak(bitrate)));
                 let _ = c.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &variant_u32(0));
                 let _ = c.SetValue(&CODECAPI_AVEncMPVGOPSize, &variant_u32((fps * crate::media::encode::KEY_EVERY_SECS) as u32));
             }
@@ -140,6 +164,7 @@ impl MfEncoder {
         if let Some(c) = &self.codec {
             unsafe {
                 let _ = c.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &variant_u32(bitrate));
+                let _ = c.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &variant_u32(peak(bitrate)));
             }
         }
     }
@@ -198,6 +223,34 @@ impl MfEncoder {
             mb.Unlock()?;
             Ok(Some((data, key)))
         }
+    }
+
+    /// Encodes one NV12 D3D11 texture (made on the device of the manager given to `new`).
+    /// The texture must stay untouched until the next calls: the encoder may still read it.
+    pub fn encode_texture(&mut self, tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, force_key: bool) -> windows::core::Result<Vec<(Vec<u8>, bool)>> {
+        let mut out = Vec::new();
+        self.pump(&mut out, true)?;
+        unsafe {
+            if force_key {
+                if let Some(c) = &self.codec {
+                    let _ = c.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant_u32(1));
+                }
+            }
+            let buf = MFCreateDXGISurfaceBuffer(&windows::Win32::Graphics::Direct3D11::ID3D11Texture2D::IID, tex, 0, false)?;
+            if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
+                let _ = buf.SetCurrentLength(b2.GetContiguousLength()?);
+            }
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buf)?;
+            let dur = (10_000_000.0 / self.fps) as i64;
+            sample.SetSampleTime(self.frame * dur)?;
+            sample.SetSampleDuration(dur)?;
+            self.frame += 1;
+            self.mft.ProcessInput(0, &sample, 0)?;
+        }
+        self.credits -= 1;
+        self.pump(&mut out, false)?;
+        Ok(out)
     }
 
     /// Encodes one I420 frame; returns whatever access units are ready (usually this one).

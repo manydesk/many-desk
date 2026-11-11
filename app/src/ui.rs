@@ -148,7 +148,7 @@ const PAN_SPEED: f32 = 900.0;
 const FM_ROW: f32 = 28.0;
 const FM_TR_ROW: f32 = 34.0;
 /// the newest update's download, after a successful check
-static UPDATE_URL: Mutex<Option<String>> = Mutex::new(None);
+static UPDATE: Mutex<Option<crate::platform::update::Update>> = Mutex::new(None);
 
 /// Text in the UI font with the CSS line-height (1.45).
 fn text(s: impl Into<String>, size: f32, w: W, color: Color32) -> RichText {
@@ -1786,8 +1786,8 @@ impl App {
             let msg = match crate::platform::update::check(&cur).await {
                 Ok(Some(u)) => {
                     *slot.lock().unwrap() = Some((tf("start.found", &[("v", &u.version)]), Some(true)));
+                    *UPDATE.lock().unwrap() = Some(u);
                     bus::wake();
-                    *UPDATE_URL.lock().unwrap() = Some(u.url);
                     return;
                 }
                 Ok(None) if manual => (t("start.upToDate"), Some(false)),
@@ -1801,10 +1801,10 @@ impl App {
     }
 
     fn do_update(&mut self) {
-        let Some(url) = UPDATE_URL.lock().unwrap().clone() else { return };
+        let Some(u) = UPDATE.lock().unwrap().clone() else { return };
         self.core.toast(t("start.downloading"), false);
         crate::rt::spawn(async move {
-            if let Err(e) = crate::platform::update::download_and_open(&url).await {
+            if let Err(e) = crate::platform::update::download_and_open(&u).await {
                 bus::emit("toast", json!({ "text": e, "error": true }));
             }
         });
