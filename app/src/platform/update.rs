@@ -135,14 +135,6 @@ fn sum_for(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Downloads the installer to Downloads and opens it (the OS/user does the rest).
-pub async fn download_and_open(u: &Update) -> Result<std::path::PathBuf, String> {
-    let dir = directories::UserDirs::new().and_then(|u| u.download_dir().map(|d| d.to_path_buf())).unwrap_or_else(std::env::temp_dir);
-    let path = download(u, &dir).await?;
-    open_path(&path)?;
-    Ok(path)
-}
-
 /// Downloads the package into `dir` and checks it against the release's SHA256SUMS;
 /// nothing is written when it does not match.
 pub async fn download(u: &Update, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
@@ -167,6 +159,211 @@ pub async fn download(u: &Update, dir: &std::path::Path) -> Result<std::path::Pa
     tokio::fs::write(&path, &bytes).await.map_err(|e| e.to_string())?;
     eprintln!("[update] saved {} ({} bytes, checksum {})", path.display(), bytes.len(), if u.sums.is_some() { "ok" } else { "not published" });
     Ok(path)
+}
+
+/// Where updates are downloaded and staged.
+fn work_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("manydesk-update")
+}
+
+/// Downloads `u`, checks it and puts it in place of the running app. On Ok the caller
+/// quits right away: a helper (macOS), the service or a new copy (Windows, Linux) starts
+/// the new version once this process is gone. On Err the package, when it got that far,
+/// comes back so the caller can open it for the user to install by hand.
+pub async fn install(u: &Update) -> Result<(), (String, Option<std::path::PathBuf>)> {
+    let dir = work_dir();
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| (e.to_string(), None))?;
+    let path = download(u, &dir).await.map_err(|e| (e, None))?;
+    let p = path.clone();
+    let r = tokio::task::spawn_blocking(move || put_in_place(&p)).await.map_err(|e| e.to_string()).and_then(|r| r);
+    match r {
+        Ok(()) => {
+            eprintln!("[update] {} installed; restarting", u.version);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[update] could not install by itself: {e}");
+            Err((e, Some(path)))
+        }
+    }
+}
+
+/// The command line this copy was started with, minus our own --wait-pid, for the new one.
+#[cfg_attr(any(mobile, not(any(windows, target_os = "linux", target_os = "macos"))), allow(dead_code))]
+fn relaunch_args() -> Vec<std::ffi::OsString> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for a in std::env::args_os().skip(1) {
+        if skip {
+            skip = false;
+        } else if a == "--wait-pid" {
+            skip = true;
+        } else {
+            out.push(a);
+        }
+    }
+    out
+}
+
+fn run(cmd: &str, args: &[&std::ffi::OsStr]) -> Result<String, String> {
+    let o = std::process::Command::new(cmd).args(args).output().map_err(|e| format!("{cmd}: {e}"))?;
+    if o.status.success() {
+        Ok(format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+    } else {
+        Err(format!("{cmd}: {}", String::from_utf8_lossy(&o.stderr).trim()))
+    }
+}
+
+/// macOS: the DMG's app replaces the running bundle. It must carry a valid signature for
+/// the same app, and when this copy is signed with a certificate, the new one must be
+/// signed by it too — so Screen Recording and Accessibility, which macOS keys to that
+/// signature, stay granted. A shell helper waits for this process to end, swaps the
+/// bundles (putting the old one back if the swap fails) and opens the new one.
+#[cfg(all(target_os = "macos", not(mobile)))]
+fn put_in_place(dmg: &std::path::Path) -> Result<(), String> {
+    use std::ffi::OsStr;
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).map_err(|e| e.to_string())?;
+    let bundle = exe.ancestors().find(|p| p.extension() == Some(OsStr::new("app"))).ok_or("not running from an .app")?.to_path_buf();
+    let parent = bundle.parent().ok_or("no folder")?.to_path_buf();
+    let staged = parent.join(".ManyDesk-update.app");
+    let _ = std::fs::remove_dir_all(&staged);
+    let mnt = work_dir().join("mnt");
+    let _ = run("hdiutil", &["detach".as_ref(), "-quiet".as_ref(), "-force".as_ref(), mnt.as_os_str()]);
+    std::fs::create_dir_all(&mnt).map_err(|e| e.to_string())?;
+    run("hdiutil", &["attach".as_ref(), "-nobrowse".as_ref(), "-readonly".as_ref(), "-noautoopen".as_ref(), "-quiet".as_ref(), "-mountpoint".as_ref(), mnt.as_os_str(), dmg.as_os_str()])?;
+    let copied = (|| {
+        let app = std::fs::read_dir(&mnt).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).find(|p| p.extension() == Some(OsStr::new("app"))).ok_or("no app in the disk image")?;
+        same_signer(&app, &bundle)?;
+        // ditto keeps the signature, extended attributes and symlinks intact
+        run("ditto", &[app.as_os_str(), staged.as_os_str()]).map_err(|e| format!("cannot write to {}: {e}", parent.display()))
+    })();
+    let _ = run("hdiutil", &["detach".as_ref(), "-quiet".as_ref(), "-force".as_ref(), mnt.as_os_str()]);
+    copied?;
+    // MANYDESK_* settings (a test copy's own config folder) go to the new copy too
+    let envs: String = std::env::vars().filter(|(k, _)| k.starts_with("MANYDESK_") && k != "MANYDESK_UPDATE_CURRENT").map(|(k, v)| format!(" --env {}", sh_quote(&format!("{k}={v}")))).collect();
+    let args: String = relaunch_args().iter().map(|a| format!(" {}", sh_quote(&a.to_string_lossy()))).collect();
+    let script = format!(
+        r#"unset MANYDESK_UPDATE_CURRENT; pid={pid}; i=0
+while kill -0 $pid 2>/dev/null && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
+old="$2.old.$$"
+mv "$2" "$old" || {{ rm -rf "$1"; open -n "$2"; exit 1; }}
+if mv "$1" "$2"; then rm -rf "$old"; else mv "$old" "$2"; fi
+open -n{envs} "$2"{sep}{args}"#,
+        pid = std::process::id(),
+        sep = if args.is_empty() { "" } else { " --args" },
+    );
+    std::process::Command::new("/bin/sh").arg("-c").arg(script).arg("manydesk-update").arg(&staged).arg(&bundle).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", not(mobile)))]
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `new` is validly signed, is the same app (bundle identifier) and, when `current` is
+/// signed with a certificate, meets `current`'s designated requirement (same signer).
+#[cfg(all(target_os = "macos", not(mobile)))]
+fn same_signer(new: &std::path::Path, current: &std::path::Path) -> Result<(), String> {
+    run("codesign", &["--verify".as_ref(), "--deep".as_ref(), "--strict".as_ref(), new.as_os_str()]).map_err(|e| format!("the new app's signature: {e}"))?;
+    let ident = |p: &std::path::Path| run("codesign", &["-dv".as_ref(), p.as_os_str()]).ok().and_then(|o| o.lines().find_map(|l| l.strip_prefix("Identifier=").map(str::to_string)));
+    let (a, b) = (ident(new), ident(current));
+    if a.is_none() || a != b {
+        return Err(format!("a different app: {a:?}, not {b:?}"));
+    }
+    let req = run("codesign", &["-d".as_ref(), "-r-".as_ref(), current.as_os_str()])?;
+    if let Some(req) = req.lines().find_map(|l| l.trim().strip_prefix("designated => ")).filter(|r| r.contains("certificate")) {
+        let req = format!("={req}");
+        run("codesign", &["--verify".as_ref(), "-R".as_ref(), req.as_ref(), new.as_os_str()]).map_err(|_| "signed by someone else".to_string())?;
+    }
+    Ok(())
+}
+
+/// Windows: a running exe can be renamed but not overwritten. The new exe goes next to
+/// it, the running one becomes <name>.old.exe (removed on the next start) and the new one
+/// takes its name. The service, when it keeps this copy running, starts the new one by
+/// itself; otherwise the new copy is started here and waits for this one to end.
+#[cfg(windows)]
+fn put_in_place(new_exe: &std::path::Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let staged = exe.with_extension("new.exe");
+    let old = exe.with_extension("old.exe");
+    let _ = std::fs::remove_file(&old);
+    std::fs::copy(new_exe, &staged).map_err(|e| format!("cannot write to {}: {e}", exe.parent().map(|p| p.display().to_string()).unwrap_or_default()))?;
+    std::fs::rename(&exe, &old).map_err(|e| {
+        let _ = std::fs::remove_file(&staged);
+        e.to_string()
+    })?;
+    if let Err(e) = std::fs::rename(&staged, &exe) {
+        let _ = std::fs::rename(&old, &exe);
+        return Err(e.to_string());
+    }
+    let by_service = std::env::args().any(|a| a == "--background") && super::service::installed();
+    if !by_service {
+        std::process::Command::new(&exe).args(relaunch_args()).env_remove("MANYDESK_UPDATE_CURRENT").arg("--wait-pid").arg(std::process::id().to_string()).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Linux: the .deb, installed with the administrator's password (pkexec asks). A copy
+/// run from the tarball is updated by hand.
+#[cfg(target_os = "linux")]
+fn put_in_place(deb: &std::path::Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if !exe.starts_with("/usr/") {
+        return Err("not installed from the .deb".into());
+    }
+    run("pkexec", &["apt-get".as_ref(), "install".as_ref(), "-y".as_ref(), "--allow-downgrades".as_ref(), deb.as_os_str()])?;
+    std::process::Command::new(&exe).args(relaunch_args()).env_remove("MANYDESK_UPDATE_CURRENT").arg("--wait-pid").arg(std::process::id().to_string()).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(any(mobile, not(any(windows, target_os = "linux", target_os = "macos"))))]
+fn put_in_place(_: &std::path::Path) -> Result<(), String> {
+    Err("updates come from the app store".into())
+}
+
+/// Start of a new copy: wait for the one it replaces (--wait-pid <pid>) to end, so the two
+/// never run at once, and clear what an update left behind.
+pub fn after_update() {
+    let mut args = std::env::args().skip_while(|a| a != "--wait-pid").skip(1);
+    if let Some(pid) = args.next().and_then(|p| p.parse::<u32>().ok()) {
+        let t0 = std::time::Instant::now();
+        while alive(pid) && t0.elapsed() < std::time::Duration::from_secs(15) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        // still in use while the service runs the old image; it goes on a later start
+        let _ = std::fs::remove_file(exe.with_extension("old.exe"));
+    }
+    let _ = std::fs::remove_dir_all(work_dir());
+}
+
+#[cfg(windows)]
+fn alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        CloseHandle(h);
+        running
+    }
+}
+
+#[cfg(not(windows))]
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("kill").args(["-0", &pid.to_string()]).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Opens a downloaded package with the system (the user installs it).
+pub fn open(p: &std::path::Path) -> Result<(), String> {
+    open_path(p)
 }
 
 fn open_path(p: &std::path::Path) -> Result<(), String> {

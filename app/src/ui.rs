@@ -83,7 +83,6 @@ pub struct App {
     covered: Vec<u32>,
     /// started with --background: minimize on the first frame
     minimize_once: bool,
-    update_started: bool,
     /// A finger down on a remote screen (phones, see touch_gestures).
     touch: Option<Touch>,
     /// Phones: the soft keyboard is up for typing into a session (toolbar button).
@@ -147,6 +146,108 @@ const PAN_SPEED: f32 = 900.0;
 /// file manager row heights: listing, transfers
 const FM_ROW: f32 = 28.0;
 const FM_TR_ROW: f32 = 34.0;
+/// how often updates are looked for while the app runs
+const UPDATE_EVERY: Duration = Duration::from_secs(6 * 3600);
+/// an automatic update waits until nobody has used the window for this long
+const UPDATE_QUIET: Duration = Duration::from_secs(120);
+/// an update is being downloaded and installed
+static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// what the UI tells the update scheduler: a session is open, updates install by
+/// themselves, the window was last used this many seconds after start, and "Download and
+/// install" was pressed during a session
+static UPD_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static UPD_AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UPD_INPUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UPD_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UPD_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn since_start() -> Duration {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed()
+}
+
+type UpdateSlot = Arc<Mutex<Option<(String, Option<bool>)>>>;
+
+/// Looks for updates on start and every UPDATE_EVERY, and installs a found one when no
+/// session is open: at once when asked for, otherwise once nobody has used the window for
+/// UPDATE_QUIET (AnyDesk installs its updates by itself, too).
+async fn update_scheduler(slot: UpdateSlot) {
+    use std::sync::atomic::Ordering::SeqCst;
+    since_start();
+    let mut checked: Option<Instant> = None;
+    let mut waited: Option<Instant> = None;
+    loop {
+        let auto = UPD_AUTO.load(SeqCst);
+        if auto && checked.is_none_or(|t| t.elapsed() > UPDATE_EVERY) {
+            checked = Some(Instant::now());
+            run_check(slot.clone(), false).await;
+        }
+        let found = UPDATE.lock().unwrap().clone();
+        if let Some(u) = &found {
+            let quiet = since_start().saturating_sub(Duration::from_secs(UPD_INPUT.load(SeqCst)));
+            let (asked, busy) = (UPD_NOW.load(SeqCst), UPD_BUSY.load(SeqCst));
+            if !INSTALLING.load(SeqCst) && !busy && (asked || (auto && quiet >= UPDATE_QUIET)) {
+                eprintln!("[update] installing {}: {}", u.version, if asked { "asked for".to_string() } else { format!("no session, window unused for {}s", quiet.as_secs()) });
+                install_update(u.clone(), slot.clone()).await;
+            } else if auto && !INSTALLING.load(SeqCst) && waited.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                waited = Some(Instant::now());
+                eprintln!("[update] {} waits: {}", u.version, if busy { "a session is open".to_string() } else { format!("window used {}s ago", quiet.as_secs()) });
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(if found.is_some() { 5 } else { 30 })).await;
+    }
+}
+
+async fn run_check(slot: UpdateSlot, manual: bool) {
+    if INSTALLING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    *slot.lock().unwrap() = Some((t("start.checking"), None));
+    bus::wake();
+    // MANYDESK_UPDATE_CURRENT=<version>: check as that version, to try the update path
+    let cur = std::env::var("MANYDESK_UPDATE_CURRENT").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    let msg = match crate::platform::update::check(&cur).await {
+        Ok(Some(u)) => {
+            let msg = (tf("start.found", &[("v", &u.version)]), Some(true));
+            *UPDATE.lock().unwrap() = Some(u);
+            Some(msg)
+        }
+        Ok(None) if manual => Some((t("start.upToDate"), Some(false))),
+        Err(e) if manual => Some((tf("start.checkFailed", &[("e", &e)]), Some(false))),
+        _ => None,
+    };
+    *slot.lock().unwrap() = msg;
+    bus::wake();
+}
+
+/// Downloads the update and puts it in place; ManyDesk then quits and the new version
+/// starts. When it cannot install by itself (no write access to its folder, a tarball
+/// copy) it opens the installer instead.
+async fn install_update(u: crate::platform::update::Update, slot: UpdateSlot) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if INSTALLING.swap(true, SeqCst) {
+        return;
+    }
+    UPD_NOW.store(false, SeqCst);
+    let msg = tf("start.updating", &[("v", &u.version)]);
+    *slot.lock().unwrap() = Some((msg.clone(), None));
+    bus::emit("toast", json!({ "text": msg, "error": false }));
+    match crate::platform::update::install(&u).await {
+        Ok(()) => {
+            // let the log and the settings reach the disk, then make way for the new copy
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            std::process::exit(0);
+        }
+        Err((e, package)) => {
+            let opened = package.as_deref().map(|p| crate::platform::update::open(p).is_ok()).unwrap_or(false);
+            let text = if opened { tf("start.updateByHand", &[("e", &e)]) } else { tf("start.checkFailed", &[("e", &e)]) };
+            *slot.lock().unwrap() = Some((text.clone(), Some(false)));
+            *UPDATE.lock().unwrap() = None;
+            INSTALLING.store(false, SeqCst);
+            bus::emit("toast", json!({ "text": text, "error": true }));
+        }
+    }
+}
 /// the newest update's download, after a successful check
 static UPDATE: Mutex<Option<crate::platform::update::Update>> = Mutex::new(None);
 
@@ -219,7 +320,6 @@ impl App {
             act_dialog: None,
             covered: Vec::new(),
             minimize_once: std::env::args().any(|a| a == "--background"),
-            update_started: false,
             touch: None,
             soft_keyboard: false,
             touchpad,
@@ -385,16 +485,8 @@ impl eframe::App for App {
         if self.minimize_once {
             self.minimize_once = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            if self.core.store.autoupdate {
-                self.check_update(false);
-            }
         }
-        if !self.update_started {
-            self.update_started = true;
-            if self.core.store.autoupdate && !cfg!(mobile) && !std::env::args().any(|a| a == "--background") {
-                self.check_update(false);
-            }
-        }
+        self.update_tick(&ctx);
         let active = self.core.active.filter(|k| self.core.tabs.iter().any(|t| t.key == *k));
         // phones: keep clear of the status bar / notch and the navigation bar
         #[cfg(mobile)]
@@ -1777,38 +1869,51 @@ impl App {
         });
     }
 
-    /// Checks for a newer ManyDesk; `manual` shows "up to date" too.
+    /// Checks for a newer ManyDesk now; `manual` shows "up to date" too.
     fn check_update(&mut self, manual: bool) {
-        *self.update.lock().unwrap() = Some((t("start.checking"), None));
-        let slot = self.update.clone();
-        // MANYDESK_UPDATE_CURRENT=<version>: check as that version, to try the update path
-        let cur = std::env::var("MANYDESK_UPDATE_CURRENT").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
-        crate::rt::spawn(async move {
-            let msg = match crate::platform::update::check(&cur).await {
-                Ok(Some(u)) => {
-                    *slot.lock().unwrap() = Some((tf("start.found", &[("v", &u.version)]), Some(true)));
-                    *UPDATE.lock().unwrap() = Some(u);
-                    bus::wake();
-                    return;
-                }
-                Ok(None) if manual => (t("start.upToDate"), Some(false)),
-                Ok(None) => return,
-                Err(e) if manual => (tf("start.checkFailed", &[("e", &e)]), Some(false)),
-                Err(_) => return,
-            };
-            *slot.lock().unwrap() = Some(msg);
-            bus::wake();
-        });
+        crate::rt::spawn(run_check(self.update.clone(), manual));
     }
 
-    fn do_update(&mut self) {
-        let Some(u) = UPDATE.lock().unwrap().clone() else { return };
-        self.core.toast(t("start.downloading"), false);
-        crate::rt::spawn(async move {
-            if let Err(e) = crate::platform::update::download_and_open(&u).await {
-                bus::emit("toast", json!({ "text": e, "error": true }));
-            }
+    /// Every frame: tell the update scheduler whether a session is open and when the window
+    /// was last used, and start the scheduler once. The scheduler runs off the UI thread:
+    /// macOS stops drawing a window nobody looks at, and an app left in the background is
+    /// exactly the one that should update itself.
+    fn update_tick(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if cfg!(mobile) {
+            return;
+        }
+        // someone at the keyboard or the mouse (not focus changes, repaints or a pointer
+        // that only left the window)
+        let used = ctx.input(|i| {
+            i.pointer.delta() != egui::Vec2::ZERO
+                || i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. } | egui::Event::Touch { .. } | egui::Event::Paste(_)))
         });
+        if used {
+            UPD_INPUT.store(since_start().as_secs(), SeqCst);
+        }
+        UPD_BUSY.store(self.busy(), SeqCst);
+        UPD_AUTO.store(self.core.store.autoupdate, SeqCst);
+        if !UPD_STARTED.swap(true, SeqCst) {
+            crate::rt::spawn(update_scheduler(self.update.clone()));
+        }
+    }
+
+    /// Any session open, either way, or a request waiting for an answer.
+    fn busy(&self) -> bool {
+        !self.core.tabs.is_empty() || !self.core.hosts.is_empty() || self.core.pending.is_some() || !self.core.queue.is_empty()
+    }
+
+    /// "Download and install": at once, or when the open sessions have ended.
+    fn do_update(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(u) = UPDATE.lock().unwrap().clone() else { return };
+        if self.busy() {
+            UPD_NOW.store(true, SeqCst);
+            self.core.toast(t("start.updateLater"), false);
+            return;
+        }
+        crate::rt::spawn(install_update(u, self.update.clone()));
     }
 
     fn page_settings(&mut self, ui: &mut Ui) {

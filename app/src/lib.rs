@@ -83,6 +83,9 @@ pub fn run() -> eframe::Result<()> {
         }
     }
 
+    // a copy started by an update waits for the one it replaces, then clears up after it
+    #[cfg(not(mobile))]
+    platform::update::after_update();
     let _ = rustls::crypto::ring::default_provider().install_default();
     rt::handle(); // start the runtime before anything spawns
     platform::keep_responsive();
