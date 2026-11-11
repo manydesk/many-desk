@@ -50,7 +50,7 @@ impl GstDecoder {
         let _ = self.pipeline.send_event(gst::event::FlushStop::new(true));
     }
 
-    pub fn decode(&mut self, au: &[u8], buf: Vec<u8>, _color: crate::video::Color) -> Result<Option<crate::video::Picture>, String> {
+    pub fn decode(&mut self, au: &[u8], spare: Vec<u8>, _color: crate::video::Color) -> Result<Option<crate::video::Picture>, String> {
         if let Some(bus) = self.pipeline.bus() {
             if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
                 return Err(format!("{msg:?}"));
@@ -73,7 +73,7 @@ impl GstDecoder {
         // Rows may be padded; RGBA stride is rounded to 4 bytes, so w*4 is exact.
         let data = map.as_slice();
         let stride = data.len() / h.max(1);
-        let mut rgba = buf;
+        let mut rgba = spare;
         rgba.clear();
         for y in 0..h {
             rgba.extend_from_slice(&data[y * stride..y * stride + w * 4]);
