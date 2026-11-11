@@ -133,7 +133,8 @@ impl App {
             ui.label(text(t("act.needPerm"), 12.5, W::Regular, th::MUTED));
         }
         ui.separator();
-        if ui.add_enabled(live && self.last_pic.contains_key(&key), egui::Button::new(t("act.screenshot"))).clicked() {
+        let has_pic = self.core.tabs.iter().any(|t| t.key == key && t.video.as_ref().is_some_and(|v| v.picture().is_some()));
+        if ui.add_enabled(live && has_pic, egui::Button::new(t("act.screenshot"))).clicked() {
             self.screenshot(key);
         }
         let mut b = board_on;
@@ -177,14 +178,14 @@ impl App {
 
     /// Saves the remote screen as it is now (full resolution) to Pictures.
     pub(super) fn screenshot(&mut self, key: u32) {
-        let Some(pic) = self.last_pic.get(&key) else { return };
-        let (w, h, rgba) = (pic.width as u32, pic.height as u32, pic.rgba.clone());
+        let Some(pic) = self.core.tabs.iter().find(|t| t.key == key).and_then(|t| t.video.as_ref()).and_then(|v| v.picture()).cloned() else { return };
+        let (w, h) = (pic.width as u32, pic.height as u32);
         let label = self.core.tabs.iter().find(|t| t.key == key).map(|t| t.label.clone()).unwrap_or_default();
         let dir = directories::UserDirs::new().and_then(|u| u.picture_dir().map(|d| d.to_path_buf())).unwrap_or_else(crate::store::downloads);
         let name: String = format!("ManyDesk {} {}.png", label, chrono::Local::now().format("%Y-%m-%d %H.%M.%S")).chars().map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c }).collect();
         let path = dir.join(name);
         crate::rt::spawn_blocking(move || {
-            let r = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| "image".to_string()).and_then(|img| img.save(&path).map_err(|e| e.to_string()));
+            let r = image::RgbaImage::from_raw(w, h, pic.rgba().into_owned()).ok_or_else(|| "image".to_string()).and_then(|img| img.save(&path).map_err(|e| e.to_string()));
             match r {
                 Ok(()) => bus::emit("toast", json!({ "text": tf("act.saved", &[("f", &path.to_string_lossy())]) })),
                 Err(e) => bus::emit("toast", json!({ "text": e, "error": true })),

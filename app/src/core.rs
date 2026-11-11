@@ -208,7 +208,8 @@ pub struct Tab {
     stats_prev: Option<(u64, Instant)>,
     pub sent_view: (u32, u32),
     incoming: Option<Incoming>,
-    pub texture: Option<egui::TextureHandle>,
+    /// the remote screen as drawn (None until the first picture)
+    pub video: Option<crate::video::View>,
     thumb_saved: bool,
     /// the host's displays and the one shown (switchable from the toolbar)
     pub screens: Vec<RemoteScreen>,
@@ -863,7 +864,7 @@ impl Core {
             stats_prev: None,
             sent_view: (0, 0),
             incoming: None,
-            texture: None,
+            video: None,
             screens: Vec::new(),
             screen: None,
             modes: None,

@@ -10,7 +10,6 @@ pub struct GstDecoder {
     src: gst_app::AppSrc,
     sink: gst_app::AppSink,
     name: &'static str,
-    rgba: Vec<u8>,
     ts: u64,
 }
 
@@ -39,7 +38,7 @@ impl GstDecoder {
                 return Err(format!("{msg:?}"));
             }
         }
-        Ok(GstDecoder { pipeline, src, sink, name, rgba: Vec::new(), ts: 0 })
+        Ok(GstDecoder { pipeline, src, sink, name, ts: 0 })
     }
 
     pub fn name(&self) -> &'static str {
@@ -51,7 +50,7 @@ impl GstDecoder {
         let _ = self.pipeline.send_event(gst::event::FlushStop::new(true));
     }
 
-    pub fn decode(&mut self, au: &[u8]) -> Result<Option<(&[u8], usize, usize)>, String> {
+    pub fn decode(&mut self, au: &[u8], spare: Vec<u8>, _color: crate::video::Color) -> Result<Option<crate::video::Picture>, String> {
         if let Some(bus) = self.pipeline.bus() {
             if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
                 return Err(format!("{msg:?}"));
@@ -74,11 +73,12 @@ impl GstDecoder {
         // Rows may be padded; RGBA stride is rounded to 4 bytes, so w*4 is exact.
         let data = map.as_slice();
         let stride = data.len() / h.max(1);
-        self.rgba.resize(w * h * 4, 0);
+        let mut rgba = spare;
+        rgba.clear();
         for y in 0..h {
-            self.rgba[y * w * 4..(y + 1) * w * 4].copy_from_slice(&data[y * stride..y * stride + w * 4]);
+            rgba.extend_from_slice(&data[y * stride..y * stride + w * 4]);
         }
-        Ok(Some((self.rgba.as_slice(), w, h)))
+        Ok(Some(crate::video::Picture { width: w, height: h, planes: crate::video::Planes::Rgba, data: rgba, color: Default::default() }))
     }
 }
 

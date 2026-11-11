@@ -79,9 +79,19 @@ extern "C" {
     fn CVPixelBufferGetBytesPerRow(pb: *mut c_void) -> usize;
 }
 
+#[link(name = "CoreVideo", kind = "framework")]
+extern "C" {
+    static kCVImageBufferColorPrimaries_ITU_R_709_2: CFStringRef;
+    static kCVImageBufferTransferFunction_ITU_R_709_2: CFStringRef;
+    static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
+}
+
 #[link(name = "VideoToolbox", kind = "framework")]
 extern "C" {
     static kVTCompressionPropertyKey_RealTime: CFStringRef;
+    static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
+    static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
+    static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
     static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
@@ -329,6 +339,11 @@ impl Encoder {
             set(s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, false);
             set(s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, false);
             set(s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel, false);
+            // BT.709, as ScreenCaptureKit is told to make it (configure): written into the
+            // SPS, so every viewer turns it back into the same RGB
+            set(s, kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2, false);
+            set(s, kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2, false);
+            set(s, kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2, false);
             // Lost frames bring a keyframe on request; the periodic one heals the rest
             // (see KEY_EVERY_SECS).
             set(s, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, cf_f64(crate::media::encode::KEY_EVERY_SECS as f64), true);
@@ -615,6 +630,8 @@ fn configure(cfg: &SCStreamConfiguration, full: (usize, usize), p: Params, curso
         cfg.setWidth(w);
         cfg.setHeight(h);
         cfg.setPixelFormat(NV12);
+        // the YCbCr the encoder labels its stream with (BT.709)
+        cfg.setColorMatrix(&*(kCVImageBufferYCbCrMatrix_ITU_R_709_2 as *const objc2_core_foundation::CFString));
         cfg.setMinimumFrameInterval(cm_time(1, p.fps.round().max(1.0) as i32));
         cfg.setShowsCursor(cursor);
         cfg.setQueueDepth(4);

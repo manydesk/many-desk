@@ -1,6 +1,7 @@
-// macOS viewer video: H.264 → VideoToolbox (hardware) → BGRA → RGBA for the texture.
-// Annex-B access units come in; SPS/PPS (sent with every keyframe) (re)create the
-// decoder session, the other NAL units are repacked with 4-byte lengths (AVCC).
+// macOS viewer video: H.264 → VideoToolbox (hardware) → NV12 (video range), which the
+// GPU turns into RGB while drawing. Annex-B access units come in; SPS/PPS (sent with every
+// keyframe) (re)create the decoder session, the other NAL units are repacked with 4-byte
+// lengths (AVCC).
 use std::ffi::c_void;
 use std::ptr;
 
@@ -72,10 +73,12 @@ extern "C" {
     static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
     fn CVPixelBufferLockBaseAddress(pb: *mut c_void, flags: u64) -> i32;
     fn CVPixelBufferUnlockBaseAddress(pb: *mut c_void, flags: u64) -> i32;
-    fn CVPixelBufferGetBaseAddress(pb: *mut c_void) -> *const u8;
-    fn CVPixelBufferGetBytesPerRow(pb: *mut c_void) -> usize;
+    fn CVPixelBufferGetBaseAddressOfPlane(pb: *mut c_void, plane: usize) -> *const u8;
+    fn CVPixelBufferGetBytesPerRowOfPlane(pb: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetHeightOfPlane(pb: *mut c_void, plane: usize) -> usize;
     fn CVPixelBufferGetWidth(pb: *const c_void) -> usize;
     fn CVPixelBufferGetHeight(pb: *const c_void) -> usize;
+    fn CVPixelBufferGetPixelFormatType(pb: *const c_void) -> u32;
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -93,17 +96,19 @@ extern "C" {
     fn VTDecompressionSessionInvalidate(s: *mut c_void);
 }
 
-const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+/// NV12, video range (16–235): the decoder's own layout, half the bytes of BGRA
+const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+const NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
 const CF_SINT32: isize = 3;
 const ASSURE_MEMORY_NOW: u32 = 1;
 
 /// Where the output callback leaves the picture.
 #[derive(Default)]
 struct Out {
-    rgba: Vec<u8>,
-    width: usize,
-    height: usize,
-    got: bool,
+    /// the buffer to fill (a spare one from the viewer), and the picture made of it
+    buf: Vec<u8>,
+    pic: Option<crate::video::Picture>,
+    color: crate::video::Color,
     error: bool,
 }
 
@@ -115,51 +120,25 @@ extern "C" fn on_frame(refcon: *mut c_void, _src: *mut c_void, status: i32, _fla
     }
     unsafe {
         CVPixelBufferLockBaseAddress(img, 1);
-        let (w, h, stride) = (CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img), CVPixelBufferGetBytesPerRow(img));
-        let base = CVPixelBufferGetBaseAddress(img);
-        if !base.is_null() {
-            out.rgba.resize(w * h * 4, 0);
-            for y in 0..h {
-                let src = std::slice::from_raw_parts(base.add(y * stride), w * 4);
-                let dst = &mut out.rgba[y * w * 4..(y + 1) * w * 4];
-                for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-                    d[0] = s[2];
-                    d[1] = s[1];
-                    d[2] = s[0];
-                    d[3] = 255;
-                }
-            }
-            out.width = w;
-            out.height = h;
-            out.got = true;
+        let (w, h) = (CVPixelBufferGetWidth(img), CVPixelBufferGetHeight(img));
+        let fmt = CVPixelBufferGetPixelFormatType(img);
+        let (y, uv) = (CVPixelBufferGetBaseAddressOfPlane(img, 0), CVPixelBufferGetBaseAddressOfPlane(img, 1));
+        if !y.is_null() && !uv.is_null() && (fmt == NV12_VIDEO || fmt == NV12_FULL) {
+            // the two planes, rows as VideoToolbox lays them out (one copy, no conversion)
+            let (ys, uvs) = (CVPixelBufferGetBytesPerRowOfPlane(img, 0), CVPixelBufferGetBytesPerRowOfPlane(img, 1));
+            let (yh, uvh) = (CVPixelBufferGetHeightOfPlane(img, 0), CVPixelBufferGetHeightOfPlane(img, 1));
+            let mut data = std::mem::take(&mut out.buf);
+            data.clear();
+            data.extend_from_slice(std::slice::from_raw_parts(y, ys * yh));
+            let uv_offset = data.len();
+            data.extend_from_slice(std::slice::from_raw_parts(uv, uvs * uvh));
+            let color = crate::video::Color { bt709: out.color.bt709, full: fmt == NV12_FULL };
+            out.pic = Some(crate::video::Picture { width: w, height: h, planes: crate::video::Planes::Nv12 { y_stride: ys, uv_offset, uv_stride: uvs }, data, color });
+        } else {
+            out.error = true;
         }
         CVPixelBufferUnlockBaseAddress(img, 1);
     }
-}
-
-/// NAL units of an Annex-B buffer (start codes removed).
-pub fn nals(b: &[u8]) -> Vec<&[u8]> {
-    let mut starts = vec![];
-    let mut i = 0;
-    while i + 3 <= b.len() {
-        if b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 {
-            starts.push((i, i + 3));
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    let mut out = vec![];
-    for (k, &(_, s)) in starts.iter().enumerate() {
-        let mut e = starts.get(k + 1).map(|n| n.0).unwrap_or(b.len());
-        while e > s && b[e - 1] == 0 {
-            e -= 1; // the leading zero of a 4-byte start code
-        }
-        if e > s {
-            out.push(&b[s..e]);
-        }
-    }
-    out
 }
 
 pub struct VtDecoder {
@@ -207,7 +186,7 @@ impl VtDecoder {
             }
             self.fmt = fmt;
             let attrs = CFDictionaryCreateMutable(ptr::null(), 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            let pf = BGRA as i32;
+            let pf = NV12_VIDEO as i32;
             let n = CFNumberCreate(ptr::null(), CF_SINT32, &pf as *const i32 as *const c_void);
             CFDictionarySetValue(attrs, kCVPixelBufferPixelFormatTypeKey, n);
             CFRelease(n);
@@ -223,11 +202,11 @@ impl VtDecoder {
         Ok(())
     }
 
-    /// Ok(Some(..)): a new picture (RGBA, width, height). Err: decoder error.
-    pub fn decode(&mut self, au: &[u8]) -> Result<Option<(&[u8], usize, usize)>, String> {
+    /// Ok(Some(..)): a new picture (NV12 in `buf`). Err: decoder error.
+    pub fn decode(&mut self, au: &[u8], buf: Vec<u8>, color: crate::video::Color) -> Result<Option<crate::video::Picture>, String> {
         let mut avcc = Vec::with_capacity(au.len() + 16);
         let mut new_params = false;
-        for n in nals(au) {
+        for n in super::decode::nals(au) {
             match n[0] & 0x1f {
                 7 => {
                     if n != self.sps.as_slice() {
@@ -257,7 +236,9 @@ impl VtDecoder {
         if avcc.is_empty() {
             return Ok(None);
         }
-        self.out.got = false;
+        self.out.pic = None;
+        self.out.buf = buf;
+        self.out.color = color;
         self.out.error = false;
         unsafe {
             let mut bb = ptr::null_mut();
@@ -286,22 +267,12 @@ impl VtDecoder {
         if self.out.error {
             return Err("decode callback".into());
         }
-        Ok(self.out.got.then(|| (self.out.rgba.as_slice(), self.out.width, self.out.height)))
+        Ok(self.out.pic.take())
     }
 }
 
 impl Drop for VtDecoder {
     fn drop(&mut self) {
         self.reset();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn splits_annex_b() {
-        let b = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5];
-        let n = super::nals(&b);
-        assert_eq!(n, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4, 5][..]]);
     }
 }

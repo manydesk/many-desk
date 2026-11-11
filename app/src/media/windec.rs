@@ -1,6 +1,7 @@
 // Windows viewer video: Microsoft's H.264 decoder MFT with a D3D11 device manager, so
-// it decodes on the GPU (DXVA). The NV12 picture is read back through IMF2DBuffer and
-// converted to RGBA. Without a usable D3D11 device the caller falls back to OpenH264.
+// it decodes on the GPU (DXVA). The NV12 picture is read back through IMF2DBuffer as it
+// is (the renderer converts it to RGB on the GPU). Without a usable D3D11 device the
+// caller falls back to OpenH264.
 use std::mem::ManuallyDrop;
 
 use windows::core::Interface;
@@ -18,7 +19,10 @@ pub struct MfDecoder {
     /// coded size (NV12 planes) and visible size
     coded: (usize, usize),
     visible: (usize, usize),
-    rgba: Vec<u8>,
+    /// the buffer being filled, and the picture made of it
+    buf: Vec<u8>,
+    pic: Option<crate::video::Picture>,
+    color: crate::video::Color,
 }
 
 unsafe impl Send for MfDecoder {}
@@ -72,7 +76,7 @@ impl MfDecoder {
             inp.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
             inp.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             mft.SetInputType(0, &inp, 0)?;
-            let mut me = MfDecoder { mft, _manager: manager, provides_samples: true, out_size: 0, coded: (0, 0), visible: (0, 0), rgba: Vec::new() };
+            let mut me = MfDecoder { mft, _manager: manager, provides_samples: true, out_size: 0, coded: (0, 0), visible: (0, 0), buf: Vec::new(), pic: None, color: Default::default() };
             me.pick_output()?;
             me.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             me.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -124,13 +128,15 @@ impl MfDecoder {
         }
     }
 
-    pub fn decode(&mut self, au: &[u8]) -> Result<Option<(&[u8], usize, usize)>, String> {
+    pub fn decode(&mut self, au: &[u8], buf: Vec<u8>, color: crate::video::Color) -> Result<Option<crate::video::Picture>, String> {
+        self.buf = buf;
+        self.color = color;
+        self.pic = None;
         self.decode_inner(au).map_err(|e| e.to_string())?;
-        Ok(if self.rgba.is_empty() { None } else { Some((self.rgba.as_slice(), self.visible.0, self.visible.1)) })
+        Ok(self.pic.take())
     }
 
     fn decode_inner(&mut self, au: &[u8]) -> windows::core::Result<()> {
-        self.rgba.clear();
         unsafe {
             let buf = MFCreateMemoryBuffer(au.len() as u32)?;
             let mut ptr = std::ptr::null_mut();
@@ -170,68 +176,40 @@ impl MfDecoder {
         }
     }
 
-    /// NV12 sample (GPU or system memory) → RGBA.
+    /// NV12 sample (GPU or system memory) → a picture: both planes in one copy, pitch kept.
     unsafe fn read(&mut self, s: &IMFSample) -> windows::core::Result<()> {
         let mb = s.GetBufferByIndex(0)?;
         let (cw, ch) = self.coded;
         let (w, h) = self.visible;
+        let color = self.color;
+        let take = |all: &[u8], pitch: usize, buf: &mut Vec<u8>| -> Option<crate::video::Picture> {
+            let need = pitch * ch * 3 / 2;
+            if all.len() < need || w > pitch {
+                return None;
+            }
+            let mut data = std::mem::take(buf);
+            data.clear();
+            data.extend_from_slice(&all[..need]);
+            Some(crate::video::Picture { width: w, height: h, planes: crate::video::Planes::Nv12 { y_stride: pitch, uv_offset: pitch * ch, uv_stride: pitch }, data, color })
+        };
         if let Ok(b2) = mb.cast::<IMF2DBuffer>() {
             let mut p = std::ptr::null_mut();
             let mut pitch = 0i32;
             b2.Lock2D(&mut p, &mut pitch)?;
             let pitch = pitch.unsigned_abs() as usize;
             let all = std::slice::from_raw_parts(p, pitch * ch * 3 / 2);
-            nv12_to_rgba(all, pitch, ch, w, h, &mut self.rgba);
+            self.pic = take(all, pitch, &mut self.buf);
             b2.Unlock2D()?;
         } else {
             let mut p = std::ptr::null_mut();
             let mut len = 0u32;
             mb.Lock(&mut p, None, Some(&mut len))?;
             let all = std::slice::from_raw_parts(p, len as usize);
-            if all.len() >= cw * ch * 3 / 2 {
-                nv12_to_rgba(all, cw, ch, w, h, &mut self.rgba);
-            }
+            self.pic = take(all, cw, &mut self.buf);
             mb.Unlock()?;
         }
         Ok(())
     }
-}
-
-/// NV12 (Y plane `pitch`×`rows`, then interleaved UV) → RGBA, BT.601 limited range. Bands
-/// of rows on several threads: a 4K picture is ~33 MB of output per frame.
-pub fn nv12_to_rgba(src: &[u8], pitch: usize, rows: usize, w: usize, h: usize, out: &mut Vec<u8>) {
-    out.resize(w * h * 4, 0);
-    let (y_plane, uv_plane) = src.split_at(pitch * rows);
-    let threads = if w * h < 640 * 480 { 1 } else { std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4) };
-    // whole pairs of rows per band (a chroma row serves two)
-    let band = (h.div_ceil(threads) + 1) & !1;
-    let convert = |first: usize, o: &mut [u8]| {
-        for (r, orow) in o.chunks_exact_mut(w * 4).enumerate() {
-            let y = first + r;
-            let yr = &y_plane[y * pitch..y * pitch + w];
-            let uvr = &uv_plane[(y / 2) * pitch..];
-            for x in 0..w {
-                let c = (yr[x] as i32 - 16) * 298;
-                let d = uvr[x & !1] as i32 - 128;
-                let e = uvr[(x & !1) + 1] as i32 - 128;
-                let px = &mut orow[x * 4..x * 4 + 4];
-                px[0] = ((c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-                px[1] = ((c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-                px[2] = ((c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-                px[3] = 255;
-            }
-        }
-    };
-    if threads == 1 {
-        convert(0, out);
-        return;
-    }
-    std::thread::scope(|sc| {
-        for (i, chunk) in out.chunks_mut(band * w * 4).enumerate() {
-            let convert = &convert;
-            sc.spawn(move || convert(i * band, chunk));
-        }
-    });
 }
 
 impl Drop for MfDecoder {
