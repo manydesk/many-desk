@@ -4,8 +4,9 @@
 // unless the user asked for the check.
 use serde_json::Value;
 
-/// Where the manifest lives. Empty ⇒ updates are off (no server configured yet).
-pub const MANIFEST_URL: &str = "";
+/// Where the manifest lives: every GitHub release carries one (.github/workflows/build.yml),
+/// and this address always leads to the newest. Empty ⇒ updates are off.
+pub const MANIFEST_URL: &str = "https://github.com/manydesk/many-desk/releases/latest/download/latest.json";
 
 pub struct Update {
     pub version: String,

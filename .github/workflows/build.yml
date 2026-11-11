@@ -1,9 +1,16 @@
-# Builds every package on each push to main and each pull request; for a v* tag also
-# publishes them as a GitHub Release (the tag must match app/Cargo.toml's version).
+# Builds and tests every package on each push to main and each pull request. A v* tag
+# (it must match app/Cargo.toml's version) also publishes a GitHub Release with:
+#   - the packages: macOS DMG, Windows EXE, Linux .deb/.tar.gz (amd64, arm64), Android APK
+#   - SHA256SUMS and build provenance attestations (gh attestation verify <file> -R manydesk/many-desk)
+#   - latest.json, the manifest the app checks for updates
+#     (releases/latest/download/latest.json, see app/src/platform/update.rs)
 #
-# Secrets (optional):
-#   ANDROID_KEYSTORE_B64   base64 of the APK signing keystore (scripts/build-android.sh; without
-#                          it each run signs with a new key and phones can't update in place)
+# Secrets (the same keys as local builds, so an installed copy updates in place):
+#   ANDROID_KEYSTORE_B64      base64 of the APK signing keystore (scripts/build-android.sh)
+#   MACOS_SIGN_P12_B64        base64 of the "ManyDesk Local Signing" identity (.p12) and
+#   MACOS_SIGN_P12_PASSWORD   its password; without them the app is signed ad hoc
+#
+# Actions are pinned to commit SHAs; Dependabot keeps them current.
 name: Build
 
 on:
@@ -17,14 +24,39 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-  RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        name: Read (and on a tag, check) the version
+        run: |
+          v="$(grep -m1 '^version' app/Cargo.toml | cut -d'"' -f2)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, but app/Cargo.toml says $v"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ManyDesk $v" >> "$GITHUB_STEP_SUMMARY"
+
   linux:
-    name: Linux ${{ matrix.arch }} (and tests)
+    name: Linux ${{ matrix.arch }}
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -34,8 +66,9 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: System libraries
         run: |
           sudo apt-get update
@@ -43,107 +76,167 @@ jobs:
             libgtk-3-dev libssl-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxrandr-dev libxdo-dev \
             libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev libgbm-dev libxtst-dev libxi-dev \
             libxkbcommon-dev libgl1-mesa-dev libasound2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: app
       - name: Tests
-        if: matrix.arch == 'amd64'
         working-directory: app
         run: cargo test --release --lib
       - name: Package
         run: MANYDESK_LINUX_NATIVE=1 bash scripts/package-native.sh linux
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-${{ matrix.arch }}
           path: |
             dist-native/*.deb
             dist-native/*.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ needs.version.outputs.release == 'true' && 90 || 14 }}
 
   windows:
     name: Windows x64
+    needs: version
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: mingw-w64
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mingw-w64 cmake nasm
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           # one small file, no go.sum to key a cache on
           cache: false
       - run: rustup target add x86_64-pc-windows-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: app
       - name: Package
         run: bash scripts/package-native.sh win
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows
           path: dist-native/*.exe
+          if-no-files-found: error
+          retention-days: ${{ needs.version.outputs.release == 'true' && 90 || 14 }}
 
   macos:
     name: macOS universal
+    needs: version
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: app
-      - name: Package
-        # ad hoc signature: there is no Developer ID in CI
+      - name: Tests
+        working-directory: app
+        run: cargo test --release --lib
+      - name: Signing identity
+        # The same "ManyDesk Local Signing" certificate as local builds: macOS keys the Screen
+        # Recording / Accessibility grants to it, so they survive an update. Without the
+        # secret: an ad hoc signature (grants are asked for again after each update).
         env:
-          MANYDESK_SIGN_ID: "-"
+          P12: ${{ secrets.MACOS_SIGN_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then echo "MANYDESK_SIGN_ID=-" >> "$GITHUB_ENV"; exit 0; fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KCPW="$(openssl rand -hex 16)"
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          printf '%s' "$P12" | base64 -d > "$RUNNER_TEMP/sign.p12"
+          security import "$RUNNER_TEMP/sign.p12" -k "$KC" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/sign.p12"
+          echo "MANYDESK_SIGN_ID=ManyDesk Local Signing" >> "$GITHUB_ENV"
+      - name: Package
         run: bash scripts/package-native.sh mac
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos
           path: dist-native/*.dmg
+          if-no-files-found: error
+          retention-days: ${{ needs.version.outputs.release == 'true' && 90 || 14 }}
 
   android:
     name: Android
+    needs: version
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
           java-version: "17"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: app
       - name: Package
         env:
-          # all ABIs for a release, one for the everyday build
-          ABIS: ${{ env.RELEASE == 'true' && 'arm64-v8a armeabi-v7a x86_64' || 'arm64-v8a' }}
+          # every ABI for a release, the common one for the everyday build
+          ABIS: ${{ needs.version.outputs.release == 'true' && 'arm64-v8a armeabi-v7a x86_64' || 'arm64-v8a' }}
           MANYDESK_ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
         run: bash scripts/build-android.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: android
           path: dist-native/*.apk
+          if-no-files-found: error
+          retention-days: ${{ needs.version.outputs.release == 'true' && 90 || 14 }}
 
   release:
     name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, windows, macos, android]
+    if: needs.version.outputs.release == 'true'
+    needs: [version, linux, windows, macos, android]
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
-      - name: The tag matches the version
-        run: |
-          v="$(grep -m1 '^version' app/Cargo.toml | cut -d'"' -f2)"
-          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, but app/Cargo.toml says $v"; exit 1; }
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: out
           merge-multiple: true
+      - name: Checksums and update manifest
+        run: |
+          cd out
+          sha256sum -- * > SHA256SUMS
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
+          jq -n --arg v "$VERSION" --arg b "$base" --arg n "https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME" '{
+            version: $v, notes: $n,
+            assets: {
+              "mac-universal": "\($b)/ManyDesk-\($v)-mac-universal.dmg",
+              "win-x64":       "\($b)/ManyDesk-\($v)-win-x64.exe",
+              "linux-amd64":   "\($b)/ManyDesk-\($v)-linux-amd64.deb",
+              "linux-arm64":   "\($b)/ManyDesk-\($v)-linux-arm64.deb",
+              "android":       "\($b)/ManyDesk-\($v)-android.apk"
+            }
+          }' > latest.json
+          # every file the manifest names is here
+          for f in $(jq -r '.assets[]' latest.json); do [ -f "$(basename "$f")" ] || { echo "::error::missing $(basename "$f")"; exit 1; }; done
+          ls -l
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            out/*.dmg
+            out/*.exe
+            out/*.deb
+            out/*.tar.gz
+            out/*.apk
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" out/* --title "ManyDesk ${GITHUB_REF_NAME#v}" --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
+            --title "ManyDesk $VERSION" --generate-notes --verify-tag --latest
