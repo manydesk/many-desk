@@ -8,6 +8,8 @@ pub mod system;
 pub mod update;
 #[cfg(windows)]
 pub mod service;
+#[cfg(windows)]
+pub mod instance;
 
 /// Keeps the window titled `title` out of screen capture (the host's pointer overlay is
 /// for the host only). Returns true once applied.

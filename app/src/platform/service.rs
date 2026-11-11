@@ -24,6 +24,8 @@ use windows_sys::Win32::System::Threading::*;
 
 const SERVICE_NAME: &str = "ManyDesk";
 const SAS_EVENT: &str = r"Global\ManyDeskSAS";
+/// The app asks the service to update ManyDesk (an installed copy, platform/update.rs).
+const UPDATE_EVENT: &str = r"Global\ManyDeskUpdate";
 
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
@@ -48,6 +50,79 @@ pub fn request_sas() -> Result<(), String> {
         } else {
             Err("SetEvent".into())
         }
+    }
+}
+
+/// Asks the service to look for an update and install it (the installed app cannot write
+/// to Program Files; the service, as SYSTEM, downloads and checks the setup itself).
+pub fn request_update() -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{OpenEventW, SetEvent};
+    unsafe {
+        let h = OpenEventW(0x0002 /* EVENT_MODIFY_STATE */, 0, wide(UPDATE_EVENT).as_ptr());
+        if h.is_null() {
+            return Err("service not running".into());
+        }
+        let ok = SetEvent(h) != 0;
+        CloseHandle(h);
+        if ok {
+            Ok(())
+        } else {
+            Err("SetEvent".into())
+        }
+    }
+}
+
+/// An event in the global namespace that the signed-in user's app may signal: SYSTEM and
+/// administrators own it, authenticated users get SYNCHRONIZE | EVENT_MODIFY_STATE. (With the
+/// default security of a SYSTEM process, a standard user's app could not open it.)
+unsafe fn shared_event(name: &str) -> HANDLE {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let sddl = wide("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100002;;;AU)");
+    let ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut()) != 0;
+    let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: sd, bInheritHandle: 0 };
+    let h = CreateEventW(if ok { &sa } else { std::ptr::null() }, 0, 0, wide(name).as_ptr());
+    if ok {
+        LocalFree(sd as _);
+    }
+    h
+}
+
+/// The service's update: the newest release's setup, checked against its SHA256SUMS,
+/// downloaded into the install folder (only administrators can write there) and run
+/// silently. The setup stops this service, replaces the files and starts it again.
+fn service_update() {
+    let log = |msg: &str| {
+        if let Ok(exe) = std::env::current_exe() {
+            let line = format!("{} {msg}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+            let path = exe.with_file_name("update").join("update.log");
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        }
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+    let r: Result<String, String> = rt.block_on(async {
+        // Test hook, in the service's Environment (registry, administrators only):
+        // MANYDESK_UPDATE_SETUP=<setup.exe> runs that setup instead of the newest release's
+        if let Ok(setup) = std::env::var("MANYDESK_UPDATE_SETUP") {
+            std::process::Command::new(&setup).arg("/S").spawn().map_err(|e| format!("start {setup}: {e}"))?;
+            return Ok(format!("test setup {setup} started"));
+        }
+        // MANYDESK_UPDATE_CURRENT in the service's Environment (registry): test an update
+        let cur = std::env::var("MANYDESK_UPDATE_CURRENT").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+        let Some(u) = super::update::check(&cur).await? else { return Ok(format!("{cur} is the newest")) };
+        if u.sums.is_none() {
+            return Err(format!("{}: no SHA256SUMS, not installed", u.version));
+        }
+        let dir = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("update");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let setup = super::update::download(&u, &dir).await?;
+        std::process::Command::new(&setup).arg("/S").spawn().map_err(|e| format!("start {}: {e}", setup.display()))?;
+        Ok(format!("{cur} -> {}: {} started", u.version, setup.display()))
+    });
+    match r {
+        Ok(m) => log(&m),
+        Err(e) => log(&format!("update failed: {e}")),
     }
 }
 
@@ -155,8 +230,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     }
     set_state(SERVICE_RUNNING);
 
-    // The SAS event viewers trigger through request_sas().
-    let sas = CreateEventW(std::ptr::null(), 0, 0, wide(SAS_EVENT).as_ptr());
+    // The SAS event viewers trigger through request_sas(), and the app's update requests.
+    let sas = shared_event(SAS_EVENT);
+    let update = shared_event(UPDATE_EVENT);
+    let updating = std::sync::Arc::new(AtomicBool::new(false));
 
     let mut child: Option<HANDLE> = None;
     let mut last_session = 0xFFFF_FFFFu32;
@@ -164,6 +241,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         // Ctrl+Alt+Del requests
         if !sas.is_null() && WaitForSingleObject(sas, 0) == WAIT_OBJECT_0 {
             send_sas();
+        }
+        if !update.is_null() && WaitForSingleObject(update, 0) == WAIT_OBJECT_0 && !updating.swap(true, Ordering::SeqCst) {
+            let flag = updating.clone();
+            std::thread::spawn(move || {
+                service_update();
+                flag.store(false, Ordering::SeqCst);
+            });
         }
         // Keep an app running in the active console session.
         let session = WTSGetActiveConsoleSessionId();

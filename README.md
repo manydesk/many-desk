@@ -54,7 +54,8 @@ Get the latest version from the [**Releases**](https://github.com/manydesk/many-
 | Platform | Package | Requirements |
 |---|---|---|
 | macOS | `ManyDesk-<version>-mac-universal.dmg` | macOS 13 or later, Apple Silicon and Intel |
-| Windows | `ManyDesk-<version>-win-x64.exe` | Windows 10 or 11, 64-bit. Single executable, no installation needed |
+| Windows | `ManyDesk-<version>-win-x64-setup.exe` | Windows 10 or 11, 64-bit. Installs into Program Files with the service for unattended access; updates install silently |
+| Windows (portable) | `ManyDesk-<version>-win-x64.exe` | The same app as a single executable, no installation needed |
 | Linux | `.deb` or `.tar.gz`, amd64 and arm64 | X11 or Wayland |
 | Android | `ManyDesk-<version>-android.apk` | Android 8.0 or later |
 | iOS | Build from source | Controller only: iOS does not allow apps to share the screen |
@@ -79,7 +80,7 @@ For unattended access, set a password (and optionally TOTP) under **Settings →
 | Platform | What the host needs |
 |---|---|
 | macOS | **Screen Recording**, **Accessibility** (for remote control) and **Local Network** (for LAN discovery) |
-| Windows | Nothing by default. Install the service from Settings to be reachable at the sign-in screen |
+| Windows | Nothing for the portable exe; install the service from Settings to be reachable at the sign-in screen. The installer sets the service up (unless unticked) and a firewall rule |
 | Android | ManyDesk's **Accessibility** service for remote control. On Android 13+ sideloaded apps may first need *App info → ⋮ → Allow restricted settings* |
 | Linux | On Wayland, the desktop portal asks once for screen sharing |
 
@@ -128,7 +129,7 @@ Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ManyDesk is a single Rust application in [`app/`](app). All desktop and Android packages can be built from a Mac.
 
-**Requirements:** Rust (via rustup), Xcode Command Line Tools; for Windows `mingw-w64`, CMake and Go; for Linux Docker; for Android run `scripts/setup-android.sh`; for iOS full Xcode.
+**Requirements:** Rust (via rustup), Xcode Command Line Tools; for Windows `mingw-w64`, CMake, Go and NSIS (`makensis`, or Docker) for the installer; for Linux Docker; for Android run `scripts/setup-android.sh`; for iOS full Xcode.
 
 ```bash
 # run during development

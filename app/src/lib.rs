@@ -88,6 +88,12 @@ pub fn run() -> eframe::Result<()> {
     // a copy started by an update waits for the one it replaces, then clears up after it
     #[cfg(not(mobile))]
     platform::update::after_update();
+    // Windows: one copy per session (another start shows this one's window instead)
+    #[cfg(windows)]
+    let mut instance = match platform::instance::claim() {
+        Some(g) => Some(g),
+        None => return Ok(()),
+    };
     let _ = rustls::crypto::ring::default_provider().install_default();
     rt::handle(); // start the runtime before anything spawns
     platform::keep_responsive();
@@ -125,10 +131,15 @@ pub fn run() -> eframe::Result<()> {
             // sends to all windows: display and full-screen changes froze other apps.
             #[cfg(windows)]
             drop_dead_windows();
+            // the copy started here is the one now
+            #[cfg(windows)]
+            drop(instance.take());
             let status = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env("MANYDESK_OPAQUE", "1").status();
             std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
         }
     }
+    #[cfg(windows)]
+    drop(instance.take());
     r
 }
 

@@ -1,6 +1,6 @@
 # Builds and tests every package on each push to main and each pull request. A v* tag
 # (it must match app/Cargo.toml's version) also publishes a GitHub Release with:
-#   - the packages: macOS DMG, Windows EXE, Linux .deb/.tar.gz (amd64, arm64), Android APK
+#   - the packages: macOS DMG, Windows EXE and installer, Linux .deb/.tar.gz (amd64, arm64), Android APK
 #   - SHA256SUMS and build provenance attestations (gh attestation verify <file> -R manydesk/many-desk)
 #   - latest.json, the manifest the app checks for updates
 #     (the app reads the release list first and falls back to this; see app/src/platform/update.rs)
@@ -104,7 +104,7 @@ jobs:
         timeout-minutes: 15
         run: |
           # x86_64 only: the mingw-w64 metapackage also brings the i686 compilers, twice the download
-          .github/apt-install.sh gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 cmake nasm
+          .github/apt-install.sh gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 cmake nasm nsis
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
@@ -219,6 +219,7 @@ jobs:
             assets: {
               "mac-universal": "\($b)/ManyDesk-\($v)-mac-universal.dmg",
               "win-x64":       "\($b)/ManyDesk-\($v)-win-x64.exe",
+              "win-x64-setup": "\($b)/ManyDesk-\($v)-win-x64-setup.exe",
               "linux-amd64":   "\($b)/ManyDesk-\($v)-linux-amd64.deb",
               "linux-arm64":   "\($b)/ManyDesk-\($v)-linux-arm64.deb",
               "android":       "\($b)/ManyDesk-\($v)-android.apk"
