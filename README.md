@@ -49,7 +49,7 @@ It is a single native application written in Rust, with one code base for every 
 
 ## Download
 
-Get the latest version from the [**Releases**](https://github.com/manydesk/many-desk/releases/latest) page. The app reads this release list on start, offers the newest version for your platform and checks the download against the release's SHA256SUMS before opening it.
+Get the latest version from the [**Releases**](https://github.com/manydesk/many-desk/releases/latest) page. After that, ManyDesk updates itself: it looks at this release list on start and every 6 hours, checks the download against the release's SHA256SUMS, and installs it when no session is open and the computer has been left alone for two minutes, then restarts. On macOS the new app must be signed by the same certificate, so Screen Recording and Accessibility stay granted. Updates can be turned off in Settings.
 
 | Platform | Package | Requirements |
 |---|---|---|
