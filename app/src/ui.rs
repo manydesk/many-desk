@@ -187,9 +187,12 @@ async fn update_scheduler(slot: UpdateSlot) {
         if let Some(u) = &found {
             let quiet = since_start().saturating_sub(Duration::from_secs(UPD_INPUT.load(SeqCst)));
             let (asked, busy) = (UPD_NOW.load(SeqCst), UPD_BUSY.load(SeqCst));
-            if !INSTALLING.load(SeqCst) && !busy && (asked || (auto && quiet >= UPDATE_QUIET)) {
+            // by itself only where no prompt would come up (an installed Windows copy
+            // without the service needs an administrator: then only when asked)
+            let quiet_ok = crate::platform::update::quiet_install_possible();
+            if !INSTALLING.load(SeqCst) && !busy && (asked || (auto && quiet_ok && quiet >= UPDATE_QUIET)) {
                 eprintln!("[update] installing {}: {}", u.version, if asked { "asked for".to_string() } else { format!("no session, window unused for {}s", quiet.as_secs()) });
-                install_update(u.clone(), slot.clone()).await;
+                install_update(u.clone(), slot.clone(), asked).await;
             } else if auto && !INSTALLING.load(SeqCst) && waited.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
                 waited = Some(Instant::now());
                 eprintln!("[update] {} waits: {}", u.version, if busy { "a session is open".to_string() } else { format!("window used {}s ago", quiet.as_secs()) });
@@ -224,7 +227,7 @@ async fn run_check(slot: UpdateSlot, manual: bool) {
 /// Downloads the update and puts it in place; ManyDesk then quits and the new version
 /// starts. When it cannot install by itself (no write access to its folder, a tarball
 /// copy) it opens the installer instead.
-async fn install_update(u: crate::platform::update::Update, slot: UpdateSlot) {
+async fn install_update(u: crate::platform::update::Update, slot: UpdateSlot, asked: bool) {
     use std::sync::atomic::Ordering::SeqCst;
     if INSTALLING.swap(true, SeqCst) {
         return;
@@ -233,11 +236,17 @@ async fn install_update(u: crate::platform::update::Update, slot: UpdateSlot) {
     let msg = tf("start.updating", &[("v", &u.version)]);
     *slot.lock().unwrap() = Some((msg.clone(), None));
     bus::emit("toast", json!({ "text": msg, "error": false }));
-    match crate::platform::update::install(&u).await {
-        Ok(()) => {
+    match crate::platform::update::install(&u, asked).await {
+        Ok(crate::platform::update::Outcome::Restart) => {
             // let the log and the settings reach the disk, then make way for the new copy
             tokio::time::sleep(Duration::from_millis(300)).await;
             std::process::exit(0);
+        }
+        Ok(crate::platform::update::Outcome::Elsewhere) => {
+            // the service or the approved setup replaces this copy; should it not, try
+            // again later (INSTALLING would otherwise stop every further attempt)
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            INSTALLING.store(false, SeqCst);
         }
         Err((e, package)) => {
             let opened = package.as_deref().map(|p| crate::platform::update::open(p).is_ok()).unwrap_or(false);
@@ -488,6 +497,13 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         self.update_tick(&ctx);
+        // ManyDesk was started again: this copy comes forward (Windows, platform::instance)
+        #[cfg(windows)]
+        if crate::platform::instance::SHOW.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         let active = self.core.active.filter(|k| self.core.tabs.iter().any(|t| t.key == *k));
         // phones: keep clear of the status bar / notch and the navigation bar
         #[cfg(mobile)]
@@ -1914,7 +1930,7 @@ impl App {
             self.core.toast(t("start.updateLater"), false);
             return;
         }
-        crate::rt::spawn(install_update(u, self.update.clone()));
+        crate::rt::spawn(install_update(u, self.update.clone(), true));
     }
 
     fn page_settings(&mut self, ui: &mut Ui) {

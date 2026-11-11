@@ -184,6 +184,11 @@ impl Default for Store {
     }
 }
 
+/// The folder of this copy's settings (and ID).
+pub fn config_dir() -> PathBuf {
+    path().parent().map(|p| p.to_path_buf()).unwrap_or_default()
+}
+
 fn path() -> PathBuf {
     // Test hook: MANYDESK_CONFIG_DIR=<dir> keeps a test copy's settings (and ID) apart from
     // the installed app's (Windows has no HOME to point elsewhere).

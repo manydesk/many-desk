@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Packages the native app (app/) for distribution into dist-native/:
 #   mac      ManyDesk.app (universal: Apple Silicon + Intel) in a DMG
-#   win      one-file ManyDesk.exe (input helper embedded) — cross-compiled with mingw-w64
+#   win      one-file ManyDesk.exe (input helper embedded) — cross-compiled with mingw-w64 —
+#            and its installer (NSIS, scripts/windows/manydesk.nsi)
 #   linux    .deb + .tar.gz for amd64 and arm64, built in Docker (ARCHS="amd64 arm64")
 # Usage: scripts/package-native.sh [--bump major|minor|patch] [mac] [win] [linux]   (default: all)
 #
@@ -152,6 +153,21 @@ win() {
   export CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_gnu="$ROOT/scripts/cmake/mingw-x86_64.cmake"
   (cd "$APP" && cargo build --release --target x86_64-pc-windows-gnu)
   cp "$APP/target/x86_64-pc-windows-gnu/release/manydesk.exe" "$OUT/ManyDesk-$VERSION-win-x64.exe"
+  # the installer (scripts/windows/manydesk.nsi): NSIS here, or in Docker when not installed
+  local SETUP="ManyDesk-$VERSION-win-x64-setup.exe"
+  if command -v makensis >/dev/null; then
+    # makensis reads UTF-8 (the Russian and Turkish texts) only under a UTF-8 locale
+    local UTF8=C.UTF-8
+    locale -a 2>/dev/null | grep -qix 'c.utf-\?8' || UTF8=en_US.UTF-8
+    LC_ALL=$UTF8 makensis -V2 -DVERSION="$VERSION" -DEXE="$OUT/ManyDesk-$VERSION-win-x64.exe" -DICON="$APP/assets/icon.ico" \
+      -DLICENSE="$ROOT/LICENSE" -DOUTFILE="$OUT/$SETUP" "$ROOT/scripts/windows/manydesk.nsi"
+  elif command -v docker >/dev/null; then
+    docker run --rm --platform linux/amd64 -v "$ROOT:/src" ubuntu:24.04 bash -c "apt-get update -qq >/dev/null && apt-get install -y -qq nsis >/dev/null && \
+      makensis -V2 -DVERSION=$VERSION -DEXE=/src/dist-native/ManyDesk-$VERSION-win-x64.exe -DICON=/src/app/assets/icon.ico \
+      -DLICENSE=/src/LICENSE -DOUTFILE=/src/dist-native/$SETUP /src/scripts/windows/manydesk.nsi"
+  else
+    echo "no makensis or docker: $SETUP not built" >&2
+  fi
 }
 
 # The .deb and .tar.gz, built where this runs (SRC: the repository there).

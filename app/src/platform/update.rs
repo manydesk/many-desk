@@ -23,10 +23,28 @@ pub struct Update {
     pub sums: Option<String>,
 }
 
+/// Windows: this copy was installed by the setup (an Uninstall.exe beside it), so it
+/// updates with the setup, not the portable exe.
+pub fn installed() -> bool {
+    cfg!(windows) && std::env::current_exe().ok().is_some_and(|e| e.with_file_name("Uninstall.exe").exists())
+}
+
+/// Whether an update can go in without anyone answering a prompt: everywhere but an
+/// installed Windows copy without the service (there the setup needs an administrator).
+pub fn quiet_install_possible() -> bool {
+    #[cfg(windows)]
+    if installed() {
+        return super::service::installed();
+    }
+    true
+}
+
 /// This build's download key in the manifest's "assets".
 fn asset_key() -> &'static str {
     if cfg!(target_os = "macos") {
         "mac-universal"
+    } else if cfg!(windows) && installed() {
+        "win-x64-setup"
     } else if cfg!(windows) {
         "win-x64"
     } else if cfg!(target_arch = "aarch64") {
@@ -62,7 +80,8 @@ async fn get_json(c: &reqwest::Client, url: &str) -> Result<Value, String> {
     r.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())
 }
 
-/// Is `name` this platform's package? (ManyDesk-0.20.0-mac-universal.dmg, …-win-x64.exe, …-linux-amd64.deb)
+/// Is `name` this platform's package? (ManyDesk-0.20.0-mac-universal.dmg, …-win-x64.exe or
+/// …-win-x64-setup.exe for an installed copy, …-linux-amd64.deb)
 fn is_ours(name: &str) -> bool {
     let ext = if cfg!(target_os = "macos") {
         ".dmg"
@@ -166,20 +185,42 @@ fn work_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("manydesk-update")
 }
 
-/// Downloads `u`, checks it and puts it in place of the running app. On Ok the caller
-/// quits right away: a helper (macOS), the service or a new copy (Windows, Linux) starts
-/// the new version once this process is gone. On Err the package, when it got that far,
-/// comes back so the caller can open it for the user to install by hand.
-pub async fn install(u: &Update) -> Result<(), (String, Option<std::path::PathBuf>)> {
+/// What an install led to.
+#[derive(Debug, PartialEq)]
+pub enum Outcome {
+    /// in place: quit now, the new version starts when this process is gone
+    Restart,
+    /// in other hands (the Windows service, or a setup the user approved): it stops this
+    /// copy and starts the new one itself
+    Elsewhere,
+}
+
+/// Downloads `u`, checks it and puts it in place of the running app. `asked`: the user
+/// pressed "Download and install" (an installed Windows copy without the service may then
+/// ask for an administrator). On Err the package, when it got that far, comes back so the
+/// caller can open it for the user to install by hand.
+pub async fn install(u: &Update, asked: bool) -> Result<Outcome, (String, Option<std::path::PathBuf>)> {
+    #[cfg(windows)]
+    if installed() {
+        if super::service::installed() {
+            // the service downloads and checks the setup itself and runs it as SYSTEM
+            super::service::request_update().map_err(|e| (e, None))?;
+            eprintln!("[update] {}: the service installs it", u.version);
+            return Ok(Outcome::Elsewhere);
+        }
+        if !asked {
+            return Err(("an administrator has to approve this update".into(), None));
+        }
+    }
     let dir = work_dir();
     tokio::fs::create_dir_all(&dir).await.map_err(|e| (e.to_string(), None))?;
     let path = download(u, &dir).await.map_err(|e| (e, None))?;
     let p = path.clone();
     let r = tokio::task::spawn_blocking(move || put_in_place(&p)).await.map_err(|e| e.to_string()).and_then(|r| r);
     match r {
-        Ok(()) => {
-            eprintln!("[update] {} installed; restarting", u.version);
-            Ok(())
+        Ok(o) => {
+            eprintln!("[update] {} installed: {o:?}", u.version);
+            Ok(o)
         }
         Err(e) => {
             eprintln!("[update] could not install by itself: {e}");
@@ -205,6 +246,7 @@ fn relaunch_args() -> Vec<std::ffi::OsString> {
     out
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn run(cmd: &str, args: &[&std::ffi::OsStr]) -> Result<String, String> {
     let o = std::process::Command::new(cmd).args(args).output().map_err(|e| format!("{cmd}: {e}"))?;
     if o.status.success() {
@@ -220,7 +262,7 @@ fn run(cmd: &str, args: &[&std::ffi::OsStr]) -> Result<String, String> {
 /// signature, stay granted. A shell helper waits for this process to end, swaps the
 /// bundles (putting the old one back if the swap fails) and opens the new one.
 #[cfg(all(target_os = "macos", not(mobile)))]
-fn put_in_place(dmg: &std::path::Path) -> Result<(), String> {
+fn put_in_place(dmg: &std::path::Path) -> Result<Outcome, String> {
     use std::ffi::OsStr;
     let exe = std::env::current_exe().and_then(|p| p.canonicalize()).map_err(|e| e.to_string())?;
     let bundle = exe.ancestors().find(|p| p.extension() == Some(OsStr::new("app"))).ok_or("not running from an .app")?.to_path_buf();
@@ -253,7 +295,7 @@ open -n{envs} "$2"{sep}{args}"#,
         sep = if args.is_empty() { "" } else { " --args" },
     );
     std::process::Command::new("/bin/sh").arg("-c").arg(script).arg("manydesk-update").arg(&staged).arg(&bundle).spawn().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(Outcome::Restart)
 }
 
 #[cfg(all(target_os = "macos", not(mobile)))]
@@ -284,7 +326,12 @@ fn same_signer(new: &std::path::Path, current: &std::path::Path) -> Result<(), S
 /// takes its name. The service, when it keeps this copy running, starts the new one by
 /// itself; otherwise the new copy is started here and waits for this one to end.
 #[cfg(windows)]
-fn put_in_place(new_exe: &std::path::Path) -> Result<(), String> {
+fn put_in_place(new_exe: &std::path::Path) -> Result<Outcome, String> {
+    // an installed copy (no service): its setup, run as an administrator after the user's
+    // approval (UAC); it stops this copy and starts the new one (/RUN)
+    if installed() {
+        return run_elevated(new_exe, "/S /RUN").map(|()| Outcome::Elsewhere);
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let staged = exe.with_extension("new.exe");
     let old = exe.with_extension("old.exe");
@@ -302,24 +349,40 @@ fn put_in_place(new_exe: &std::path::Path) -> Result<(), String> {
     if !by_service {
         std::process::Command::new(&exe).args(relaunch_args()).env_remove("MANYDESK_UPDATE_CURRENT").arg("--wait-pid").arg(std::process::id().to_string()).spawn().map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(Outcome::Restart)
+}
+
+/// Runs `exe` with `args` as an administrator: Windows asks the user (UAC) first.
+#[cfg(windows)]
+fn run_elevated(exe: &std::path::Path, args: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let w = |s: &std::ffi::OsStr| s.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let (verb, file, params) = (w("runas".as_ref()), w(exe.as_os_str()), w(args.as_ref()));
+    // > 32: started; otherwise refused (ERROR_CANCELLED when the user said no)
+    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), std::ptr::null(), 1) } as isize;
+    if r > 32 {
+        Ok(())
+    } else {
+        Err(format!("the setup did not start ({r})"))
+    }
 }
 
 /// Linux: the .deb, installed with the administrator's password (pkexec asks). A copy
 /// run from the tarball is updated by hand.
 #[cfg(target_os = "linux")]
-fn put_in_place(deb: &std::path::Path) -> Result<(), String> {
+fn put_in_place(deb: &std::path::Path) -> Result<Outcome, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     if !exe.starts_with("/usr/") {
         return Err("not installed from the .deb".into());
     }
     run("pkexec", &["apt-get".as_ref(), "install".as_ref(), "-y".as_ref(), "--allow-downgrades".as_ref(), deb.as_os_str()])?;
     std::process::Command::new(&exe).args(relaunch_args()).env_remove("MANYDESK_UPDATE_CURRENT").arg("--wait-pid").arg(std::process::id().to_string()).spawn().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(Outcome::Restart)
 }
 
 #[cfg(any(mobile, not(any(windows, target_os = "linux", target_os = "macos"))))]
-fn put_in_place(_: &std::path::Path) -> Result<(), String> {
+fn put_in_place(_: &std::path::Path) -> Result<Outcome, String> {
     Err("updates come from the app store".into())
 }
 
