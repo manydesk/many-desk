@@ -60,6 +60,9 @@ fn pack(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// How long an encode call waits for the frame it gave the encoder (drain_after_input).
+const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(40);
+
 impl MfEncoder {
     /// `d3d`: the device manager of the GPU the frames are on (they come as textures).
     pub fn new(width: usize, height: usize, fps: f64, bitrate: u32, d3d: Option<&IMFDXGIDeviceManager>) -> windows::core::Result<Self> {
@@ -193,6 +196,23 @@ impl MfEncoder {
         }
     }
 
+    /// After an input: wait (up to OUTPUT_WAIT) for the access unit it makes. A hardware
+    /// encoder finishes a frame a few milliseconds after taking it; without waiting, the
+    /// frame would only go out with the next capture — a frame interval late while the
+    /// screen moves, and up to the still-screen interval when one key press changes it.
+    fn drain_after_input(&mut self, out: &mut Vec<(Vec<u8>, bool)>) -> windows::core::Result<()> {
+        let before = out.len();
+        let deadline = std::time::Instant::now() + OUTPUT_WAIT;
+        loop {
+            self.pump(out, false)?;
+            if out.len() > before || std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            // high-resolution timers: a fraction of a millisecond, not the 15.6 ms tick
+            std::thread::sleep(std::time::Duration::from_micros(300));
+        }
+    }
+
     fn take_output(&mut self) -> windows::core::Result<Option<(Vec<u8>, bool)>> {
         unsafe {
             let sample = if self.provides_samples {
@@ -249,7 +269,7 @@ impl MfEncoder {
             self.mft.ProcessInput(0, &sample, 0)?;
         }
         self.credits -= 1;
-        self.pump(&mut out, false)?;
+        self.drain_after_input(&mut out)?;
         Ok(out)
     }
 
@@ -288,7 +308,7 @@ impl MfEncoder {
             self.mft.ProcessInput(0, &sample, 0)?;
         }
         self.credits -= 1;
-        self.pump(&mut out, false)?;
+        self.drain_after_input(&mut out)?;
         Ok(out)
     }
 }

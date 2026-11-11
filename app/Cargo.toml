@@ -1,6 +1,6 @@
 [package]
 name = "manydesk"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 description = "ManyDesk — native remote desktop (egui UI, MDP transport)"
 license = "Apache-2.0"

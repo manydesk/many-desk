@@ -77,7 +77,6 @@ pub struct App {
     fm_dialog: Option<FmDialog>,
     /// per session: the whiteboard, and the last full-size picture (for screenshots)
     boards: HashMap<u32, Board>,
-    last_pic: HashMap<u32, crate::video::Picture>,
     act_dialog: Option<ActDialog>,
     /// displays whose privacy cover is already kept out of the shared picture
     covered: Vec<u32>,
@@ -114,6 +113,8 @@ pub struct App {
     startup_checked: Option<Instant>,
     /// update check: None = idle, Some(None) = checking, Some(Some(..)) = result text + ok
     update: std::sync::Arc<Mutex<Option<(String, Option<bool>)>>>,
+    /// per session: the host's pointer image as a texture, and which shape it is
+    cursor_tex: HashMap<u32, (u32, TextureHandle)>,
 }
 
 /// What a file manager pane asks for this frame (applied after drawing).
@@ -316,7 +317,6 @@ impl App {
             acl_text,
             fm_dialog: None,
             boards: HashMap::new(),
-            last_pic: HashMap::new(),
             act_dialog: None,
             covered: Vec::new(),
             minimize_once: std::env::args().any(|a| a == "--background"),
@@ -335,6 +335,7 @@ impl App {
             startup: Default::default(),
             startup_checked: None,
             update: Default::default(),
+            cursor_tex: HashMap::new(),
         }
     }
 }
@@ -2069,7 +2070,7 @@ impl App {
                 return;
             }
             let tab = &self.core.tabs[i];
-            if tab.state != TabState::Live || tab.texture.is_none() {
+            if tab.state != TabState::Live || tab.video.is_none() {
                 self.connecting_card(ui, stage, i, key);
                 // the camera does not need the screen (a host that can't capture it still has a face)
                 if self.core.tabs.get(i).is_some_and(|t| t.state == TabState::Live) {
@@ -2079,17 +2080,17 @@ impl App {
                 self.session_fab(ui, stage, key);
                 return;
             }
-            let tex = tab.texture.clone().unwrap();
+            let pic_size = tab.video.as_ref().map(|v| v.size_vec2()).unwrap_or(Vec2::ZERO);
             let control = tab.remote.control;
             let capturing = self.core.capture_tab == Some(key);
             let resp = ui.allocate_rect(stage, Sense::click_and_drag());
             let peer = self.core.tabs[i].label.clone();
             self.camera_pip(&ctx, key, stage, &peer);
             let rect = match mode {
-                ViewMode::Fit => fit_rect(stage, tex.size_vec2(), ppp),
+                ViewMode::Fit => fit_rect(stage, pic_size, ppp),
                 ViewMode::Stretch => stage,
                 ViewMode::Actual => {
-                    let size = native.unwrap_or_else(|| tex.size_vec2()) / ppp;
+                    let size = native.unwrap_or(pic_size) / ppp;
                     let over = (size - stage.size()).max(Vec2::ZERO);
                     let mut pan = self.core.tabs[i].pan;
                     if over != Vec2::ZERO {
@@ -2121,14 +2122,31 @@ impl App {
             // phones: the pinch zoom over "fit"
             let rect = if cfg!(mobile) && mode == ViewMode::Fit { self.zoomed(key, stage, rect) } else { rect };
             let painter = ui.painter().with_clip_rect(stage);
-            painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            if let Some(v) = self.core.tabs[i].video.as_mut() {
+                v.paint(&painter, rect);
+            }
+            // The host's pointer, sent apart from the picture (macOS and Windows hosts). In
+            // control, its shape follows our own pointer with no delay (as AnyDesk does);
+            // watching, it sits where the host says.
+            let local = ctx.input(|i| i.pointer.hover_pos()).filter(|p| capturing && stage.contains(*p));
+            let remote = self.core.tabs[i].pointer.map(|(x, y)| rect.min + Vec2::new(x * rect.width(), y * rect.height()));
+            let shown_at = if capturing { local } else { remote };
+            let display_w = native.map(|n| n.x).unwrap_or(pic_size.x);
+            let cursor_drawn = match (shown_at, self.cursor_texture(&ctx, i, key)) {
+                (Some(at), Some((tex, size, hot))) if display_w > 0.0 && !cfg!(mobile) => {
+                    let scale = rect.width() / display_w;
+                    painter.image(tex.id(), Rect::from_min_size(at - hot * scale, size * scale), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    true
+                }
+                _ => false,
+            };
             // touchpad: the pointer the finger moves
             if cfg!(mobile) && self.touchpad_for(key) && control {
                 let c = self.tp_cursor.get(&key).copied().unwrap_or(Pos2::new(0.5, 0.5));
                 paint_arrow(&painter, rect.min + Vec2::new(c.x * rect.width(), c.y * rect.height()));
             }
             if std::env::var_os("MANYDESK_PERF").is_some() {
-                let (ts, rp) = (tex.size_vec2(), rect.size() * ppp);
+                let (ts, rp) = (pic_size, rect.size() * ppp);
                 let line = format!("[draw] texture {}x{} drawn as {:.2}x{:.2} px at ({:.2},{:.2}) px", ts.x, ts.y, rp.x, rp.y, rect.min.x * ppp, rect.min.y * ppp);
                 if ctx.data_mut(|d| d.get_temp::<String>(Id::new("perf-draw")) != Some(line.clone())) {
                     eprintln!("{line}");
@@ -2191,10 +2209,13 @@ impl App {
                 self.core.set_capture(Some(key));
             }
             if capturing {
-                // The local pointer: a small dot that moves instantly (the remote arrow follows).
+                // The local pointer: the host's pointer shape where it is (above); a small
+                // dot that moves instantly when the host does not send its shape.
                 ctx.set_cursor_icon(egui::CursorIcon::None);
-                if let Some(p) = ctx.input(|i| i.pointer.hover_pos()).filter(|p| stage.contains(*p)) {
-                    ui.painter().circle(p, 3.5, Color32::WHITE, Stroke::new(1.5, Color32::from_black_alpha(153)));
+                if !cursor_drawn {
+                    if let Some(p) = ctx.input(|i| i.pointer.hover_pos()).filter(|p| stage.contains(*p)) {
+                        ui.painter().circle(p, 3.5, Color32::WHITE, Stroke::new(1.5, Color32::from_black_alpha(153)));
+                    }
                 }
                 self.forward_input(&ctx, key, rect, rect.intersect(stage));
             }
@@ -2240,29 +2261,38 @@ impl App {
         }
     }
 
+    /// The host's pointer image as a texture (made again when the shape changes), with its
+    /// size and hot spot in the host display's pixels.
+    fn cursor_texture(&mut self, ctx: &egui::Context, i: usize, key: u32) -> Option<(TextureHandle, Vec2, Vec2)> {
+        let tab = &self.core.tabs[i];
+        let shape = tab.pointer_shape.as_ref()?;
+        let gen = tab.pointer_gen;
+        if self.cursor_tex.get(&key).is_none_or(|(g, _)| *g != gen) {
+            let tex = ctx.load_texture(format!("cursor-{key}"), shape.image.clone(), TextureOptions::LINEAR);
+            self.cursor_tex.insert(key, (gen, tex));
+        }
+        let tex = self.cursor_tex.get(&key)?.1.clone();
+        Some((tex, shape.size, shape.hot))
+    }
+
     fn upload_frame(&mut self, ctx: &egui::Context, i: usize, key: u32) {
         let tab = &mut self.core.tabs[i];
-        let Some(feed) = &tab.feed else { return };
+        let Some(feed) = tab.feed.clone() else { return };
         let Some(pic) = feed.shared.latest.lock().unwrap().take() else { return };
         let t0 = Instant::now();
-        // Opaque pixels: premultiplied and unmultiplied are the same, minus the per-pixel math.
-        let img = egui::ColorImage::from_rgba_premultiplied([pic.width, pic.height], &pic.rgba);
-        let t1 = Instant::now();
-        match &mut tab.texture {
-            Some(t) => t.set(img, TextureOptions::LINEAR),
-            None => tab.texture = Some(ctx.load_texture(format!("tab-{key}"), img, TextureOptions::LINEAR)),
+        let view = tab.video.get_or_insert_with(|| crate::video::View::new(format!("tab-{key}")));
+        if let Some(buf) = view.set(ctx, pic) {
+            feed.shared.give_back(buf);
         }
-        crate::perf::add("colorimage", t1 - t0);
-        crate::perf::add("texset", t1.elapsed());
+        crate::perf::add("texset", t0.elapsed());
         let n = self.frames.entry(key).or_default();
         *n += 1;
         if *n == 45 {
             let id = tab.peer_id.clone();
-            if let Some(j) = thumbnail(&pic) {
+            if let Some(j) = tab.video.as_ref().and_then(|v| v.picture()).and_then(|p| thumbnail(p)) {
                 self.core.store.set_thumb(&id, j);
             }
         }
-        self.last_pic.insert(key, pic);
     }
 
     /// .connecting + .conn-card
@@ -2966,7 +2996,7 @@ impl App {
         }
         let pic = cams.feed.lock().unwrap().as_ref().and_then(|f| f.shared.latest.lock().unwrap().take());
         if let Some(pic) = pic {
-            let img = egui::ColorImage::from_rgba_premultiplied([pic.width, pic.height], &pic.rgba);
+            let img = egui::ColorImage::from_rgba_premultiplied([pic.width, pic.height], &pic.rgba());
             match &mut cams.texture {
                 Some(t) => t.set(img, TextureOptions::LINEAR),
                 None => cams.texture = Some(ctx.load_texture(format!("cam-{key}"), img, TextureOptions::LINEAR)),
@@ -4557,7 +4587,7 @@ pub fn compact(ctx: &egui::Context) -> bool {
 }
 
 fn thumbnail(pic: &crate::video::Picture) -> Option<Vec<u8>> {
-    let img = image::RgbaImage::from_raw(pic.width as u32, pic.height as u32, pic.rgba.clone())?;
+    let img = image::RgbaImage::from_raw(pic.width as u32, pic.height as u32, pic.rgba().into_owned())?;
     let small = image::imageops::thumbnail(&img, 480, (480 * pic.height / pic.width.max(1)).max(1) as u32);
     let rgb = image::DynamicImage::ImageRgba8(small).to_rgb8();
     let mut out = std::io::Cursor::new(Vec::new());
