@@ -199,7 +199,7 @@ pub enum Outcome {
 /// pressed "Download and install" (an installed Windows copy without the service may then
 /// ask for an administrator). On Err the package, when it got that far, comes back so the
 /// caller can open it for the user to install by hand.
-pub async fn install(u: &Update, asked: bool) -> Result<Outcome, (String, Option<std::path::PathBuf>)> {
+pub async fn install(u: &Update, #[cfg_attr(not(windows), allow(unused_variables))] asked: bool) -> Result<Outcome, (String, Option<std::path::PathBuf>)> {
     #[cfg(windows)]
     if installed() {
         if super::service::installed() {
