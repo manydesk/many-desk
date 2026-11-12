@@ -488,7 +488,7 @@ pub fn spinner(ui: &mut Ui, stopped: bool) {
         return;
     }
     let a0 = (ui.input(|i| i.time) % 0.9) as f32 / 0.9 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2 - 0.78;
-    let pts: Vec<Pos2> = (0..=16).map(|i| c + Vec2::angled(a0 + i as f32 * 1.5708 / 16.0) * r).collect();
+    let pts: Vec<Pos2> = (0..=16).map(|i| c + Vec2::angled(a0 + i as f32 * std::f32::consts::FRAC_PI_2 / 16.0) * r).collect();
     ui.painter().add(egui::Shape::line(pts, Stroke::new(3.0, ACCENT)));
     ui.ctx().request_repaint();
 }

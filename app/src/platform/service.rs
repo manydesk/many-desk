@@ -244,9 +244,23 @@ pub fn uninstall() -> Result<(), String> {
     // the copy `install` made for a portable ManyDesk (the setup's files are its uninstaller's)
     if let Some(dir) = std::env::var_os("ProgramFiles").map(|p| std::path::PathBuf::from(p).join("ManyDesk")) {
         if !dir.join("Uninstall.exe").exists() && std::env::current_exe().is_ok_and(|e| !e.starts_with(&dir)) {
+            // the copy the service kept running in the user's session: without the service
+            // it has no reason to stay, and its file could not be removed while it runs
+            end_processes_of(&dir.join("ManyDesk.exe"));
             for f in ["ManyDesk.exe", "ManyDesk.old.exe"] {
                 let p = dir.join(f);
-                if p.exists() && std::fs::remove_file(&p).is_err() {
+                // Windows lets go of a just-ended program's file a moment later
+                let mut gone = !p.exists();
+                for _ in 0..20 {
+                    if gone {
+                        break;
+                    }
+                    gone = std::fs::remove_file(&p).is_ok();
+                    if !gone {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                }
+                if !gone {
                     // still running (the copy the service started): gone at the next restart
                     unsafe {
                         windows_sys::Win32::Storage::FileSystem::MoveFileExW(wide(&p.to_string_lossy()).as_ptr(), std::ptr::null(), windows_sys::Win32::Storage::FileSystem::MOVEFILE_DELAY_UNTIL_REBOOT);
@@ -258,6 +272,37 @@ pub fn uninstall() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Ends every process (but this one) whose program is `exe`, and waits for them to go.
+fn end_processes_of(exe: &std::path::Path) {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    let want = exe.to_string_lossy().to_lowercase();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snap, &mut e) != 0;
+        while more {
+            if e.th32ProcessID != GetCurrentProcessId() {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, e.th32ProcessID);
+                if !h.is_null() {
+                    let mut buf = [0u16; 1024];
+                    let mut len = buf.len() as u32;
+                    if QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0 && String::from_utf16_lossy(&buf[..len as usize]).to_lowercase() == want {
+                        TerminateProcess(h, 0);
+                        WaitForSingleObject(h, 5_000);
+                    }
+                    CloseHandle(h);
+                }
+            }
+            more = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
 }
 
 /// `install` / `uninstall` from the app: done here when it runs as an administrator,
