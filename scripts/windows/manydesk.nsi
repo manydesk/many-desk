@@ -100,7 +100,11 @@ Section "!${APP}" SecApp
   WriteRegStr HKLM "${UNINST}" "QuietUninstallString" '"$INSTDIR\Uninstall.exe" /S'
   WriteRegDWORD HKLM "${UNINST}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINST}" "NoRepair" 1
-  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  ; the app's size alone (a setup left in update\ by the service is not part of it)
+  FileOpen $3 "$INSTDIR\ManyDesk.exe" r
+  FileSeek $3 0 END $0
+  FileClose $3
+  IntOp $0 $0 / 1024
   IntFmt $0 "0x%08X" $0
   WriteRegDWORD HKLM "${UNINST}" "EstimatedSize" "$0"
 
