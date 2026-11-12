@@ -88,6 +88,20 @@ unsafe fn shared_event(name: &str) -> HANDLE {
     h
 }
 
+/// Setups an earlier update left in the install folder's update directory. The one that
+/// installed this version may still be finishing when the service starts: what cannot go
+/// now goes on a later try.
+fn remove_old_setups() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(entries) = std::fs::read_dir(exe.with_file_name("update")) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 /// The service's update: the newest release's setup, checked against its SHA256SUMS,
 /// downloaded into the install folder (only administrators can write there) and run
 /// silently. The setup stops this service, replaces the files and starts it again.
@@ -116,6 +130,7 @@ fn service_update() {
         }
         let dir = std::env::current_exe().map_err(|e| e.to_string())?.with_file_name("update");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        remove_old_setups();
         let setup = super::update::download(&u, &dir).await?;
         std::process::Command::new(&setup).arg("/S").spawn().map_err(|e| format!("start {}: {e}", setup.display()))?;
         Ok(format!("{cur} -> {}: {} started", u.version, setup.display()))
@@ -234,6 +249,14 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     let sas = shared_event(SAS_EVENT);
     let update = shared_event(UPDATE_EVENT);
     let updating = std::sync::Arc::new(AtomicBool::new(false));
+    // the setup of the last update, once it has finished (it starts this service as its
+    // last step, so give it a moment)
+    std::thread::spawn(|| {
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            remove_old_setups();
+        }
+    });
 
     let mut child: Option<HANDLE> = None;
     let mut last_session = 0xFFFF_FFFFu32;
