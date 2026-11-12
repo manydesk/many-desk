@@ -118,7 +118,7 @@ fn service_update() {
     let r: Result<String, String> = rt.block_on(async {
         // Test hook, in the service's Environment (registry, administrators only):
         // MANYDESK_UPDATE_SETUP=<setup.exe> runs that setup instead of the newest release's
-        if let Ok(setup) = std::env::var("MANYDESK_UPDATE_SETUP") {
+        if let Some(setup) = crate::unsafe_hook("MANYDESK_UPDATE_SETUP") {
             std::process::Command::new(&setup).arg("/S").spawn().map_err(|e| format!("start {setup}: {e}"))?;
             return Ok(format!("test setup {setup} started"));
         }
@@ -141,15 +141,45 @@ fn service_update() {
     }
 }
 
-pub fn install() -> Result<(), String> {
+/// Where the service's program lives: a folder only administrators can write to. The
+/// service runs as LocalSystem, so its file must not be one a standard user can replace —
+/// registering a portable copy in Downloads would hand SYSTEM to anyone who can write there.
+fn service_exe() -> Result<std::path::PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let cmd = format!("\"{}\" --service", exe.display());
+    let pf = std::env::var_os("ProgramFiles").map(std::path::PathBuf::from).ok_or("no Program Files")?;
+    if exe.starts_with(&pf) {
+        return Ok(exe); // installed by the setup (or already the service's copy)
+    }
+    let dir = pf.join("ManyDesk");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let target = dir.join("ManyDesk.exe");
+    // a running copy cannot be overwritten, but it can be renamed out of the way
+    if target.exists() && std::fs::copy(&exe, &target).is_err() {
+        let old = dir.join("ManyDesk.old.exe");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&target, &old).map_err(|e| e.to_string())?;
+    }
+    std::fs::copy(&exe, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+    Ok(target)
+}
+
+/// Registers and starts the service (as an administrator: see `install_elevated`). An
+/// existing registration is pointed at the protected copy too.
+pub fn install() -> Result<(), String> {
     unsafe {
         let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_ALL_ACCESS);
         if scm.is_null() {
             return Err("need administrator".into());
         }
-        let svc = CreateServiceW(
+        let exe = match service_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                CloseServiceHandle(scm);
+                return Err(e);
+            }
+        };
+        let cmd = wide(&format!("\"{}\" --service", exe.display()));
+        let mut svc = CreateServiceW(
             scm,
             wide(SERVICE_NAME).as_ptr(),
             wide("ManyDesk Remote Access").as_ptr(),
@@ -157,7 +187,7 @@ pub fn install() -> Result<(), String> {
             SERVICE_WIN32_OWN_PROCESS,
             SERVICE_AUTO_START,
             SERVICE_ERROR_NORMAL,
-            wide(&cmd).as_ptr(),
+            cmd.as_ptr(),
             std::ptr::null(),
             std::ptr::null_mut(),
             std::ptr::null(),
@@ -165,15 +195,33 @@ pub fn install() -> Result<(), String> {
             std::ptr::null(),
         );
         let err = GetLastError();
-        if !svc.is_null() {
-            StartServiceW(svc, 0, std::ptr::null());
-            CloseServiceHandle(svc);
+        if svc.is_null() && err == 1073 {
+            // ERROR_SERVICE_EXISTS: keep it, on the protected path
+            svc = OpenServiceW(scm, wide(SERVICE_NAME).as_ptr(), SERVICE_ALL_ACCESS);
+            if !svc.is_null() {
+                ChangeServiceConfigW(svc, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE, cmd.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null());
+            }
         }
-        CloseServiceHandle(scm);
-        if svc.is_null() && err != 1073 {
-            // 1073 = ERROR_SERVICE_EXISTS
+        if svc.is_null() {
+            CloseServiceHandle(scm);
             return Err(format!("CreateService failed ({err})"));
         }
+        // what it is, in the Services console
+        let mut text = wide("Keeps this computer reachable through ManyDesk when nobody is signed in, and installs ManyDesk updates.");
+        let desc = SERVICE_DESCRIPTIONW { lpDescription: text.as_mut_ptr() };
+        ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc as *const _ as *const _);
+        // a crash does not end unattended access: Windows starts it again (5 s, 5 s, 30 s;
+        // the count starts over after a day without one)
+        let mut actions = [
+            SC_ACTION { Type: SC_ACTION_RESTART, Delay: 5_000 },
+            SC_ACTION { Type: SC_ACTION_RESTART, Delay: 5_000 },
+            SC_ACTION { Type: SC_ACTION_RESTART, Delay: 30_000 },
+        ];
+        let fail = SERVICE_FAILURE_ACTIONSW { dwResetPeriod: 86_400, lpRebootMsg: std::ptr::null_mut(), lpCommand: std::ptr::null_mut(), cActions: actions.len() as u32, lpsaActions: actions.as_mut_ptr() };
+        ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fail as *const _ as *const _);
+        StartServiceW(svc, 0, std::ptr::null());
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
     }
     Ok(())
 }
@@ -193,7 +241,56 @@ pub fn uninstall() -> Result<(), String> {
         }
         CloseServiceHandle(scm);
     }
+    // the copy `install` made for a portable ManyDesk (the setup's files are its uninstaller's)
+    if let Some(dir) = std::env::var_os("ProgramFiles").map(|p| std::path::PathBuf::from(p).join("ManyDesk")) {
+        if !dir.join("Uninstall.exe").exists() && std::env::current_exe().is_ok_and(|e| !e.starts_with(&dir)) {
+            for f in ["ManyDesk.exe", "ManyDesk.old.exe"] {
+                let p = dir.join(f);
+                if p.exists() && std::fs::remove_file(&p).is_err() {
+                    // still running (the copy the service started): gone at the next restart
+                    unsafe {
+                        windows_sys::Win32::Storage::FileSystem::MoveFileExW(wide(&p.to_string_lossy()).as_ptr(), std::ptr::null(), windows_sys::Win32::Storage::FileSystem::MOVEFILE_DELAY_UNTIL_REBOOT);
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(dir.join("update"));
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
     Ok(())
+}
+
+/// `install` / `uninstall` from the app: done here when it runs as an administrator,
+/// otherwise in an elevated copy of itself after Windows asked the user (UAC). Blocks
+/// until that copy is done.
+pub fn change_elevated(install_it: bool) -> Result<(), String> {
+    let direct = if install_it { install() } else { uninstall() };
+    match direct {
+        Err(e) if e == "need administrator" => {}
+        other => return other,
+    }
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let (verb, file, params) = (wide("runas"), wide(&exe.to_string_lossy()), wide(if install_it { "--install-service" } else { "--uninstall-service" }));
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.lpParameters = params.as_ptr();
+        info.nShow = 0;
+        if ShellExecuteExW(&mut info) == 0 || info.hProcess.is_null() {
+            return Err("not approved".into());
+        }
+        WaitForSingleObject(info.hProcess, 60_000);
+        CloseHandle(info.hProcess);
+    }
+    if installed() == install_it {
+        Ok(())
+    } else {
+        Err("the service did not change".into())
+    }
 }
 
 pub fn installed() -> bool {

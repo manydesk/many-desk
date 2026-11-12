@@ -18,6 +18,8 @@ Packages are built by the scripts in `scripts/` (see the README's *Building from
 cd app && cargo test --release --lib
 ```
 
+Hooks that lower a host's guard (`MANYDESK_AUTOACCEPT`, `MANYDESK_AUTOFULL`, `MANYDESK_TESTACCEPT`, `MANYDESK_TESTGRANTTERM`, `MANYDESK_UPDATE_SETUP`) exist only in builds made with `cargo build --release --features test-hooks`; released packages ignore them.
+
 Most features involve two computers. Two copies can run on one machine with separate settings: `HOME=<dir>` on macOS and Linux, `MANYDESK_CONFIG_DIR=<dir>` on Windows. The README lists the environment variables that drive a session without a person at the keyboard.
 
 ## Guidelines

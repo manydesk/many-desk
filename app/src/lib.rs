@@ -42,6 +42,18 @@ pub fn version() -> String {
     format!("{} · build {}", env!("CARGO_PKG_VERSION"), env!("MANYDESK_BUILD"))
 }
 
+/// A test hook that lowers a host's guard — accepting every request, granting every
+/// permission, running a given setup as the service. It exists only in builds made with
+/// `--features test-hooks`: in a released ManyDesk an environment variable must not be
+/// able to open the computer to whoever connects.
+pub(crate) fn unsafe_hook(name: &str) -> Option<String> {
+    if cfg!(feature = "test-hooks") {
+        std::env::var(name).ok()
+    } else {
+        None
+    }
+}
+
 /// The desktop app (src/main.rs); Android starts at `android_main`, iOS at `manydesk_main`.
 pub fn run() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -94,6 +106,8 @@ pub fn run() -> eframe::Result<()> {
         Some(g) => Some(g),
         None => return Ok(()),
     };
+    #[cfg(target_os = "macos")]
+    platform::system::refresh_autostart();
     let _ = rustls::crypto::ring::default_provider().install_default();
     rt::handle(); // start the runtime before anything spawns
     platform::keep_responsive();

@@ -379,7 +379,7 @@ impl eframe::App for App {
                 self.core.connect(&id);
             }
         }
-        if self.core.pending.is_some() && std::env::var_os("MANYDESK_TESTACCEPT").is_some() {
+        if self.core.pending.is_some() && crate::unsafe_hook("MANYDESK_TESTACCEPT").is_some() {
             let perms = self.core.store.unattended.perms;
             self.core.decide(true, perms);
         }
@@ -556,7 +556,7 @@ impl App {
     /// The core's turn: events in, sessions forward (also from android's background tick).
     fn tick_core(&mut self) {
         self.core.tick(&self.rx);
-        if std::env::var_os("MANYDESK_TESTGRANTTERM").is_some() {
+        if crate::unsafe_hook("MANYDESK_TESTGRANTTERM").is_some() {
             if let Some(h) = self.core.hosts.iter().find(|h| h.state == crate::core::HostState::Live && !h.perms.terminal && h.live_for() > Duration::from_secs(8)) {
                 let (k, p) = (h.key, crate::store::Permissions { terminal: true, ..h.perms });
                 eprintln!("[test] host ticks Terminal");
@@ -564,11 +564,11 @@ impl App {
             }
         }
         // Test hook: accept requests even while the window is hidden (no ui pass then).
-        if self.core.pending.is_some() && std::env::var_os("MANYDESK_AUTOACCEPT").is_some() {
+        if self.core.pending.is_some() && crate::unsafe_hook("MANYDESK_AUTOACCEPT").is_some() {
             // tests may ask for every permission (restart, privacy, tunnel included)
-            let mut perms = if std::env::var_os("MANYDESK_AUTOFULL").is_some() { crate::store::Permissions::FULL } else { self.req_perms };
+            let mut perms = if crate::unsafe_hook("MANYDESK_AUTOFULL").is_some() { crate::store::Permissions::FULL } else { self.req_perms };
             // MANYDESK_TESTGRANTTERM=1: Terminal is off at first and ticked 8 s into the session
-            if std::env::var_os("MANYDESK_TESTGRANTTERM").is_some() {
+            if crate::unsafe_hook("MANYDESK_TESTGRANTTERM").is_some() {
                 perms.terminal = false;
             }
             self.core.decide(true, perms);
@@ -1830,26 +1830,25 @@ impl App {
                 let installed = _installed;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    // in a thread: Windows may ask the user first (UAC), and the elevated
+                    // copy takes a moment
+                    let change = |install: bool, slot: Arc<Mutex<(bool, bool)>>| {
+                        std::thread::spawn(move || match crate::platform::service::change_elevated(install) {
+                            Ok(()) => {
+                                slot.lock().unwrap().1 = install;
+                                bus::emit("toast", json!({ "text": t(if install { "start.svcInstalled" } else { "start.svcRemoved" }) }));
+                            }
+                            Err(e) => bus::emit("toast", json!({ "text": e, "error": true })),
+                        });
+                    };
                     if installed {
                         if th::btn(ui, &t("start.svcRemove"), Btn::Normal).clicked() {
-                            match crate::platform::service::uninstall() {
-                                Ok(()) => {
-                                    self.startup.lock().unwrap().1 = false;
-                                    self.core.toast(t("start.svcRemoved"), false)
-                                }
-                                Err(e) => self.core.toast(e, true),
-                            }
+                            change(false, self.startup.clone());
                         }
                         th::dot(ui, th::OK);
                         ui.label(text(t("start.svcOn"), 13.0, W::Regular, th::MUTED));
                     } else if th::btn(ui, &t("start.svcInstall"), Btn::Primary).clicked() {
-                        match crate::platform::service::install() {
-                            Ok(()) => {
-                                self.startup.lock().unwrap().1 = true;
-                                self.core.toast(t("start.svcInstalled"), false)
-                            }
-                            Err(e) => self.core.toast(e, true),
-                        }
+                        change(true, self.startup.clone());
                     }
                 });
                 th::hint(ui, &t("start.svcHint"));

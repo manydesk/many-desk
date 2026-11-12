@@ -144,26 +144,11 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     {
         let path = agent_path().ok_or("no home")?;
         if !on {
-            let _ = run("launchctl", &["bootout", &format!("gui/{}", unsafe { libc_getuid() }), &path.to_string_lossy()]);
+            // The file alone: launchd forgets the agent at the next sign-in. (Unloading it
+            // now would end this very process when launchd started it.)
             return std::fs::remove_file(&path).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }).map_err(|e| e.to_string());
         }
-        // Inside an .app the bundle is launched (so macOS keeps one instance and the
-        // permissions granted to it); a bare binary is started directly.
-        let args = match exe.find(".app/Contents/MacOS/") {
-            Some(i) => format!("<string>/usr/bin/open</string><string>-g</string><string>{}</string><string>--args</string><string>--background</string>", xml(&exe[..i + 4])),
-            None => format!("<string>{}</string><string>--background</string>", xml(&exe)),
-        };
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>az.manydesk.native</string>
-  <key>ProgramArguments</key><array>{args}</array>
-  <key>RunAtLoad</key><true/>
-  <key>LimitLoadToSessionType</key><string>Aqua</string>
-</dict></plist>
-"#
-        );
+        let plist = agent_plist(&exe);
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
@@ -193,15 +178,47 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     }
 }
 
+/// The launch agent: launchd starts ManyDesk in the background at sign-in and again if it
+/// crashes (KeepAlive, unless it quit cleanly — the user's Quit, or an update that starts
+/// the new version itself). The program is the bundle's own executable, so macOS shows it
+/// as ManyDesk under Login Items (AssociatedBundleIdentifiers) and the permissions granted
+/// to the app apply.
 #[cfg(target_os = "macos")]
-fn xml(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+fn agent_plist(exe: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>az.manydesk.native</string>
+  <key>ProgramArguments</key><array><string>{}</string><string>--background</string></array>
+  <key>AssociatedBundleIdentifiers</key><array><string>az.manydesk.native</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict></plist>
+"#,
+        xml(exe)
+    )
+}
+
+/// An agent written by an older version (or for the app at another place) is brought up
+/// to date; it takes effect at the next sign-in.
+#[cfg(target_os = "macos")]
+pub fn refresh_autostart() {
+    let (Some(path), Some(exe)) = (agent_path(), exe()) else { return };
+    // only the agent of this very app (not one that starts a copy somewhere else)
+    let Some(bundle) = exe.find(".app/Contents/MacOS/").map(|i| &exe[..i + 4]) else { return };
+    if let Ok(old) = std::fs::read_to_string(&path) {
+        let new = agent_plist(&exe);
+        if old != new && old.contains(&xml(bundle)) {
+            let _ = std::fs::write(&path, new);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn libc_getuid() -> u32 {
-    extern "C" {
-        fn getuid() -> u32;
-    }
-    getuid()
+fn xml(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
