@@ -58,7 +58,7 @@ vt100 = "0.16"
 eframe = { version = "0.37", default-features = false, features = ["clipboard"] }
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 xcap = "0.9"
-rfd = "0.15"
+rfd = "0.18"
 # Wake-on-LAN: this computer's network cards (lan.rs)
 mac_address = "1"
 # the remote terminal's shell (host side): a PTY, ConPTY on Windows
