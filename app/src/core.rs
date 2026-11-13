@@ -364,6 +364,8 @@ pub enum HostState {
 }
 
 pub struct Host {
+    /// the viewer's receive rate (bits/s) and when it said so
+    rx_rate: Option<(f64, Instant)>,
     pub key: u32,
     pub req: Request,
     pub perms: Permissions,
@@ -1497,6 +1499,7 @@ impl Core {
             rv.publish(&r.reply, &rv::seal(&r.key, &obj)).await;
         });
         self.hosts.push(Host {
+            rx_rate: None,
             key,
             req,
             perms: if hold { Permissions::NONE } else { perms },
@@ -2123,6 +2126,7 @@ impl Core {
                     self.apply_quality(i);
                 }
             }
+            Some("rate") => self.hosts[i].rx_rate = m["bps"].as_f64().filter(|b| b.is_finite() && *b >= 0.0).map(|b| (b, Instant::now())),
             Some("view") => {
                 self.hosts[i].quality.set_view(m["w"].as_f64().unwrap_or(0.0), m["h"].as_f64().unwrap_or(0.0));
                 self.apply_quality(i);
@@ -2765,7 +2769,15 @@ impl Core {
             let tab = &mut self.tabs[i];
             let (fps, size, dec) = tab.feed.as_ref().map(|f| (f.shared.fps(), *f.shared.size.lock().unwrap(), *f.shared.decoder.lock().unwrap())).unwrap_or_default();
             let recv = st["recv"].as_u64().unwrap_or(0);
+            // What actually arrived here, for the host's quality control: only the receiving
+            // end knows what a slow link carried (the sender counts bytes before they are
+            // lost or queued). Older hosts ignore the message.
+            let rate = tab.stats_prev.map(|(b, at)| recv.saturating_sub(b) as f64 * 8.0 / now.duration_since(at).as_secs_f64().max(0.1));
+            let sid = tab.sid;
             tab.stats = fmt_stats(&st, recv, &mut tab.stats_prev, fps, size, dec);
+            if let Some(bps) = rate {
+                self.ctl(sid, json!({ "t": "rate", "bps": bps.round() }));
+            }
         }
         for i in 0..self.hosts.len() {
             if self.hosts[i].state != HostState::Live {
@@ -2775,7 +2787,9 @@ impl Core {
             if now.duration_since(self.hosts[i].last_tick) >= Duration::from_secs(2) {
                 self.hosts[i].last_tick = now;
                 let st = s.stats();
-                if self.hosts[i].quality.tick(&st["video"], st["rtt"].as_f64().unwrap_or(0.0), st["cwnd"].as_f64().unwrap_or(0.0)) {
+                // a fresh report from the viewer, or 0: not known (an older viewer)
+                let carried = self.hosts[i].rx_rate.filter(|(_, at)| at.elapsed() < Duration::from_secs(5)).map_or(0.0, |(b, _)| b);
+                if self.hosts[i].quality.tick(&st["video"], st["rtt"].as_f64().unwrap_or(0.0), st["cwnd"].as_f64().unwrap_or(0.0), carried) {
                     self.apply_quality(i);
                 }
                 let h = &mut self.hosts[i];

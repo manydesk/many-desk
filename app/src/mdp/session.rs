@@ -214,6 +214,8 @@ struct QuicSink {
     pending: Arc<Mutex<BTreeMap<u32, Instant>>>,
     /// when the encoder last got the go-ahead (see `congested`)
     last_go: Mutex<Instant>,
+    /// a keyframe is on its way (set and cleared by the sender task)
+    key_busy: Arc<AtomicBool>,
 }
 
 /// However backed up the path looks, a frame goes at least this often: the picture never
@@ -250,7 +252,17 @@ impl Sink for QuicSink {
         let chan = self.tx.capacity() == 0;
         // Jitter (Wi-Fi) delays single frames by about a round trip; only a backlog beyond
         // that and BACKLOG means the path can't keep up.
-        let back = backlog(&self.pending, &self.conn) > BACKLOG.max(self.conn.rtt());
+        let behind = backlog(&self.pending, &self.conn);
+        // No frame at all while a keyframe is still on its way, or while the path is so far
+        // behind that a frame would be dropped: on a slow link a forced frame was dropped,
+        // which asked for a keyframe, whose size backed the path up again — every frame a
+        // keyframe, two a second at best. Waiting costs nothing: nothing sent now could be
+        // shown before what is already on its way.
+        if self.key_busy.load(Ordering::Relaxed) || behind > BACKLOG_DROP {
+            crate::perf::tick(if behind > BACKLOG_DROP { "cong-far-behind" } else { "cong-keyframe" });
+            return true;
+        }
+        let back = behind > BACKLOG.max(self.conn.rtt());
         let mut last = self.last_go.lock().unwrap();
         if (chan || back) && last.elapsed() < MIN_FRAME_GAP {
             crate::perf::tick(if chan { "cong-channel" } else { "cong-backlog" });
@@ -264,7 +276,8 @@ impl Sink for QuicSink {
 fn start_video_sender(me: Arc<Session>, conn: quinn::Connection, video: Arc<Video>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<EncodedFrame>(2);
     let pending: Arc<Mutex<BTreeMap<u32, Instant>>> = Default::default();
-    let sink: Arc<dyn Sink> = Arc::new(QuicSink { tx, conn: conn.clone(), pending: pending.clone(), last_go: Mutex::new(Instant::now()) });
+    let key_busy = Arc::new(AtomicBool::new(false));
+    let sink: Arc<dyn Sink> = Arc::new(QuicSink { tx, conn: conn.clone(), pending: pending.clone(), last_go: Mutex::new(Instant::now()), key_busy: key_busy.clone() });
     *me.sink.lock().unwrap() = Some(sink.clone());
     video.start(sink);
     // MANYDESK_PERF: what actually goes out on the wire (QUIC, all streams), per second.
@@ -319,7 +332,9 @@ fn start_video_sender(me: Arc<Session>, conn: quinn::Connection, video: Arc<Vide
             let key = f.key;
             if key {
                 *me.key_in_flight.lock().unwrap() = Some(Instant::now());
+                key_busy.store(true, Ordering::Relaxed);
             }
+            let kb = key_busy.clone();
             let give_up = FRAME_GIVE_UP.max(Duration::from_secs_f64(f.data.len() as f64 * 8.0 / GIVE_UP_RATE));
             let me2 = me.clone();
             crate::rt::spawn(async move {
@@ -342,8 +357,10 @@ fn start_video_sender(me: Arc<Session>, conn: quinn::Connection, video: Arc<Vide
                     }
                 };
                 if key {
-                    send.await;
+                    // (bounded: should it never arrive, frames flow again and the viewer asks anew)
+                    let _ = tokio::time::timeout(KEY_WAIT, send).await;
                     *me2.key_in_flight.lock().unwrap() = None;
+                    kb.store(false, Ordering::Relaxed);
                 } else if tokio::time::timeout(give_up, send).await.is_err() {
                     // never delivered: give it up (the viewer resyncs on the next keyframe)
                     crate::perf::tick("host-frame-given-up");
@@ -917,6 +934,7 @@ impl Session {
             out["rtt"] = json!(cs.path.rtt.as_secs_f64() * 1000.0);
             out["cwnd"] = json!(cs.path.cwnd);
             out["lost"] = json!(cs.path.lost_packets);
+            out["lostBytes"] = json!(cs.path.lost_bytes);
             out["sent"] = json!(cs.udp_tx.bytes);
             out["recv"] = json!(cs.udp_rx.bytes);
         }

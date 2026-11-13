@@ -101,7 +101,12 @@ fn transport() -> Arc<quinn::TransportConfig> {
     t.max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()));
     t.keep_alive_interval(Some(Duration::from_secs(3)));
     // BBR: paces by measured bandwidth instead of filling buffers (lower latency for video).
-    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // MANYDESK_CC=cubic|newreno: another congestion controller (comparison on weak links)
+    match std::env::var("MANYDESK_CC").as_deref() {
+        Ok("cubic") => t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+        Ok("newreno") => t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default())),
+        _ => t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+    };
     t.max_concurrent_uni_streams(1024u32.into());
     t.stream_receive_window((16u32 << 20).into());
     t.receive_window((64u32 << 20).into());

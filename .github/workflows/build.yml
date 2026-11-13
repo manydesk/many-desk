@@ -82,6 +82,11 @@ jobs:
       - name: Tests
         working-directory: app
         run: cargo test --release --lib
+      # clippy's deny-by-default lints (likely bugs) fail the build; its warnings are shown
+      - name: Lint
+        if: matrix.arch == 'amd64'
+        working-directory: app
+        run: cargo clippy --release --lib
       - name: Package
         run: MANYDESK_LINUX_NATIVE=1 bash scripts/package-native.sh linux
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
