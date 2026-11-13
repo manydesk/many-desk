@@ -102,7 +102,7 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Media
 [target.'cfg(target_os = "linux")'.dependencies]
 gstreamer = "0.23"
 gstreamer-app = "0.23"
-x11rb = { version = "0.13", features = ["shm", "xtest", "xfixes", "randr"] }
+x11rb = { version = "0.14", features = ["shm", "xtest", "xfixes", "randr"] }
 libc = "0.2"
 
 [profile.release]
