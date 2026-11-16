@@ -96,9 +96,21 @@ pub struct Quality {
     /// the cap's size steps in use, and the cap above which the picture may grow again
     cap_steps: f64,
     cap_grow_at: f64,
+    /// limited ticks in a row (the first cap needs two: one dropped frame on a fast link
+    /// is not a slow link)
+    cap_bad: u32,
+    /// calm ticks in a row with the cap unused (a still screen)
+    cap_idle: u32,
+    /// what the link carried when it last choked: an unused cap climbs to twice that at most
+    choked_at: f64,
 }
 
 const CAP_WAIT: u32 = 3;
+/// Calm ticks with the cap unused before it is tried a step higher anyway: a choke reads
+/// the link low, and a screen that barely moves never fills the cap to prove it wrong.
+const CAP_IDLE: u32 = 5;
+/// An unused cap climbs to this much over what the link carried when it last choked.
+const CAP_IDLE_MAX: f64 = 2.0;
 const CAP_WAIT_MAX: u32 = 30;
 /// One try upward: an eighth more.
 const CAP_STEP: f64 = 1.125;
@@ -126,7 +138,7 @@ const CALM_MAX: Duration = Duration::from_secs(60);
 
 impl Quality {
     pub fn new() -> Self {
-        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0 }
+        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0, cap_bad: 0, cap_idle: 0, choked_at: 0.0 }
     }
 
     pub fn set_mode(&mut self, m: Mode) {
@@ -175,13 +187,14 @@ impl Quality {
             // cross the link in some 3 s — a full-size one takes 16 s at 100 kbit/s.
             let pixels = (sw / scale) * (sh / scale);
             let fit = cap * KEY_SECS / (KEY_BYTES_PER_PIXEL * 8.0);
-            if pixels > fit {
+            // (a little over is fine: a quarter fewer pixels for a few per cent would be a bad deal)
+            if pixels > fit * 1.15 {
                 scale *= (pixels / fit).sqrt().min(4.0);
             }
             // Sizes in steps of a quarter: a new size means a new encoder and a keyframe,
             // which a cap that moves a little every tick must not cause.
             let base = fit0 * q.extra * ls * self.cpu_scale;
-            let mut steps = ((scale / base).ln() / 1.25f64.ln()).ceil().max(0.0);
+            let mut steps = ((scale / base).ln() / 1.25f64.ln() - 0.2).ceil().max(0.0);
             // Smaller at once, larger only with clear room (the cap two steps up): a
             // picture that grows and shrinks around one size pays a keyframe each time.
             if steps < self.cap_steps && cap < self.cap_grow_at {
@@ -320,8 +333,14 @@ impl Quality {
         }
         let capacity = self.carried.iter().copied().fold(0.0, f64::max);
         self.since_raise = self.since_raise.saturating_add(1);
-        if reason == "bandwidth" && capacity > 0.0 {
+        self.cap_bad = if reason == "bandwidth" { self.cap_bad + 1 } else { 0 };
+        if reason != "none" {
+            self.cap_idle = 0;
+        }
+        // the first cap after two limited ticks in a row; an existing one follows at once
+        if reason == "bandwidth" && capacity > 0.0 && (self.cap.is_some() || self.cap_bad >= 2) {
             self.cap_good = 0;
+            self.choked_at = capacity;
             if self.since_raise <= 3 {
                 // the try upward did not hold: wait longer before the next
                 self.cap_wait = (self.cap_wait * 2).min(CAP_WAIT_MAX);
@@ -336,14 +355,26 @@ impl Quality {
             if self.since_raise == 4 {
                 self.cap_wait = CAP_WAIT; // it held
             }
-            // A try upward only when the picture uses the cap: a screen that sends far less
-            // (little moving) says nothing about the link, and the cap would climb past it
-            // until the next busy moment chokes the link.
+            // A try upward every few ticks while the picture uses the cap; a screen that sends
+            // far less (little moving) says little about the link: the cap climbs slower then,
+            // and only so far, or it would climb past the link until a busy moment chokes it.
             let used = goodput >= self.cap.unwrap_or(0.0) * 0.75;
-            if let Some(c) = self.cap.filter(|_| used) {
-                self.cap_good += 1;
-                if self.cap_good >= self.cap_wait {
+            if let Some(c) = self.cap {
+                let raise = if used {
+                    self.cap_idle = 0;
+                    self.cap_good += 1;
+                    self.cap_good >= self.cap_wait
+                } else {
+                    // Unused, it still climbs, slowly and only so far above the last choke:
+                    // the choke may have read the link far too low (the picture would stay
+                    // small and slow on a still screen for good), while a link that really
+                    // is that slow chokes once more, briefly, when the screen gets busy.
+                    self.cap_idle += 1;
+                    self.cap_idle >= CAP_IDLE.max(self.cap_wait) && c * CAP_STEP <= self.choked_at * CAP_IDLE_MAX
+                };
+                if raise {
                     self.cap_good = 0;
+                    self.cap_idle = 0;
                     self.since_raise = 0;
                     let up = c * CAP_STEP;
                     self.cap = if up > preset(self.mode).max_br * 2.5 { None } else { Some(up) };
@@ -458,7 +489,10 @@ mod tests {
         assert!(start > 3_000_000);
         q.tick(&stats(30, "none"), 80.0, 1e5, 3e6);
         q.carried.clear();
-        // the viewer reports 1 Mbit/s arriving while the encoder asks for 4+
+        // the viewer reports 1 Mbit/s arriving while the encoder asks for 4+: one limited
+        // tick could be a lone dropped frame, the second sets the cap
+        q.tick(&stats(45, "bandwidth"), 80.0, 1e5, 1e6);
+        assert!(q.cap.is_none());
         assert!(q.tick(&stats(60, "bandwidth"), 80.0, 1e5, 1e6));
         let (scale, fps, bitrate) = q.params((1920, 1080)).unwrap();
         assert_eq!(bitrate, 800_000);
@@ -483,11 +517,44 @@ mod tests {
         q.set_view(1920.0, 1080.0);
         q.params((1920, 1080));
         q.tick(&stats(30, "none"), 400.0, 1e4, 0.0);
+        q.tick(&stats(35, "bandwidth"), 400.0, 1e4, 1e5);
         q.tick(&stats(40, "bandwidth"), 400.0, 1e4, 1e5);
         let (scale, fps, bitrate) = q.params((1920, 1080)).unwrap();
         assert_eq!(bitrate, 80_000);
         assert_eq!(fps, 5.0);
         assert!(scale > 1.5 && scale <= 6.0, "{scale}");
+    }
+
+    #[test]
+    fn a_lone_drop_on_a_fast_link_sets_no_cap() {
+        let mut q = Quality::new();
+        q.set_view(1920.0, 1080.0);
+        q.params((1920, 1080));
+        q.tick(&stats(30, "none"), 20.0, 1e6, 3e5); // a still screen: little goes out
+        q.tick(&stats(60, "bandwidth"), 20.0, 1e6, 3e5);
+        q.tick(&stats(90, "none"), 20.0, 1e6, 3e5);
+        assert!(q.cap.is_none());
+    }
+
+    #[test]
+    fn a_still_screen_does_not_keep_a_low_cap() {
+        let mut q = Quality::new();
+        q.set_view(1675.0, 1088.0);
+        q.params((1675, 1088));
+        q.tick(&stats(30, "none"), 80.0, 3e4, 0.0);
+        // a choke that read the link low (580 kbit/s on a 1 Mbit/s link)
+        q.tick(&stats(40, "bandwidth"), 80.0, 3e4, 5.8e5);
+        q.tick(&stats(50, "bandwidth"), 80.0, 3e4, 5.8e5);
+        let low = q.cap.unwrap();
+        let (scale, _, _) = q.params((1675, 1088)).unwrap();
+        assert_eq!(scale, 1.0, "a keyframe a little over the budget keeps the full size");
+        // then a still screen: 50 kbit/s for a minute
+        for i in 0..30 {
+            q.tick(&stats(60 + i, "none"), 80.0, 3e4, 5e4);
+        }
+        let c = q.cap.unwrap();
+        assert!(c > low * 1.5, "{low} → {c}");
+        assert!(c <= 5.8e5 * CAP_IDLE_MAX, "{c}");
     }
 
     #[test]
