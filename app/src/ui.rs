@@ -350,10 +350,12 @@ impl App {
 }
 
 impl eframe::App for App {
-    /// Transparent background, for the host overlay window (the main window paints
-    /// every pixel with its panels anyway).
+    /// Opaque: the app's own background. (The host overlay is an immediate viewport, which
+    /// eframe always clears transparent.) A transparent clear showed the desktop through
+    /// the main window wherever a frame had not painted yet — on Windows, for a moment while
+    /// the window was dragged to a monitor with another scale and changed size.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0; 4]
+        th::BG.to_normalized_gamma_f32()
     }
 
     /// Test hooks: MANYDESK_TESTCOPY=<text> copies it once the window is up (as "copy my
@@ -2143,7 +2145,11 @@ impl App {
             // The host's pointer, sent apart from the picture (macOS and Windows hosts). In
             // control, its shape follows our own pointer with no delay (as AnyDesk does);
             // watching, it sits where the host says.
-            let local = ctx.input(|i| i.pointer.hover_pos()).filter(|p| capturing && stage.contains(*p));
+            // the pointer is on the remote screen itself: inside the stage and not over
+            // something drawn above it (the floating toolbar, a camera window, a menu)
+            let stage_layer = ui.layer_id();
+            let over_stage = |p: &Pos2| stage.contains(*p) && ctx.layer_id_at(*p).is_none_or(|l| l == stage_layer);
+            let local = ctx.input(|i| i.pointer.hover_pos()).filter(|p| capturing && over_stage(p));
             let remote = self.core.tabs[i].pointer.map(|(x, y)| rect.min + Vec2::new(x * rect.width(), y * rect.height()));
             let shown_at = if capturing { local } else { remote };
             let display_w = native.map(|n| n.x).unwrap_or(pic_size.x);
@@ -2226,9 +2232,12 @@ impl App {
             if capturing {
                 // The local pointer: the host's pointer shape where it is (above); a small
                 // dot that moves instantly when the host does not send its shape.
-                ctx.set_cursor_icon(egui::CursorIcon::None);
+                // only there: over the toolbar, the chat or another tab it is the usual pointer
+                if local.is_some() {
+                    ctx.set_cursor_icon(egui::CursorIcon::None);
+                }
                 if !cursor_drawn {
-                    if let Some(p) = ctx.input(|i| i.pointer.hover_pos()).filter(|p| stage.contains(*p)) {
+                    if let Some(p) = local {
                         ui.painter().circle(p, 3.5, Color32::WHITE, Stroke::new(1.5, Color32::from_black_alpha(153)));
                     }
                 }
