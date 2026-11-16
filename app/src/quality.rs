@@ -101,16 +101,19 @@ pub struct Quality {
     cap_bad: u32,
     /// calm ticks in a row with the cap unused (a still screen)
     cap_idle: u32,
-    /// what the link carried when it last choked: an unused cap climbs to twice that at most
+    /// what the link carried when it last choked: an unused cap climbs a little past that at most
     choked_at: f64,
+    /// ticks since the cap was last cut
+    since_cut: u32,
 }
 
 const CAP_WAIT: u32 = 3;
 /// Calm ticks with the cap unused before it is tried a step higher anyway: a choke reads
 /// the link low, and a screen that barely moves never fills the cap to prove it wrong.
 const CAP_IDLE: u32 = 5;
-/// An unused cap climbs to this much over what the link carried when it last choked.
-const CAP_IDLE_MAX: f64 = 2.0;
+/// An unused cap climbs to this much of what the link carried when it last choked (the cap
+/// itself sits at 80 % of it).
+const CAP_IDLE_MAX: f64 = 1.25;
 const CAP_WAIT_MAX: u32 = 30;
 /// One try upward: an eighth more.
 const CAP_STEP: f64 = 1.125;
@@ -138,7 +141,7 @@ const CALM_MAX: Duration = Duration::from_secs(60);
 
 impl Quality {
     pub fn new() -> Self {
-        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0, cap_bad: 0, cap_idle: 0, choked_at: 0.0 }
+        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0, cap_bad: 0, cap_idle: 0, choked_at: 0.0, since_cut: u32::MAX }
     }
 
     pub fn set_mode(&mut self, m: Mode) {
@@ -333,6 +336,7 @@ impl Quality {
         }
         let capacity = self.carried.iter().copied().fold(0.0, f64::max);
         self.since_raise = self.since_raise.saturating_add(1);
+        self.since_cut = self.since_cut.saturating_add(1);
         self.cap_bad = if reason == "bandwidth" { self.cap_bad + 1 } else { 0 };
         if reason != "none" {
             self.cap_idle = 0;
@@ -348,9 +352,13 @@ impl Quality {
             }
             // down to what the link carried, but at most to 60 % of the cap in one step: a
             // choke reads low (the queue drains while frames wait), and a deep cut shrinks
-            // the picture, whose new size costs a keyframe
+            // the picture, whose new size costs a keyframe. Right after a cut the queue is
+            // still draining: the ticks just after it read lower still and would cut again.
             let seen = (capacity * CAP_SHARE).max(CAP_FLOOR);
-            self.cap = Some(self.cap.map_or(seen, |c| seen.min(c).max(c * 0.6)));
+            if self.cap.is_none() || self.since_cut > 2 {
+                self.cap = Some(self.cap.map_or(seen, |c| seen.min(c).max(c * 0.6)));
+                self.since_cut = 0;
+            }
         } else if reason == "none" {
             if self.since_raise == 4 {
                 self.cap_wait = CAP_WAIT; // it held
@@ -553,7 +561,7 @@ mod tests {
             q.tick(&stats(60 + i, "none"), 80.0, 3e4, 5e4);
         }
         let c = q.cap.unwrap();
-        assert!(c > low * 1.5, "{low} → {c}");
+        assert!(c > low * 1.3, "{low} → {c}");
         assert!(c <= 5.8e5 * CAP_IDLE_MAX, "{c}");
     }
 
