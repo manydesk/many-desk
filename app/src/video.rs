@@ -354,7 +354,7 @@ fn run(rx: Receiver<(bool, Vec<u8>)>, sh: Arc<Shared>, ask_key: impl Fn(), camer
                 sh.times.lock().unwrap().push(Instant::now());
                 crate::perf::add("decode", t1 - t0);
                 crate::perf::add("handoff", t1.elapsed());
-                crate::bus::wake();
+                crate::bus::wake_once();
             }
             Ok(None) => {}
             Err(_) => {

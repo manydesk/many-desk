@@ -1049,6 +1049,9 @@ impl Core {
             return;
         }
         tab.sent_view = (w, h);
+        if std::env::var_os("MANYDESK_PERF").is_some() {
+            eprintln!("[view] stage {w}x{h} sent");
+        }
         let sid = tab.sid;
         self.ctl(sid, json!({ "t": "view", "w": w, "h": h }));
     }

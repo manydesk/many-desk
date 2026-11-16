@@ -319,6 +319,13 @@ impl Video {
                     ep.bitrate = p.bitrate;
                 }
             }
+            // Bitrate and frame rate change in place on OpenH264 too (a new encoder would
+            // start with a keyframe).
+            if let Some((H264::Open(e), ep, w, h)) = &mut enc {
+                if *w == dw && *h == dh && ep.scale == p.scale && (ep.fps != p.fps || ep.bitrate != p.bitrate) && super::openh264_retune(e, p.fps, p.bitrate) {
+                    *ep = p;
+                }
+            }
             if !matches!(&enc, Some((_, ep, w, h)) if *ep == p && *w == dw && *h == dh) {
                 enc = None;
                 #[cfg(windows)]

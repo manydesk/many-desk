@@ -163,6 +163,11 @@ impl MfEncoder {
         }
     }
 
+    /// The frame rate it was made with.
+    pub fn fps(&self) -> f64 {
+        self.fps
+    }
+
     pub fn set_bitrate(&self, bitrate: u32) {
         if let Some(c) = &self.codec {
             unsafe {

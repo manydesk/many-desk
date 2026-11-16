@@ -327,12 +327,20 @@ impl Quality {
                 self.cap_wait = (self.cap_wait * 2).min(CAP_WAIT_MAX);
                 self.since_raise = u32::MAX;
             }
-            self.cap = Some((capacity * CAP_SHARE).max(CAP_FLOOR));
+            // down to what the link carried, but at most to 60 % of the cap in one step: a
+            // choke reads low (the queue drains while frames wait), and a deep cut shrinks
+            // the picture, whose new size costs a keyframe
+            let seen = (capacity * CAP_SHARE).max(CAP_FLOOR);
+            self.cap = Some(self.cap.map_or(seen, |c| seen.min(c).max(c * 0.6)));
         } else if reason == "none" {
             if self.since_raise == 4 {
                 self.cap_wait = CAP_WAIT; // it held
             }
-            if let Some(c) = self.cap {
+            // A try upward only when the picture uses the cap: a screen that sends far less
+            // (little moving) says nothing about the link, and the cap would climb past it
+            // until the next busy moment chokes the link.
+            let used = goodput >= self.cap.unwrap_or(0.0) * 0.75;
+            if let Some(c) = self.cap.filter(|_| used) {
                 self.cap_good += 1;
                 if self.cap_good >= self.cap_wait {
                     self.cap_good = 0;

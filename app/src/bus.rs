@@ -33,6 +33,15 @@ pub fn wake() {
     }
 }
 
+/// One pass, now: for a new video picture. (egui answers `request_repaint` with two passes,
+/// so things settle after a change — at 60 pictures a second that drew every one twice.
+/// A request with any delay is answered with one.)
+pub fn wake_once() {
+    if let Some(c) = WAKE.get() {
+        c.request_repaint_after(std::time::Duration::from_nanos(1));
+    }
+}
+
 pub fn emit(name: &'static str, v: Value) {
     if let Some(tx) = TX.get() {
         let _ = tx.lock().unwrap().send(Msg::Event(name, v));
