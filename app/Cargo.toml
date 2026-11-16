@@ -1,6 +1,6 @@
 [package]
 name = "manydesk"
-version = "0.25.1"
+version = "0.25.2"
 edition = "2021"
 description = "ManyDesk — native remote desktop (egui UI, MDP transport)"
 license = "Apache-2.0"
@@ -42,6 +42,8 @@ if-addrs = "0.13"
 socket2 = { version = "0.6", features = ["all"] }
 bytes = "1"
 openh264 = "0.9"
+# the raw option ids and structs, to change the bitrate and frame rate of a running encoder
+openh264-sys2 = { version = "0.9", default-features = false }
 resvg = { version = "0.45", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cpal = "0.18"

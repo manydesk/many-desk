@@ -384,15 +384,23 @@ pub fn run(video: Arc<Video>, sink: Arc<dyn Sink>) -> Result<(), String> {
         }
         // a new encoder for a new size or frame rate; the bitrate alone changes in place on
         // the hardware one
+        // A new encoder (and with it a keyframe) only for a new size. The hardware encoder
+        // keeps the frame rate it was made with: the bitrate is scaled so each frame gets the
+        // bits it should at the new rate. OpenH264 takes both in place.
         let need = match &mut enc {
-            Some((Enc::Hardware(m), ep, d)) if *d == dst && ep.fps == p.fps => {
-                if ep.bitrate != p.bitrate {
-                    m.set_bitrate(p.bitrate);
-                    ep.bitrate = p.bitrate;
+            Some((Enc::Hardware(m), ep, d)) if *d == dst => {
+                if ep.bitrate != p.bitrate || ep.fps != p.fps {
+                    m.set_bitrate((p.bitrate as f64 * m.fps() / p.fps.max(1.0)) as u32);
+                    (ep.bitrate, ep.fps) = (p.bitrate, p.fps);
                 }
                 false
             }
-            Some((Enc::Software(..), ep, d)) => *d != dst || ep.fps != p.fps || ep.bitrate != p.bitrate,
+            Some((Enc::Software(e, _), ep, d)) if *d == dst => {
+                if (ep.fps != p.fps || ep.bitrate != p.bitrate) && super::openh264_retune(e, p.fps, p.bitrate) {
+                    (ep.bitrate, ep.fps) = (p.bitrate, p.fps);
+                }
+                ep.fps != p.fps || ep.bitrate != p.bitrate
+            }
             _ => true,
         };
         let mut force = force;
