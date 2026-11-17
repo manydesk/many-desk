@@ -1,5 +1,6 @@
 # Build output (rebuilt by cargo / scripts/*.sh)
 target/
+target-old/
 build/
 dist-native/
 
