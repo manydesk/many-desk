@@ -2241,7 +2241,7 @@ impl App {
                         ui.painter().circle(p, 3.5, Color32::WHITE, Stroke::new(1.5, Color32::from_black_alpha(153)));
                     }
                 }
-                self.forward_input(&ctx, key, rect, rect.intersect(stage));
+                self.forward_input(&ctx, key, rect, rect.intersect(stage), stage_layer);
             }
             self.fs_toolbar(&ctx, stage, key);
             self.session_fab(ui, stage, key);
@@ -2259,6 +2259,12 @@ impl App {
         }
         if self.tb_hide_at.is_some_and(|t| Instant::now() < t) {
             self.floating_toolbar(ctx, stage, key);
+            // A menu of the bar is open (the pointer went down into it): the bar stays, or the
+            // menu would go with it 0.7 s later — a menu not drawn in a frame is closed.
+            if egui::Popup::is_any_open(ctx) {
+                self.tb_hide_at = Some(Instant::now() + Duration::from_millis(700));
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
         }
     }
 
@@ -2551,7 +2557,8 @@ impl App {
                     }
                 }
                 let r = th::tbbtn(ui, &self.icons, "more", privacy_on || board_on, false, &t("tt.actions"));
-                egui::Popup::menu(&r).show(|ui| self.actions_menu(ui, key));
+                let room = ui.ctx().content_rect().bottom() - r.rect.bottom() - 8.0;
+                egui::Popup::menu(&r).show(|ui| self.actions_menu(ui, key, room));
                 if th::tbbtn(ui, &self.icons, if self.fullscreen { "shrink" } else { "expand" }, false, false, &t("tt.fs")).clicked() {
                     self.fullscreen = !self.fullscreen;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
@@ -2611,7 +2618,7 @@ impl App {
     /// Captured pointer and keys → the host (positions normalized to the remote screen).
     /// `rect` is where the whole remote screen is drawn (in 1:1 it reaches past the stage),
     /// `visible` the part of it on screen: only events there are sent.
-    fn forward_input(&mut self, ctx: &egui::Context, key: u32, rect: Rect, visible: Rect) {
+    fn forward_input(&mut self, ctx: &egui::Context, key: u32, rect: Rect, visible: Rect, stage_layer: egui::LayerId) {
         let swap = self.core.tabs.iter().find(|t| t.key == key).is_some_and(|t| !t.os.is_empty() && (t.os == "darwin") != self.mac_local);
         // Translated keyboard: characters as typed here go over as text; only keys that
         // type nothing (arrows, Enter, shortcuts…) go as physical keys.
@@ -2619,6 +2626,10 @@ impl App {
         let typed = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
         let norm = |p: Pos2| ((p.x - rect.left()) / rect.width(), (p.y - rect.top()) / rect.height());
         let events = ctx.input(|i| i.events.clone());
+        // Over something drawn above the picture (an open menu, the floating toolbar): the
+        // pointer and its presses are that thing's, not the remote screen's. A release always
+        // goes, so no button stays down over there.
+        let above = |p: Pos2| ctx.layer_id_at(p).is_some_and(|l| l != stage_layer);
         let mut moved = None;
         let mut out = Vec::new();
         let touch = cfg!(mobile);
@@ -2632,7 +2643,7 @@ impl App {
                 // a finger: see touch_gestures
                 egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } if touch => {}
                 // the camera window floats over the picture
-                egui::Event::PointerMoved(p) | egui::Event::PointerButton { pos: p, pressed: true, .. } if self.pip_rects.iter().any(|r| r.contains(p)) => {}
+                egui::Event::PointerMoved(p) | egui::Event::PointerButton { pos: p, pressed: true, .. } if self.pip_rects.iter().any(|r| r.contains(p)) || above(p) => {}
                 egui::Event::PointerMoved(p) if visible.contains(p) => moved = Some(norm(p)),
                 egui::Event::PointerButton { pos, button, pressed, .. } if visible.contains(pos) => {
                     let b = match button {
@@ -2644,6 +2655,8 @@ impl App {
                     let (x, y) = norm(pos);
                     out.push(json!({ "t": if pressed { "down" } else { "up" }, "b": b, "c": 1, "x": x, "y": y }));
                 }
+                // the wheel over an open menu scrolls the menu
+                egui::Event::MouseWheel { .. } if ctx.input(|i| i.pointer.hover_pos()).is_some_and(above) => {}
                 egui::Event::MouseWheel { unit, delta, .. } => {
                     let k = match unit {
                         egui::MouseWheelUnit::Point => 1.0,
@@ -2936,7 +2949,9 @@ impl App {
             self.fab_rects.push(stage); // the dimmed stage closes the menu
         }
         if let Some(r) = &more_resp {
-            egui::Popup::menu(r).show(|ui| self.actions_menu(ui, key));
+            // beside the buttons, at most the screen's height
+            let room = ui.ctx().content_rect().height() - 16.0;
+            egui::Popup::menu(r).show(|ui| self.actions_menu(ui, key, room));
         }
         if resp.clicked() {
             self.fab_open = !self.fab_open;

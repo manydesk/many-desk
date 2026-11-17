@@ -28,7 +28,15 @@ pub enum ActDialog {
 
 impl App {
     /// The ⋯ button's menu. Called inside the toolbar row.
-    pub(super) fn actions_menu(&mut self, ui: &mut Ui, key: u32) {
+    /// `room`: the height there is for it on the screen. Taller than that (a small screen),
+    /// it scrolls, or its last items (whiteboard, switch sides, restart, tunnels) would be
+    /// off the screen.
+    pub(super) fn actions_menu(&mut self, ui: &mut Ui, key: u32, room: f32) {
+        let room = (room - 16.0).max(220.0);
+        egui::ScrollArea::vertical().id_salt(("act-menu", key)).max_height(room).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded).show(ui, |ui| self.actions_menu_items(ui, key));
+    }
+
+    fn actions_menu_items(&mut self, ui: &mut Ui, key: u32) {
         let Some(tab) = self.core.tabs.iter().find(|t| t.key == key) else { return };
         let (os, perms, privacy, lock_end, kbd_text, live) = (tab.os.clone(), tab.remote, tab.privacy, tab.lock_on_end, tab.kbd_text, tab.state == TabState::Live);
         let board_on = self.boards.get(&key).is_some_and(|b| b.on);
