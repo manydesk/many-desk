@@ -402,6 +402,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
 
     let mut child: Option<HANDLE> = None;
     let mut last_session = 0xFFFF_FFFFu32;
+    // the signed-in user runs ManyDesk already (autostart, the Start menu): our copy left
+    // at once; look again only now and then, less often while that goes on (5 s up to 15 s)
+    let mut wait_until: Option<std::time::Instant> = None;
+    let mut backoff = 0u64;
     while !STOP.load(Ordering::SeqCst) {
         // Ctrl+Alt+Del requests
         if !sas.is_null() && WaitForSingleObject(sas, 0) == WAIT_OBJECT_0 {
@@ -417,7 +421,21 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         // Keep an app running in the active console session.
         let session = WTSGetActiveConsoleSessionId();
         let alive = child.map(|h| WaitForSingleObject(h, 0) != WAIT_OBJECT_0).unwrap_or(false);
-        if session != 0xFFFF_FFFF && (!alive || session != last_session) {
+        if !alive {
+            if let Some(h) = child.take() {
+                let mut code = 0u32;
+                if GetExitCodeProcess(h, &mut code) != 0 && code == crate::platform::instance::ALREADY_RUNNING as u32 {
+                    backoff = (backoff * 2).clamp(5, 15);
+                    wait_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff));
+                } else {
+                    backoff = 0;
+                }
+                CloseHandle(h);
+            }
+        }
+        let waiting = wait_until.is_some_and(|t| std::time::Instant::now() < t) && session == last_session;
+        if session != 0xFFFF_FFFF && (!alive || session != last_session) && !waiting {
+            wait_until = None;
             if let Some(h) = child.take() {
                 CloseHandle(h);
             }
