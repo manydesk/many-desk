@@ -537,7 +537,11 @@ impl eframe::App for App {
         }
         crate::perf::phase(if active.is_some() { "ui.session" } else { "ui.home" });
         match active {
-            Some(k) => self.session_view(ui, k),
+            Some(k) => {
+                self.core.hold_close();
+                self.session_view(ui, k);
+                self.core.release_close();
+            }
             None => self.home(ui),
         }
         crate::perf::phase("ui.overlays");
