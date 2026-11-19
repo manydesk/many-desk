@@ -75,6 +75,8 @@ pub struct App {
     acl_text: String,
     /// the file manager's open prompt (new folder, rename, delete)
     fm_dialog: Option<FmDialog>,
+    /// Rename of a recent tile: (its ID, the name being typed)
+    rename: Option<(String, String)>,
     /// per session: the whiteboard, and the last full-size picture (for screenshots)
     boards: HashMap<u32, Board>,
     act_dialog: Option<ActDialog>,
@@ -325,6 +327,7 @@ impl App {
             totp_code: String::new(),
             acl_text,
             fm_dialog: None,
+            rename: None,
             boards: HashMap::new(),
             act_dialog: None,
             covered: Vec::new(),
@@ -545,6 +548,7 @@ impl eframe::App for App {
             None => self.home(ui),
         }
         crate::perf::phase("ui.overlays");
+        self.rename_dialog(&ctx);
         self.request_window(&ctx);
         self.host_stack(&ctx);
         self.host_cameras(&ctx);
@@ -1232,6 +1236,7 @@ impl App {
         let (area, _) = ui.allocate_exact_size(Vec2::new(width, rows as f32 * (tile_h + gap) - gap), Sense::hover());
         let mut connect = None;
         let mut forget = None;
+        let mut rename = None;
         let mut wake = None;
         let mut menu_pick: Option<(String, Option<crate::core::SessMode>)> = None;
         for (i, r) in recents.iter().enumerate() {
@@ -1308,8 +1313,7 @@ impl App {
             let tg = p.layout_no_wrap(time_ago(r.ts), th::font(11.0, W::Regular), th::MUTED);
             p.galley(Pos2::new(text_right - tg.size().x, meta.top() + 27.0 - tg.size().y / 2.0), tg.clone(), th::MUTED);
             let name_w = text_right - meta.left() - 4.0;
-            let name = if r.name.is_empty() { rv::format_id(&r.id) } else { r.name.clone() };
-            let mut job = egui::text::LayoutJob::simple_singleline(name, th::font(13.5, W::Semibold), th::TEXT);
+            let mut job = egui::text::LayoutJob::simple_singleline(r.label(), th::font(13.5, W::Semibold), th::TEXT);
             job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
             let ng = ui.painter().layout_job(job);
             ui.painter().galley(meta.min, ng, th::TEXT);
@@ -1362,6 +1366,9 @@ impl App {
                     menu_pick = Some((r.id.clone(), m));
                 }
                 ui.separator();
+                if ui.button(t("fm.rename")).clicked() {
+                    rename = Some((r.id.clone(), r.label()));
+                }
                 if ui.button(t("tt.forget")).clicked() {
                     forget = Some(r.id.clone());
                 }
@@ -1373,6 +1380,9 @@ impl App {
             Some((id, Some(m))) => self.core.connect_mode(&id, m),
             Some((id, None)) => wake = Some(id),
             None => {}
+        }
+        if rename.is_some() {
+            self.rename = rename;
         }
         if let Some(id) = forget {
             self.core.store.forget(&id);
@@ -2321,7 +2331,7 @@ impl App {
         crate::perf::add("texset", t0.elapsed());
         let n = self.frames.entry(key).or_default();
         *n += 1;
-        if *n == 45 {
+        if *n == 45 && !tab.wallpaper {
             let id = tab.peer_id.clone();
             if let Some(j) = tab.video.as_ref().and_then(|v| v.picture()).and_then(|p| thumbnail(p)) {
                 self.core.store.set_thumb(&id, j);
@@ -3764,6 +3774,56 @@ impl App {
         ctx.data_mut(|d| d.insert_temp(focus_id, remote));
     }
 
+    /// Rename of a recent tile (AnyDesk: the tile menu's Rename). Empty: the computer's own name.
+    fn rename_dialog(&mut self, ctx: &egui::Context) {
+                let Some((id, name)) = self.rename.as_mut() else { return };
+        let (mut close, mut submit) = (false, false);
+        let own = self.core.store.recent.iter().find(|r| r.id == *id).map(|r| if r.name.is_empty() { rv::format_id(&r.id) } else { r.name.clone() }).unwrap_or_default();
+        let modal = dialog_modal(ctx, "rename-dialog").frame(egui::Frame::new().fill(th::SURFACE).stroke(Stroke::new(1.0, th::BORDER)).corner_radius(12).shadow(th::shadow_lg()).inner_margin(Margin::same(22))).show(ctx, |ui| {
+            ui.set_width(dialog_width(ui.ctx(), 340.0));
+            th::h3(ui, &t("fm.rename"));
+            ui.add_space(6.0);
+            field(ui, &t("fm.nameField"), |ui| {
+                let r = ui.add(egui::TextEdit::singleline(name).frame(egui::Frame::NONE).font(th::font(13.5, W::Regular)).hint_text(own.as_str()).char_limit(60).desired_width(f32::INFINITY));
+                // Enter first: it takes the focus away, and the line below would give it back
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                } else if !ui.ctx().memory(|m| m.focused().is_some()) {
+                    r.request_focus();
+                }
+            });
+            ui.label(text(tf("recent.renameHint", &[("name", &own)]), 12.0, W::Regular, th::MUTED));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let bw = (ui.available_width() - 8.0) / 2.0;
+                if th::btn_sized(ui, &t("btn.cancel"), Btn::Normal, Some(bw)).clicked() {
+                    close = true;
+                }
+                if th::btn_sized(ui, &t("btn.save"), Btn::Primary, Some(bw)).clicked() {
+                    submit = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            close = true;
+        }
+        if submit {
+            if let Some((id, name)) = self.rename.take() {
+                // the computer's own name typed back: no name of our own
+                let alias = if name.trim() == own { "" } else { name.trim() };
+                self.core.store.set_alias(&id, alias);
+                if let Some(label) = self.core.store.recent.iter().find(|r| r.id == id).map(|r| r.label()) {
+                    for tab in self.core.tabs.iter_mut().filter(|t| t.peer_id == id) {
+                        tab.label = label.clone();
+                    }
+                }
+            }
+        } else if close {
+            self.rename = None;
+        }
+    }
+
     /// New folder / rename / delete, over the file manager.
     fn fm_dialog(&mut self, ctx: &egui::Context) {
         let Some(d) = self.fm_dialog.as_mut() else { return };
@@ -3782,11 +3842,11 @@ impl App {
             if let Some(name) = name {
                 field(ui, &t("fm.nameField"), |ui| {
                     let r = ui.add(egui::TextEdit::singleline(name).frame(egui::Frame::NONE).font(th::font(13.5, W::Regular)).desired_width(f32::INFINITY));
-                    if !ui.ctx().memory(|m| m.focused().is_some()) {
-                        r.request_focus();
-                    }
+                    // Enter first: it takes the focus away, and the line below would give it back
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit = true;
+                    } else if !ui.ctx().memory(|m| m.focused().is_some()) {
+                        r.request_focus();
                     }
                 });
                 valid = crate::fm::valid_name(name);
@@ -4509,8 +4569,8 @@ fn suggestions(core: &crate::core::Core, q: &str) -> Vec<Suggestion> {
     for r in &core.store.recent {
         let peer = lan.iter().find(|p| p.id == r.id);
         let ip = peer.map(|p| p.ip.to_string()).unwrap_or_default();
-        if hit(&r.id, &r.name, &ip) {
-            out.push(Suggestion { id: r.id.clone(), name: r.name.clone(), ip, lan: peer.is_some() });
+        if hit(&r.id, &r.name, &ip) || (!r.alias.is_empty() && hit(&r.id, &r.alias, &ip)) {
+            out.push(Suggestion { id: r.id.clone(), name: r.label(), ip, lan: peer.is_some() });
         }
     }
     for p in &lan {

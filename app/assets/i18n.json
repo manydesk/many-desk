@@ -430,7 +430,8 @@
    "n.shareChannel": "Ekran paylaşımı",
    "n.shareText": "Ekranınız paylaşılır",
    "toast.copied": "Kopyalandı",
-   "toast.saved": "Yadda saxlanıldı"
+   "toast.saved": "Yadda saxlanıldı",
+   "recent.renameHint": "Boş qoysanız, kompüterin öz adı göstərilir: {name}"
   },
   "en": {
    "home": "Home",
@@ -856,7 +857,8 @@
    "n.shareChannel": "Screen sharing",
    "n.shareText": "Your screen is being shared",
    "toast.copied": "Copied",
-   "toast.saved": "Saved"
+   "toast.saved": "Saved",
+   "recent.renameHint": "Leave it empty to show the computer’s own name: {name}"
   },
   "ru": {
    "home": "Главная",
@@ -1282,7 +1284,8 @@
    "n.shareChannel": "Показ экрана",
    "n.shareText": "Ваш экран транслируется",
    "toast.copied": "Скопировано",
-   "toast.saved": "Сохранено"
+   "toast.saved": "Сохранено",
+   "recent.renameHint": "Оставьте пустым, чтобы показывать собственное имя компьютера: {name}"
   },
   "tr": {
    "home": "Ana sayfa",
@@ -1708,7 +1711,8 @@
    "n.shareChannel": "Ekran paylaşımı",
    "n.shareText": "Ekranınız paylaşılıyor",
    "toast.copied": "Kopyalandı",
-   "toast.saved": "Kaydedildi"
+   "toast.saved": "Kaydedildi",
+   "recent.renameHint": "Boş bırakırsanız bilgisayarın kendi adı gösterilir: {name}"
   }
  }
 }

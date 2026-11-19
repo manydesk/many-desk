@@ -184,6 +184,11 @@ pub struct Tab {
     pub key: u32,
     pub peer_id: String,
     pub label: String,
+    /// the name the computer gives itself (kept in the recent list; `label` may be the
+    /// name given here instead)
+    pub remote_name: String,
+    /// the tile shows the host's wallpaper (it sent one): no frame of the session instead
+    pub wallpaper: bool,
     pub os: String,
     pub state: TabState,
     pub sas: String,
@@ -838,7 +843,9 @@ impl Core {
             return;
         }
         let key = self.next_id();
-        let label = self.store.recent.iter().find(|r| r.id == id).map(|r| r.name.clone()).unwrap_or_else(|| rv::format_id(&id));
+        let recent = self.store.recent.iter().find(|r| r.id == id);
+        let label = recent.map(|r| r.label()).unwrap_or_else(|| rv::format_id(&id));
+        let remote_name = recent.map(|r| r.name.clone()).unwrap_or_default();
         let (session_key, raw) = rv::new_session_key();
         let topic = rv::random_topic();
         self.rv.subscribe(&topic, false);
@@ -850,6 +857,8 @@ impl Core {
             key,
             peer_id: id,
             label,
+            remote_name,
+            wallpaper: false,
             os: String::new(),
             state: TabState::Requesting,
             sas: String::new(),
@@ -921,13 +930,17 @@ impl Core {
                 if !is_hex64(&reply) {
                     return;
                 }
+                let renamed = self.store.recent.iter().any(|r| r.id == self.tabs[i].peer_id && !r.alias.is_empty());
                 let tab = &mut self.tabs[i];
                 if let Some(hs) = tab.hs.as_mut() {
                     hs.host_peer = Some(pubkey);
                 }
                 let name: String = msg["name"].as_str().unwrap_or("").chars().take(60).collect();
                 if !name.is_empty() {
-                    tab.label = name;
+                    if !renamed {
+                        tab.label = name.clone();
+                    }
+                    tab.remote_name = name;
                 }
                 tab.os = msg["os"].as_str().unwrap_or("").to_string();
                 let Some(offer) = rv::decode_code(code).filter(|o| o.get("mdp").is_some()) else {
@@ -1680,6 +1693,7 @@ impl Core {
         }
         self.send_perms(i);
         self.send_screens(i);
+        self.send_wallpaper(i);
         self.apply_quality(i);
         self.update_host_input();
         let name = self.hosts[i].req.name.clone();
@@ -1734,7 +1748,7 @@ impl Core {
                     let tab = &mut self.tabs[i];
                     tab.state = TabState::Live;
                     tab.live_since = Some(Instant::now());
-                    let (id, name, os) = (tab.peer_id.clone(), tab.label.clone(), tab.os.clone());
+                    let (id, name, os) = (tab.peer_id.clone(), tab.remote_name.clone(), tab.os.clone());
                     self.end_handshake(i);
                     self.store.remember(&id, &name, &os);
                     self.presence.insert(id, (Instant::now(), false));
@@ -1883,6 +1897,9 @@ impl Core {
         if matches!(m["t"].as_str(), Some("fls" | "fok" | "ferr")) {
             self.viewer_fm(i, &m);
             return;
+        }
+        if m["t"] == "wallpaper" {
+            return self.viewer_wallpaper(i, &m);
         }
         if self.viewer_action(i, &m) {
             return;
@@ -2060,6 +2077,30 @@ impl Core {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Host: this computer's wallpaper, for the viewer's recent-sessions tile (as AnyDesk
+    /// shows it there). Read off the UI thread; nothing is sent when it cannot be read.
+    fn send_wallpaper(&self, i: usize) {
+        let Some(s) = self.session(self.hosts[i].sid) else { return };
+        crate::rt::spawn_blocking(move || {
+            let Some(jpeg) = crate::wallpaper::jpeg() else { return };
+            use base64::Engine;
+            let msg = json!({ "t": "wallpaper", "jpg": base64::engine::general_purpose::STANDARD.encode(jpeg) }).to_string();
+            crate::rt::spawn(async move {
+                let _ = s.send_text(false, &msg).await;
+            });
+        });
+    }
+
+    /// Viewer: the host's wallpaper becomes its tile picture (a JPEG it can decode, kept small).
+    fn viewer_wallpaper(&mut self, i: usize, m: &Value) {
+        use base64::Engine;
+        let Some(jpeg) = m["jpg"].as_str().filter(|b| b.len() < 2 << 20).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok()) else { return };
+        let ok = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).is_ok_and(|img| (1..=4096).contains(&img.width()) && (1..=4096).contains(&img.height()));
+        if ok && self.store.set_thumb(&self.tabs[i].peer_id, jpeg) {
+            self.tabs[i].wallpaper = true;
         }
     }
 
@@ -2691,7 +2732,7 @@ impl Core {
     /// Wake-on-LAN for a recent computer (its network cards are known from the LAN).
     pub fn wake(&mut self, id: &str) {
         let Some(r) = self.store.recent.iter().find(|r| r.id == id) else { return };
-        let name = if r.name.is_empty() { rv::format_id(id) } else { r.name.clone() };
+        let name = r.label();
         if r.macs.is_empty() {
             return self.toast(t("lan.noMac"), true);
         }

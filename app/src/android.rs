@@ -115,6 +115,17 @@ pub fn clipboard_text() -> Option<String> {
     })
 }
 
+/// The home-screen wallpaper as a JPEG (Bridge.wallpaper), or None.
+pub fn wallpaper_jpeg(max_width: i32) -> Option<Vec<u8>> {
+    with_bridge(|env, c| {
+        let o = env.call_static_method(c, "wallpaper", "(I)[B", &[JValue::Int(max_width)]).ok()?.l().ok()?;
+        if o.is_null() {
+            return None;
+        }
+        env.convert_byte_array(jni::objects::JByteArray::from(o)).ok()
+    })
+}
+
 /// One remote-control event (input.rs's JSON, coordinates in this display's pixels).
 pub fn inject(cmd: &str) {
     with_bridge(|env, c| {

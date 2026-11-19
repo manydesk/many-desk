@@ -25,6 +25,7 @@ mod theme;
 mod turncfg;
 mod ui;
 mod video;
+mod wallpaper;
 #[cfg(not(target_os = "ios"))]
 mod video_gl;
 #[cfg(target_os = "android")]
