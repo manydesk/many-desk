@@ -105,7 +105,7 @@ pub fn run() -> eframe::Result<()> {
     #[cfg(windows)]
     let mut instance = match platform::instance::claim() {
         Some(g) => Some(g),
-        None => return Ok(()),
+        None => std::process::exit(platform::instance::ALREADY_RUNNING),
     };
     #[cfg(target_os = "macos")]
     platform::system::refresh_autostart();

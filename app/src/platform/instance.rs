@@ -13,6 +13,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{AllowSetForegroundWindow, Enum
 /// Set when another start asked this copy to show itself (the UI takes it).
 pub static SHOW: AtomicBool = AtomicBool::new(false);
 
+/// The exit code of a start that found another copy running. The service then waits
+/// before it tries again, instead of starting a copy every half second.
+pub const ALREADY_RUNNING: i32 = 75;
+
 fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
 }
@@ -54,6 +58,12 @@ pub fn claim() -> Option<Guard> {
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             CloseHandle(mutex);
+            // A start with --background (the service, autostart) leaves the running copy
+            // as it is. Telling it to show itself restored its window every time the
+            // service tried again: it could not be minimized, maximized or closed.
+            if std::env::args().any(|a| a == "--background") {
+                return None;
+            }
             // this start came from the user, so it may bring a window forward: hand that on
             AllowSetForegroundWindow(ASFW_ANY);
             let ev = OpenEventW(0x0002 /* EVENT_MODIFY_STATE */, 0, wide(&event_name).as_ptr());
