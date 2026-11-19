@@ -71,6 +71,25 @@ public class MainActivity extends NativeActivity {
         });
     }
 
+    /**
+     * The window is going away for good (swiped from the recent apps, or Android closed it).
+     * NativeActivity.onDestroy waits for android_main to return, but the UI's event loop
+     * (winit) ignores onDestroy and never returns: the main thread hung there, and the next
+     * launch stayed on the white splash until a force stop. The event loop cannot start
+     * again in this process anyway (see started), so the process ends here and the next
+     * launch starts fresh. A recreated window (a configuration change we do not handle)
+     * comes back through RestartActivity.
+     */
+    @Override
+    protected void onDestroy() {
+        if (isChangingConfigurations()) {
+            startActivity(new Intent(this, RestartActivity.class).putExtra("pid", android.os.Process.myPid())
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
+        }
+        android.os.Process.killProcess(android.os.Process.myPid());
+        super.onDestroy();
+    }
+
     /** Back at the top level: ManyDesk goes to the background like AnyDesk does, and its
      *  sessions keep going (finishing the window would end the UI for good, see started). */
     @Override
