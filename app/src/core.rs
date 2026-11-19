@@ -762,6 +762,13 @@ impl Core {
                 }
                 self.send_screens(i);
             }
+            // Android: the system installer did not put an update in
+            "update:failed" => {
+                if !v["cancelled"].as_bool().unwrap_or(false) {
+                    let e = v["e"].as_str().unwrap_or("").to_string();
+                    self.toast(tf("upd.failed", &[("e", &e)]), true);
+                }
+            }
             "turn:cache" => {
                 self.store.turn.cf_cache = serde_json::from_value(v).ok();
                 self.store.save();

@@ -108,6 +108,51 @@ public final class Bridge {
         a.stopService(new Intent(a, ScreenCapture.class));
     }
 
+    // -------------------------------------------------------------- update ---
+
+    /** The installer's answer when it is not a success (InstallReceiver). */
+    static native void nativeUpdateFailed(boolean cancelled, String message);
+
+    /**
+     * Installs a downloaded update (an APK in the app's own folder, already checked against
+     * the release's SHA256SUMS). The system shows its confirmation; the new version replaces
+     * this one and the app opens again. Returns null when the installer took it, "allow" when
+     * the user has to let ManyDesk install apps first (that setting is opened), or the error.
+     */
+    public static String installApk(String path) {
+        final MainActivity a = activity;
+        if (a == null) return "no window";
+        if (!a.getPackageManager().canRequestPackageInstalls()) {
+            a.startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, android.net.Uri.parse("package:" + a.getPackageName()))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            return "allow";
+        }
+        try {
+            java.io.File f = new java.io.File(path);
+            android.content.pm.PackageInstaller pi = a.getPackageManager().getPackageInstaller();
+            android.content.pm.PackageInstaller.SessionParams p = new android.content.pm.PackageInstaller.SessionParams(
+                    android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            p.setAppPackageName(a.getPackageName());
+            p.setSize(f.length());
+            int id = pi.createSession(p);
+            try (android.content.pm.PackageInstaller.Session s = pi.openSession(id)) {
+                try (java.io.OutputStream out = s.openWrite("base.apk", 0, f.length());
+                     java.io.InputStream in = new java.io.FileInputStream(f)) {
+                    byte[] buf = new byte[1 << 16];
+                    for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+                    s.fsync(out);
+                }
+                int flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT;
+                if (android.os.Build.VERSION.SDK_INT >= 31) flags |= android.app.PendingIntent.FLAG_MUTABLE;
+                android.app.PendingIntent done = android.app.PendingIntent.getBroadcast(a, id, new Intent(a, InstallReceiver.class), flags);
+                s.commit(done.getIntentSender());
+            }
+            return null;
+        } catch (Throwable e) {
+            return String.valueOf(e.getMessage());
+        }
+    }
+
     // ----------------------------------------------------------- wallpaper ---
 
     /**

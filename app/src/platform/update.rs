@@ -32,6 +32,10 @@ pub fn installed() -> bool {
 /// Whether an update can go in without anyone answering a prompt: everywhere but an
 /// installed Windows copy without the service (there the setup needs an administrator).
 pub fn quiet_install_possible() -> bool {
+    // Android always asks the user (the system's install confirmation)
+    if cfg!(target_os = "android") {
+        return false;
+    }
     #[cfg(windows)]
     if installed() {
         return super::service::installed();
@@ -41,7 +45,9 @@ pub fn quiet_install_possible() -> bool {
 
 /// This build's download key in the manifest's "assets".
 fn asset_key() -> &'static str {
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "macos") {
         "mac-universal"
     } else if cfg!(windows) && installed() {
         "win-x64-setup"
@@ -83,7 +89,9 @@ async fn get_json(c: &reqwest::Client, url: &str) -> Result<Value, String> {
 /// Is `name` this platform's package? (ManyDesk-0.20.0-mac-universal.dmg, …-win-x64.exe or
 /// …-win-x64-setup.exe for an installed copy, …-linux-amd64.deb)
 fn is_ours(name: &str) -> bool {
-    let ext = if cfg!(target_os = "macos") {
+    let ext = if cfg!(target_os = "android") {
+        ".apk"
+    } else if cfg!(target_os = "macos") {
         ".dmg"
     } else if cfg!(windows) {
         ".exe"
@@ -381,7 +389,14 @@ fn put_in_place(deb: &std::path::Path) -> Result<Outcome, String> {
     Ok(Outcome::Restart)
 }
 
-#[cfg(any(mobile, not(any(windows, target_os = "linux", target_os = "macos"))))]
+/// Android: the system installer takes the APK and asks the user; on yes it replaces this
+/// app and opens the new one.
+#[cfg(target_os = "android")]
+fn put_in_place(apk: &std::path::Path) -> Result<Outcome, String> {
+    crate::android::install_apk(apk).map(|()| Outcome::Elsewhere)
+}
+
+#[cfg(any(target_os = "ios", not(any(windows, target_os = "linux", target_os = "macos", target_os = "android"))))]
 fn put_in_place(_: &std::path::Path) -> Result<Outcome, String> {
     Err("updates come from the app store".into())
 }

@@ -190,6 +190,8 @@ fn drop_dead_windows() {
 #[no_mangle]
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
     android::init(&app);
+    // an update's APK, once it is installed (or was turned down), goes
+    platform::update::after_update();
     perf::startup("start");
     let _ = rustls::crypto::ring::default_provider().install_default();
     rt::handle();

@@ -244,11 +244,23 @@ async fn install_update(u: crate::platform::update::Update, slot: UpdateSlot, as
             tokio::time::sleep(Duration::from_millis(300)).await;
             std::process::exit(0);
         }
+        Ok(crate::platform::update::Outcome::Elsewhere) if cfg!(target_os = "android") => {
+            // the system's installer asks the user now; a "no" leaves the offer standing
+            *slot.lock().unwrap() = Some((tf("start.found", &[("v", &u.version)]), Some(true)));
+            INSTALLING.store(false, SeqCst);
+        }
         Ok(crate::platform::update::Outcome::Elsewhere) => {
             // the service or the approved setup replaces this copy; should it not, try
             // again later (INSTALLING would otherwise stop every further attempt)
             tokio::time::sleep(Duration::from_secs(600)).await;
             INSTALLING.store(false, SeqCst);
+        }
+        Err((e, _)) if cfg!(target_os = "android") => {
+            // keep the offer: after allowing installs (the setting was opened) it is one tap
+            let text = if e == "allow" { t("upd.allow") } else { tf("upd.failed", &[("e", &e)]) };
+            *slot.lock().unwrap() = Some((tf("start.found", &[("v", &u.version)]), Some(true)));
+            INSTALLING.store(false, SeqCst);
+            bus::emit("toast", json!({ "text": text, "error": e != "allow" }));
         }
         Err((e, package)) => {
             let opened = package.as_deref().map(|p| crate::platform::update::open(p).is_ok()).unwrap_or(false);
@@ -1072,6 +1084,31 @@ impl App {
                     });
                 });
         }
+        // Android: a newer version (installed from an APK, the app looks for it itself); not
+        // while a session is open, the installer would cut it
+        let found = UPDATE.lock().unwrap().as_ref().map(|u| u.version.clone());
+        if let Some(v) = found.filter(|_| cfg!(target_os = "android") && !self.busy()) {
+            ui.add_space(12.0);
+            egui::Frame::new().fill(th::ACCENT_SOFT).corner_radius(12).inner_margin(Margin::same(16)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    self.icons.show(ui, "refresh", 18.0, th::ACCENT);
+                    ui.label(text(tf("start.found", &[("v", &v)]), 14.0, W::Semibold, th::TEXT));
+                });
+                ui.add_space(4.0);
+                ui.label(text(t("upd.hint"), 12.5, W::Regular, th::MUTED));
+                ui.add_space(10.0);
+                let installing = INSTALLING.load(std::sync::atomic::Ordering::SeqCst);
+                ui.horizontal(|ui| {
+                    if th::btn(ui, &t(if installing { "start.downloading" } else { "upd.install" }), Btn::Primary).clicked() && !installing {
+                        self.do_update();
+                    }
+                    if installing {
+                        ui.add(egui::Spinner::new().size(16.0).color(th::ACCENT));
+                    }
+                });
+            });
+        }
         ui.add_space(12.0);
         // the remote device
         card(ui, &mut |ui| {
@@ -1870,35 +1907,51 @@ impl App {
                 th::hint(ui, &t("start.svcHint"));
             }
             ui.add_space(12.0);
-            let mut au = self.core.store.autoupdate;
-            if th::checkbox(ui, &mut au, &t("start.autoupdate")).changed() {
-                self.core.store.autoupdate = au;
-                self.core.store.save();
-            }
+            self.update_controls(ui);
+        });
+    }
+
+    /// A phone's settings: checking for updates (the system's installer asks before one goes in).
+    fn update_panel(&mut self, ui: &mut Ui) {
+        th::panel(ui, |ui| {
+            th::h3(ui, &t("upd.title"));
+            ui.label(text(tf("upd.current", &[("v", env!("CARGO_PKG_VERSION"))]), 12.5, W::Regular, th::MUTED));
             ui.add_space(8.0);
-            let state = self.update.lock().unwrap().clone();
-            let checking = matches!(state, Some((_, None)));
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if th::btn(ui, &t("start.checkNow"), Btn::Normal).clicked() && !checking {
-                    self.check_update(true);
-                }
-                if checking {
-                    ui.add(egui::Spinner::new().size(16.0).color(th::MUTED));
-                }
-            });
-            if let Some((msg, ok)) = state.filter(|s| s.1.is_some()) {
-                ui.add_space(6.0);
-                let (col, open) = match ok {
-                    Some(true) => (th::OK, true),
-                    _ => (th::MUTED, false),
-                };
-                ui.label(text(&msg, 12.5, W::Regular, col));
-                if open && th::btn(ui, &t("start.install"), Btn::Primary).clicked() {
-                    self.do_update();
-                }
+            self.update_controls(ui);
+        });
+    }
+
+    /// Automatic updates on or off, "Check now", and what the last check found.
+    fn update_controls(&mut self, ui: &mut Ui) {
+        let mut au = self.core.store.autoupdate;
+        let label = if cfg!(target_os = "android") { t("upd.autoCheck") } else { t("start.autoupdate") };
+        if th::checkbox(ui, &mut au, &label).changed() {
+            self.core.store.autoupdate = au;
+            self.core.store.save();
+        }
+        ui.add_space(8.0);
+        let state = self.update.lock().unwrap().clone();
+        let checking = matches!(state, Some((_, None)));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if th::btn(ui, &t("start.checkNow"), Btn::Normal).clicked() && !checking {
+                self.check_update(true);
+            }
+            if checking {
+                ui.add(egui::Spinner::new().size(16.0).color(th::MUTED));
             }
         });
+        if let Some((msg, ok)) = state.filter(|s| s.1.is_some()) {
+            ui.add_space(6.0);
+            let (col, open) = match ok {
+                Some(true) => (th::OK, true),
+                _ => (th::MUTED, false),
+            };
+            ui.label(text(&msg, 12.5, W::Regular, col));
+            if open && th::btn(ui, &t("start.install"), Btn::Primary).clicked() {
+                self.do_update();
+            }
+        }
     }
 
     /// Checks for a newer ManyDesk now; `manual` shows "up to date" too.
@@ -1912,7 +1965,8 @@ impl App {
     /// exactly the one that should update itself.
     fn update_tick(&mut self, ctx: &egui::Context) {
         use std::sync::atomic::Ordering::SeqCst;
-        if cfg!(mobile) {
+        // iOS updates through its store; Android is installed from an APK and checks itself
+        if cfg!(target_os = "ios") {
             return;
         }
         // someone at the keyboard or the mouse (not focus changes, repaints or a pointer
@@ -1973,6 +2027,9 @@ impl App {
         // store updates the app)
         if !cfg!(mobile) {
             self.startup_panel(ui);
+        } else if cfg!(target_os = "android") {
+            // installed from an APK, not a store: ManyDesk looks for its own updates
+            self.update_panel(ui);
         }
         self.security_panels(ui);
         th::panel(ui, |ui| {

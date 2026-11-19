@@ -56,9 +56,13 @@ javac -source 11 -target 11 -classpath "$PLATFORM" -d "$B/classes" $(find "$SRC/
 "$BT/d8" --min-api 26 --output "$B" $(find "$B/classes" -name '*.class') --lib "$PLATFORM"
 
 # 3. resources + manifest → base apk, then the code and the libraries
+# versionCode from the version (0.25.8 → 25008): Android installs an update only over a
+# lower code, and the app's own updater relies on that
+IFS=. read -r V1 V2 V3 <<<"$VERSION"
+VCODE=$(( ${V1:-0} * 1000000 + ${V2:-0} * 1000 + ${V3:-0} ))
 "$BT/aapt2" compile --dir "$SRC/res" -o "$B/res.zip"
 "$BT/aapt2" link -o "$B/base.apk" -I "$PLATFORM" --manifest "$SRC/AndroidManifest.xml" \
-  --version-name "$VERSION" --min-sdk-version 26 --target-sdk-version 34 "$B/res.zip"
+  --version-name "$VERSION" --version-code "$VCODE" --replace-version --min-sdk-version 26 --target-sdk-version 34 "$B/res.zip"
 (cd "$B" && zip -q base.apk classes.dex && zip -qr base.apk lib)
 
 # 4. align and sign (a local key; a store release needs its own)
