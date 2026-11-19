@@ -115,6 +115,25 @@ pub fn clipboard_text() -> Option<String> {
     })
 }
 
+/// Hands a downloaded, checked update to the system installer (Bridge.installApk), which
+/// asks the user. Err("allow"): ManyDesk may not install apps yet (that setting was opened).
+pub fn install_apk(path: &std::path::Path) -> Result<(), String> {
+    with_bridge(|env, c| {
+        let s = env.new_string(path.to_string_lossy()).ok()?;
+        let o = env.call_static_method(c, "installApk", "(Ljava/lang/String;)Ljava/lang/String;", &[JValue::Object(&s)]).ok()?.l().ok()?;
+        Some(if o.is_null() { Ok(()) } else { Err(env.get_string(&JString::from(o)).ok().map(String::from).unwrap_or_default()) })
+    })
+    .unwrap_or_else(|| Err("no Java bridge".into()))
+}
+
+/// The installer did not put the update in: the user cancelled it, or it failed.
+#[no_mangle]
+pub extern "system" fn Java_az_manydesk_Bridge_nativeUpdateFailed(mut env: JNIEnv, _c: JClass, cancelled: jni::sys::jboolean, msg: JString) {
+    let msg: String = env.get_string(&msg).map(Into::into).unwrap_or_default();
+    log::warn!("[update] installer: cancelled {cancelled}, {msg}");
+    crate::bus::emit("update:failed", serde_json::json!({ "cancelled": cancelled != 0, "e": msg }));
+}
+
 /// The home-screen wallpaper as a JPEG (Bridge.wallpaper), or None.
 pub fn wallpaper_jpeg(max_width: i32) -> Option<Vec<u8>> {
     with_bridge(|env, c| {

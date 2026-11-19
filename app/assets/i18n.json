@@ -431,7 +431,14 @@
    "n.shareText": "Ekranınız paylaşılır",
    "toast.copied": "Kopyalandı",
    "toast.saved": "Yadda saxlanıldı",
-   "recent.renameHint": "Boş qoysanız, kompüterin öz adı göstərilir: {name}"
+   "recent.renameHint": "Boş qoysanız, kompüterin öz adı göstərilir: {name}",
+   "upd.title": "Yeniləmələr",
+   "upd.current": "Bu versiya: {v}",
+   "upd.autoCheck": "Yeniləmələri avtomatik yoxla",
+   "upd.install": "Yenilə",
+   "upd.hint": "Yükləndikdən sonra Android quraşdırmanı təsdiqləməyinizi istəyəcək.",
+   "upd.allow": "ManyDesk-ə tətbiq quraşdırmağa icazə verin, sonra yenidən «Yenilə» basın.",
+   "upd.failed": "Yeniləmə quraşdırılmadı: {e}"
   },
   "en": {
    "home": "Home",
@@ -858,7 +865,14 @@
    "n.shareText": "Your screen is being shared",
    "toast.copied": "Copied",
    "toast.saved": "Saved",
-   "recent.renameHint": "Leave it empty to show the computer’s own name: {name}"
+   "recent.renameHint": "Leave it empty to show the computer’s own name: {name}",
+   "upd.title": "Updates",
+   "upd.current": "This version: {v}",
+   "upd.autoCheck": "Check for updates automatically",
+   "upd.install": "Update",
+   "upd.hint": "Once it is downloaded, Android asks you to confirm the install.",
+   "upd.allow": "Allow ManyDesk to install apps, then tap Update again.",
+   "upd.failed": "The update was not installed: {e}"
   },
   "ru": {
    "home": "Главная",
@@ -1285,7 +1299,14 @@
    "n.shareText": "Ваш экран транслируется",
    "toast.copied": "Скопировано",
    "toast.saved": "Сохранено",
-   "recent.renameHint": "Оставьте пустым, чтобы показывать собственное имя компьютера: {name}"
+   "recent.renameHint": "Оставьте пустым, чтобы показывать собственное имя компьютера: {name}",
+   "upd.title": "Обновления",
+   "upd.current": "Эта версия: {v}",
+   "upd.autoCheck": "Проверять обновления автоматически",
+   "upd.install": "Обновить",
+   "upd.hint": "После загрузки Android попросит подтвердить установку.",
+   "upd.allow": "Разрешите ManyDesk устанавливать приложения, затем снова нажмите «Обновить».",
+   "upd.failed": "Обновление не установлено: {e}"
   },
   "tr": {
    "home": "Ana sayfa",
@@ -1712,7 +1733,14 @@
    "n.shareText": "Ekranınız paylaşılıyor",
    "toast.copied": "Kopyalandı",
    "toast.saved": "Kaydedildi",
-   "recent.renameHint": "Boş bırakırsanız bilgisayarın kendi adı gösterilir: {name}"
+   "recent.renameHint": "Boş bırakırsanız bilgisayarın kendi adı gösterilir: {name}",
+   "upd.title": "Güncellemeler",
+   "upd.current": "Bu sürüm: {v}",
+   "upd.autoCheck": "Güncellemeleri otomatik denetle",
+   "upd.install": "Güncelle",
+   "upd.hint": "İndirildikten sonra Android kurulumu onaylamanızı ister.",
+   "upd.allow": "ManyDesk’in uygulama yüklemesine izin verin, sonra tekrar Güncelle’ye dokunun.",
+   "upd.failed": "Güncelleme yüklenmedi: {e}"
   }
  }
 }

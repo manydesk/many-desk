@@ -14,6 +14,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- the app's own updates (Bridge.installApk): the system still asks the user -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- the session camera (off until turned on in a session) -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -60,6 +62,11 @@
             android:excludeFromRecents="true"
             android:taskAffinity="az.manydesk.restart"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- The installer's answer to an update (Bridge.installApk). -->
+        <receiver
+            android:name=".InstallReceiver"
+            android:exported="false" />
 
         <!-- Remote control of this phone: taps, swipes, keys and text from the viewer. -->
         <service
