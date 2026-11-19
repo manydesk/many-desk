@@ -438,7 +438,9 @@
    "upd.install": "Yenilə",
    "upd.hint": "Yükləndikdən sonra Android quraşdırmanı təsdiqləməyinizi istəyəcək.",
    "upd.allow": "ManyDesk-ə tətbiq quraşdırmağa icazə verin, sonra yenidən «Yenilə» basın.",
-   "upd.failed": "Yeniləmə quraşdırılmadı: {e}"
+   "upd.failed": "Yeniləmə quraşdırılmadı: {e}",
+   "tray.open": "ManyDesk-i aç",
+   "tray.quit": "Çıxış"
   },
   "en": {
    "home": "Home",
@@ -872,7 +874,9 @@
    "upd.install": "Update",
    "upd.hint": "Once it is downloaded, Android asks you to confirm the install.",
    "upd.allow": "Allow ManyDesk to install apps, then tap Update again.",
-   "upd.failed": "The update was not installed: {e}"
+   "upd.failed": "The update was not installed: {e}",
+   "tray.open": "Open ManyDesk",
+   "tray.quit": "Quit"
   },
   "ru": {
    "home": "Главная",
@@ -1306,7 +1310,9 @@
    "upd.install": "Обновить",
    "upd.hint": "После загрузки Android попросит подтвердить установку.",
    "upd.allow": "Разрешите ManyDesk устанавливать приложения, затем снова нажмите «Обновить».",
-   "upd.failed": "Обновление не установлено: {e}"
+   "upd.failed": "Обновление не установлено: {e}",
+   "tray.open": "Открыть ManyDesk",
+   "tray.quit": "Выход"
   },
   "tr": {
    "home": "Ana sayfa",
@@ -1740,7 +1746,9 @@
    "upd.install": "Güncelle",
    "upd.hint": "İndirildikten sonra Android kurulumu onaylamanızı ister.",
    "upd.allow": "ManyDesk’in uygulama yüklemesine izin verin, sonra tekrar Güncelle’ye dokunun.",
-   "upd.failed": "Güncelleme yüklenmedi: {e}"
+   "upd.failed": "Güncelleme yüklenmedi: {e}",
+   "tray.open": "ManyDesk’i aç",
+   "tray.quit": "Çıkış"
   }
  }
 }

@@ -82,8 +82,12 @@ pub struct App {
     act_dialog: Option<ActDialog>,
     /// displays whose privacy cover is already kept out of the shared picture
     covered: Vec<u32>,
-    /// started with --background: minimize on the first frame
+    /// started with --background: minimize on the first frame (hide, with a tray icon)
     minimize_once: bool,
+    /// the window is hidden in the tray (closed by the user, or started with --background)
+    hidden: bool,
+    /// a connection request was waiting at the last frame (a new one shows the window)
+    pending_seen: bool,
     /// A finger down on a remote screen (phones, see touch_gestures).
     touch: Option<Touch>,
     /// Phones: the soft keyboard is up for typing into a session (toolbar button).
@@ -292,6 +296,8 @@ impl App {
         th::setup(&cc.egui_ctx);
         crate::perf::startup("fonts");
         let mut core = Core::new();
+        #[cfg(not(mobile))]
+        crate::platform::tray::start();
         // Test hook: MANYDESK_AUTOCONNECT=<id> connects on start (headless tests), as
         // MANYDESK_AUTOMODE=files|terminal says (default: the desktop).
         if let Ok(id) = std::env::var("MANYDESK_AUTOCONNECT") {
@@ -344,6 +350,8 @@ impl App {
             act_dialog: None,
             covered: Vec::new(),
             minimize_once: std::env::args().any(|a| a == "--background"),
+            hidden: false,
+            pending_seen: false,
             touch: None,
             soft_keyboard: false,
             touchpad,
@@ -493,6 +501,7 @@ impl eframe::App for App {
         crate::perf::phase("core.tick");
         self.tick_core();
         crate::perf::phase("logic");
+        self.tray_logic(ctx);
         // Keep ticking while sessions exist, also when the window is hidden (then eframe
         // runs only this, not ui()).
         if !self.core.tabs.is_empty() || !self.core.hosts.is_empty() || self.core.pending.is_some() {
@@ -511,16 +520,19 @@ impl eframe::App for App {
         crate::perf::startup("first frame");
         if self.minimize_once {
             self.minimize_once = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if crate::platform::tray::active() {
+                self.hide_to_tray(&ctx);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        }
+        // the window's close button: ManyDesk goes on in the tray (AnyDesk does the same);
+        // "Quit" in the icon's menu ends it
+        if ctx.input(|i| i.viewport().close_requested()) && crate::platform::tray::active() && !crate::platform::tray::QUIT.load(std::sync::atomic::Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_to_tray(&ctx);
         }
         self.update_tick(&ctx);
-        // ManyDesk was started again: this copy comes forward (Windows, platform::instance)
-        #[cfg(windows)]
-        if crate::platform::instance::SHOW.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
         let active = self.core.active.filter(|k| self.core.tabs.iter().any(|t| t.key == *k));
         // phones: keep clear of the status bar / notch and the navigation bar
         #[cfg(mobile)]
@@ -1957,6 +1969,45 @@ impl App {
     /// Checks for a newer ManyDesk now; `manual` shows "up to date" too.
     fn check_update(&mut self, manual: bool) {
         crate::rt::spawn(run_check(self.update.clone(), manual));
+    }
+
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.hidden = true;
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.hidden = false;
+    }
+
+    /// Every pass, also while the window is hidden (then only logic() runs): the tray icon's
+    /// Open and Quit, and a connection request, which brings the window forward so it can be
+    /// answered (as AnyDesk's accept window comes up).
+    fn tray_logic(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering::SeqCst;
+        use crate::platform::tray;
+        if tray::QUIT.load(SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        let pending = self.core.pending.is_some();
+        let new_request = pending && !self.pending_seen;
+        self.pending_seen = pending;
+        // ManyDesk was started again: this copy comes forward (Windows, platform::instance)
+        #[cfg(windows)]
+        let again = crate::platform::instance::SHOW.swap(false, SeqCst);
+        #[cfg(not(windows))]
+        let again = false;
+        if again || tray::SHOW.swap(false, SeqCst) || (new_request && (self.hidden || ctx.input(|i| i.viewport().minimized == Some(true)))) {
+            self.show_window(ctx);
+        }
+        if self.hidden {
+            // the icon's clicks arrive between frames: look for them now and then
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     /// Every frame: tell the update scheduler whether a session is open and when the window
