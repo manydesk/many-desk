@@ -454,6 +454,9 @@ pub struct Core {
     /// switch sides: our offer (token, tab, when), and the tab to close once reversed
     switch_offer: Option<(String, u32, Instant)>,
     switch_close_tab: Option<u32>,
+    /// While the session view is drawn, closes wait here: the view holds the tab's index,
+    /// and removing the tab under it panicked (index out of bounds) on Disconnect.
+    hold_close: Option<Vec<u32>>,
     /// viewer: TCP tunnels into the sessions
     pub tunnels: Vec<Tunnel>,
     next_tunnel: u32,
@@ -520,6 +523,7 @@ impl Core {
             privacy_on: false,
             switch_offer: None,
             switch_close_tab: None,
+            hold_close: None,
             tunnels: Vec::new(),
             next_tunnel: 0,
             auth_keys: HashMap::new(),
@@ -1004,7 +1008,25 @@ impl Core {
         }
     }
 
+    /// Holds tab closes until `release_close` (see `hold_close`).
+    pub fn hold_close(&mut self) {
+        self.hold_close.get_or_insert_with(Vec::new);
+    }
+
+    /// Ends the hold and closes the tabs asked for meanwhile.
+    pub fn release_close(&mut self) {
+        for key in self.hold_close.take().unwrap_or_default() {
+            self.close_tab(key);
+        }
+    }
+
     pub fn close_tab(&mut self, key: u32) {
+        if let Some(held) = &mut self.hold_close {
+            if !held.contains(&key) {
+                held.push(key);
+            }
+            return;
+        }
         let Some(i) = self.tabs.iter().position(|t| t.key == key) else { return };
         let tab = &self.tabs[i];
         if let Some(hs) = &tab.hs {
