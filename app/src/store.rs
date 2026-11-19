@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 pub struct Recent {
     pub id: String,
     pub name: String,
+    /// the name given here (Rename); shown instead of `name`, which the computer reports
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alias: String,
     #[serde(default)]
     pub os: String,
     pub ts: i64,
@@ -24,6 +27,19 @@ pub struct Recent {
     pub macs: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ip: String,
+}
+
+impl Recent {
+    /// What the tile and the session tab call it: the given name, else the computer's own.
+    pub fn label(&self) -> String {
+        if !self.alias.is_empty() {
+            self.alias.clone()
+        } else if !self.name.is_empty() {
+            self.name.clone()
+        } else {
+            crate::rv::format_id(&self.id)
+        }
+    }
 }
 
 /// What a viewer may do on this computer. The accept window, the session card and the
@@ -244,17 +260,26 @@ impl Store {
     /// Most recent first, at most 12.
     pub fn remember(&mut self, id: &str, name: &str, os: &str) {
         let prev = self.recent.iter().position(|r| r.id == id).map(|i| self.recent.remove(i));
-        let (thumb, auth, trust, macs, ip) = prev.map(|r| (r.thumb, r.auth, r.trust, r.macs, r.ip)).unwrap_or_default();
-        self.recent.insert(0, Recent { id: id.into(), name: name.into(), os: os.into(), ts: crate::rv::now_ms(), thumb, auth, trust, macs, ip });
+        let (alias, thumb, auth, trust, macs, ip) = prev.map(|r| (r.alias, r.thumb, r.auth, r.trust, r.macs, r.ip)).unwrap_or_default();
+        self.recent.insert(0, Recent { id: id.into(), name: name.into(), alias, os: os.into(), ts: crate::rv::now_ms(), thumb, auth, trust, macs, ip });
         self.recent.truncate(12);
         self.save();
     }
 
-    pub fn set_thumb(&mut self, id: &str, jpeg: Vec<u8>) {
+    /// Rename: an empty name goes back to the computer's own.
+    pub fn set_alias(&mut self, id: &str, alias: &str) {
         if let Some(r) = self.recent.iter_mut().find(|r| r.id == id) {
-            r.thumb = jpeg;
+            r.alias = alias.trim().chars().take(60).collect();
             self.save();
         }
+    }
+
+    /// False when that computer is not in the list.
+    pub fn set_thumb(&mut self, id: &str, jpeg: Vec<u8>) -> bool {
+        let Some(r) = self.recent.iter_mut().find(|r| r.id == id) else { return false };
+        r.thumb = jpeg;
+        self.save();
+        true
     }
 
     /// A finished session for the connection log (newest first, at most 300).

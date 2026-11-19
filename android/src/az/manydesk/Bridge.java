@@ -108,6 +108,38 @@ public final class Bridge {
         a.stopService(new Intent(a, ScreenCapture.class));
     }
 
+    // ----------------------------------------------------------- wallpaper ---
+
+    /**
+     * The home-screen wallpaper as a JPEG at most maxWidth wide (the viewer's recent tile),
+     * or null. Android 13 and later show it to apps only with "All files access".
+     */
+    public static byte[] wallpaper(int maxWidth) {
+        final MainActivity a = activity;
+        if (a == null) return null;
+        try {
+            android.graphics.drawable.Drawable d = android.app.WallpaperManager.getInstance(a).getDrawable();
+            if (d == null) return null;
+            int w = d.getIntrinsicWidth(), h = d.getIntrinsicHeight();
+            if (w <= 0 || h <= 0) {
+                android.util.DisplayMetrics m = a.getResources().getDisplayMetrics();
+                w = m.widthPixels;
+                h = m.heightPixels;
+            }
+            float s = Math.min(1f, maxWidth / (float) w);
+            int bw = Math.max(1, Math.round(w * s)), bh = Math.max(1, Math.round(h * s));
+            android.graphics.Bitmap b = android.graphics.Bitmap.createBitmap(bw, bh, android.graphics.Bitmap.Config.ARGB_8888);
+            d.setBounds(0, 0, bw, bh);
+            d.draw(new android.graphics.Canvas(b));
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            b.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out);
+            b.recycle();
+            return out.toByteArray();
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
     // --------------------------------------------------------------- files ---
 
     /** "All files access" (Android 11+) or the storage permission (older). */
