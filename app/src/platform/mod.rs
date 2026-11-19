@@ -6,6 +6,7 @@ pub mod vdisplay;
 pub mod perms;
 pub mod system;
 pub mod update;
+pub mod tray;
 #[cfg(windows)]
 pub mod service;
 #[cfg(windows)]
