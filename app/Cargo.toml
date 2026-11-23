@@ -36,7 +36,7 @@ gethostname = "0.5"
 directories = "6"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rcgen = "0.13"
+rcgen = "0.14"
 if-addrs = "0.13"
 # the LAN port (lan.rs): several ManyDesks on one computer share it
 socket2 = { version = "0.6", features = ["all"] }
