@@ -1746,14 +1746,19 @@ impl App {
             ui.add_space(10.0);
             th::checkbox(ui, &mut self.turn.enabled, &t("turn.enable"));
             ui.add_space(10.0);
-            // .seg: Cloudflare | other TURN
+            // .seg: ManyDesk | Cloudflare | other TURN
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                for (i, (val, key)) in [("cloudflare", "turn.cf"), ("manual", "turn.manual")].into_iter().enumerate() {
-                    let on = self.turn.provider == val || (val == "cloudflare" && self.turn.provider.is_empty());
+                const SEG: [(&str, &str); 3] = [("manydesk", "turn.md"), ("cloudflare", "turn.cf"), ("manual", "turn.manual")];
+                for (i, (val, key)) in SEG.into_iter().enumerate() {
+                    let on = self.turn.provider == val || (val == "manydesk" && self.turn.provider.is_empty());
                     let g = ui.painter().layout_no_wrap(t(key), th::font(13.0, if on { W::Medium } else { W::Regular }), th::TEXT);
                     let (r, resp) = ui.allocate_exact_size(Vec2::new(g.size().x + 28.0, 32.0), Sense::click());
-                    let cr = if i == 0 { CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 } } else { CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 } };
+                    let cr = match i {
+                        0 => CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 },
+                        _ if i == SEG.len() - 1 => CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 },
+                        _ => CornerRadius::ZERO,
+                    };
                     ui.painter().rect(r, cr, if on { th::ACCENT_SOFT } else { th::SURFACE_2 }, Stroke::new(1.0, if on { th::ACCENT } else { th::BORDER_STRONG }), StrokeKind::Inside);
                     ui.painter().galley(r.center() - g.size() / 2.0, g, if on { th::ACCENT } else { th::TEXT });
                     if resp.hovered() {
@@ -1773,13 +1778,15 @@ impl App {
                     field(&mut c[0], &t("turn.user"), |ui| input(ui, &mut self.turn.username, false));
                     field(&mut c[1], &t("turn.pass"), |ui| input(ui, &mut self.turn.credential, true));
                 });
-            } else {
+            } else if self.turn.provider == "cloudflare" {
                 th::hint(ui, &t("turn.cfSteps").replace("<b>", "").replace("</b>", ""));
                 ui.add_space(8.0);
                 ui.columns(2, |c| {
                     field(&mut c[0], &t("turn.keyId"), |ui| input(ui, &mut self.turn.cf_key_id, false));
                     field(&mut c[1], &t("turn.token"), |ui| input(ui, &mut self.turn.cf_token, true));
                 });
+            } else {
+                th::hint(ui, &t("turn.mdHint"));
             }
             ui.add_space(12.0);
             let out = self.turn_out.lock().unwrap().clone();
@@ -1825,7 +1832,7 @@ impl App {
     fn edited_turn(&self) -> crate::store::TurnCfg {
         let mut c = self.turn.clone();
         if c.provider.is_empty() {
-            c.provider = "cloudflare".into();
+            c.provider = "manydesk".into();
         }
         c.urls = self.turn_urls.lines().map(str::trim).filter(|u| (u.starts_with("turn:") || u.starts_with("turns:")) && !u.contains(char::is_whitespace)).map(String::from).collect();
         c.cf_key_id = c.cf_key_id.trim().into();
@@ -1837,7 +1844,11 @@ impl App {
         let mut c = self.edited_turn();
         let prev = &self.core.store.turn;
         c.cf_cache = if c.cf_key_id == prev.cf_key_id && c.cf_token == prev.cf_token { prev.cf_cache.clone() } else { None };
-        let ready = if c.provider == "cloudflare" { !c.cf_key_id.is_empty() && !c.cf_token.is_empty() } else { !c.urls.is_empty() };
+        let ready = match c.provider.as_str() {
+            "cloudflare" => !c.cf_key_id.is_empty() && !c.cf_token.is_empty(),
+            "manual" => !c.urls.is_empty(),
+            _ => true,
+        };
         let msg = if !c.enabled {
             (t("turn.off"), false)
         } else if !ready {

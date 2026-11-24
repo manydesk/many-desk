@@ -149,7 +149,7 @@ pub struct Store {
 #[serde(default)]
 pub struct TurnCfg {
     pub enabled: bool,
-    /// "cloudflare" or "manual"
+    /// "manydesk" (the shared relay, turncfg::RELAY), "cloudflare" (the user's own key) or "manual"
     pub provider: String,
     pub urls: Vec<String>,
     pub username: String,
@@ -161,7 +161,10 @@ pub struct TurnCfg {
 }
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(default)]
 pub struct CfCreds {
+    /// whose credentials: "manydesk" or the Cloudflare key ID (older caches: empty)
+    pub source: String,
     pub urls: Vec<String>,
     pub username: String,
     pub credential: String,
@@ -192,7 +195,7 @@ impl Default for Store {
             log: Vec::new(),
             stun: DEFAULT_STUN.iter().map(|s| s.to_string()).collect(),
             recent: Vec::new(),
-            turn: TurnCfg { provider: "cloudflare".into(), ..Default::default() },
+            turn: TurnCfg { enabled: true, provider: "manydesk".into(), ..Default::default() },
             autoupdate: true,
             touchpad: true,
             lan_visible: true,
@@ -240,6 +243,11 @@ impl Store {
         }
         if s.stun.is_empty() {
             s.stun = Store::default().stun;
+        }
+        // TURN never set up (no key, no address): the ManyDesk relay, on, as on a new install.
+        let t = &s.turn;
+        if t.provider != "manydesk" && t.cf_key_id.is_empty() && t.cf_token.is_empty() && t.urls.is_empty() {
+            s.turn = Store::default().turn;
         }
         s.perms.control &= s.allow_control;
         s.perms.clipboard &= s.allow_clipboard;
