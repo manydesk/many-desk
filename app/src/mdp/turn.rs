@@ -49,6 +49,15 @@ const A_MAPPED: u16 = 0x0020;
 /// The channel used for the one peer of a session.
 const CHANNEL: u16 = 0x4000;
 
+/// An address a public TURN server relays to: not private, CGNAT (100.64/10),
+/// link-local, loopback or otherwise reserved.
+fn routable(ip: IpAddr) -> bool {
+    let IpAddr::V4(v) = ip else { return false };
+    let o = v.octets();
+    let reserved = o[0] == 0 || o[0] >= 224 || (o[0] == 100 && (o[1] & 0xc0) == 64) || (o[0] == 198 && (o[1] & 0xfe) == 18) || (o[0] == 192 && o[1] == 0 && o[2] == 0);
+    !(super::net::is_private(ip) || reserved)
+}
+
 /// A TURN server with static (long-term) credentials, as configured or fetched.
 #[derive(Clone, Debug)]
 pub struct Server {
@@ -325,27 +334,31 @@ impl Relay {
     }
 
     /// Lets these peers' packets through the relay (IP only; ports do not matter).
-    /// Public addresses first; private ones separately, since servers may refuse those
-    /// and one refused address fails the whole request.
+    /// One request per address: a server refuses some (Cloudflare answers 403 for private,
+    /// CGNAT 100.64/10, link-local and loopback ones), and one refused address fails the
+    /// whole request, so a phone's CGNAT address used to leave the relay with no
+    /// permission at all. Globally routable addresses go first. Ok when any was allowed.
     pub async fn permit(&self, sock: &UdpSocket, peers: &[SocketAddr]) -> Result<(), String> {
-        let mut public: Vec<(u16, Vec<u8>)> = vec![];
-        let mut private: Vec<(u16, Vec<u8>)> = vec![];
-        let mut seen: Vec<IpAddr> = vec![];
+        let mut ips: Vec<SocketAddr> = vec![];
         for p in peers.iter().filter(|p| p.is_ipv4()) {
-            if seen.contains(&p.ip()) {
-                continue;
+            if !ips.iter().any(|q| q.ip() == p.ip()) {
+                ips.push(*p);
             }
-            seen.push(p.ip());
-            let list = if super::net::is_private(p.ip()) { &mut private } else { &mut public };
-            list.push((A_PEER, xor_addr(*p)));
         }
-        if !private.is_empty() {
-            let _ = self.request(sock, CREATE_PERMISSION, &private).await;
+        ips.sort_by_key(|p| !routable(p.ip()));
+        let mut last = Ok(());
+        let mut any = false;
+        for p in &ips {
+            match self.request(sock, CREATE_PERMISSION, &[(A_PEER, xor_addr(*p))]).await {
+                Ok(()) => any = true,
+                Err(e) => last = Err(format!("{}: {e}", p.ip())),
+            }
         }
-        if public.is_empty() {
-            return Ok(());
+        if any || ips.is_empty() {
+            Ok(())
+        } else {
+            last
         }
-        self.request(sock, CREATE_PERMISSION, &public).await
     }
 
     /// Binds the session's channel to the chosen peer (also renews its permission).
@@ -531,10 +544,23 @@ mod tests {
             let r = Relay::allocate(&sock, &server).await.unwrap();
             println!("relayed {}", r.relayed);
             r.permit(&sock, &["8.8.8.8:1".parse().unwrap(), "10.0.0.1:1".parse().unwrap()]).await.unwrap();
+            // a phone's CGNAT address next to a public one: the public one is still permitted
+            r.permit(&sock, &["100.64.1.2:1".parse().unwrap(), "8.8.4.4:1".parse().unwrap()]).await.unwrap();
+            assert!(r.permit(&sock, &["100.64.1.2:1".parse().unwrap()]).await.is_err());
             r.bind(&sock, "8.8.8.8:5000".parse().unwrap()).await.unwrap();
             let bad = Server { credential: "wrong".into(), ..server };
             assert!(Relay::allocate(&sock, &bad).await.is_err());
         });
+    }
+
+    #[test]
+    fn routable_leaves_out_what_relays_refuse() {
+        for a in ["104.30.136.143", "37.61.115.101", "8.8.8.8", "100.63.255.1", "100.128.0.1"] {
+            assert!(routable(a.parse().unwrap()), "{a}");
+        }
+        for a in ["100.64.1.2", "100.127.255.254", "10.0.0.1", "172.20.10.2", "192.168.1.5", "169.254.1.1", "127.0.0.1", "198.18.0.1", "192.0.0.8", "0.1.2.3", "224.0.0.1", "::1"] {
+            assert!(!routable(a.parse().unwrap()), "{a}");
+        }
     }
 
     #[test]
