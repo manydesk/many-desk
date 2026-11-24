@@ -113,7 +113,7 @@ For unattended access, set a password (and optionally TOTP) under **Settings →
 
 Quality adapts per viewer: resolution follows the viewer's window, and frame rate and bitrate step down under CPU or network pressure before resolution does, which keeps text readable.
 
-**NAT traversal.** Most connections are direct. Behind carrier-grade or symmetric NAT (common on mobile networks), configure a TURN relay under **Settings → TURN relay**. Cloudflare Realtime TURN (1,000 GB per month free) is supported with short-lived credentials, as is any standard TURN server. Only one side needs it.
+**NAT traversal.** Most connections are direct. Behind carrier-grade or symmetric NAT (common on mobile networks), ManyDesk falls back to a TURN relay. By default it uses the ManyDesk relay: a small Cloudflare Worker (`turn-worker/`) that hands out short-lived Cloudflare Realtime TURN credentials, so nothing needs setting up and no TURN secret ships in the app. Under **Settings → TURN relay** you can use your own Cloudflare Realtime TURN key (1,000 GB per month free) or any standard TURN server instead. Only one side needs it.
 
 ## Security
 
@@ -164,6 +164,7 @@ app/                   the application (Rust)
   assets/i18n.json     translations
 android/  ios/         platform shells
 native/                macOS and Windows input helpers
+turn-worker/           the ManyDesk relay (Cloudflare Worker: short-lived TURN credentials)
 scripts/               build and packaging
 ```
 
