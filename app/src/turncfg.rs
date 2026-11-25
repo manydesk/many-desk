@@ -12,9 +12,14 @@ use crate::store::{CfCreds, TurnCfg};
 /// secret never ships in the app.
 pub const RELAY: &str = "https://manydesk-turn.rzayevsukur.workers.dev/v1/ice";
 
+/// The plain-UDP `turn:` addresses of a list, in its order.
+fn udp_urls(urls: &[String]) -> Vec<String> {
+    urls.iter().map(|u| u.trim()).filter(|u| u.starts_with("turn:") && !u.contains("transport=tcp")).map(String::from).collect()
+}
+
 /// The first plain-UDP `turn:` address of a list.
 fn udp_url(urls: &[String]) -> Option<String> {
-    urls.iter().map(|u| u.trim()).find(|u| u.starts_with("turn:") && !u.contains("transport=tcp")).map(String::from)
+    udp_urls(urls).into_iter().next()
 }
 
 /// Fresh Cloudflare credentials (24 h). Errors are i18n keys ("cf.auth", …).
@@ -80,7 +85,8 @@ pub async fn server(cfg: TurnCfg) -> Result<Option<Server>, String> {
     }
     if cfg.provider == "manual" {
         let url = udp_url(&cfg.urls).ok_or_else(|| crate::i18n::t("turn.needUrl"))?;
-        return Ok(Some(Server { url, username: cfg.username, credential: cfg.credential }));
+        let more = udp_urls(&cfg.urls).into_iter().skip(1).collect();
+        return Ok(Some(Server { url, username: cfg.username, credential: cfg.credential, more }));
     }
     let own = cfg.provider == "cloudflare";
     let source = if own { cfg.cf_key_id.as_str() } else { "manydesk" };
@@ -94,8 +100,9 @@ pub async fn server(cfg: TurnCfg) -> Result<Option<Server>, String> {
             c
         }
     };
-    let url = udp_url(&creds.urls).ok_or_else(|| crate::i18n::t("cf.noTurn"))?;
-    Ok(Some(Server { url, username: creds.username, credential: creds.credential }))
+    let mut urls = udp_urls(&creds.urls).into_iter();
+    let url = urls.next().ok_or_else(|| crate::i18n::t("cf.noTurn"))?;
+    Ok(Some(Server { url, username: creds.username, credential: creds.credential, more: urls.collect() }))
 }
 
 /// Settings → TURN → Test: allocates a relay with these settings.
@@ -105,8 +112,8 @@ pub async fn test(cfg: TurnCfg) -> Result<String, String> {
     let server = server(cfg).await?.ok_or("off")?;
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(|e| e.to_string())?;
     let t0 = std::time::Instant::now();
-    let relay = tokio::time::timeout(Duration::from_secs(8), crate::mdp::turn::Relay::allocate(&sock, &server)).await.map_err(|_| crate::i18n::t("turn.noResp"))??;
-    Ok(format!("{}\n{} → {} ({} ms)", crate::i18n::t("turn.works"), server.url, relay.relayed, t0.elapsed().as_millis()))
+    let (url, relay) = crate::mdp::turn::Relay::allocate_any(&sock, &server).await.map_err(|e| if e.is_empty() { crate::i18n::t("turn.noResp") } else { e })?;
+    Ok(format!("{}\n{} → {} ({} ms)", crate::i18n::t("turn.works"), url, relay.relayed, t0.elapsed().as_millis()))
 }
 
 #[cfg(test)]
@@ -122,6 +129,8 @@ mod tests {
         let c = ice_creds(&data, "manydesk", "md.noTurn").unwrap();
         assert_eq!((c.source.as_str(), c.username.as_str(), c.credential.as_str()), ("manydesk", "u", "c"));
         assert_eq!(udp_url(&c.urls).as_deref(), Some("turn:turn.cloudflare.com:3478?transport=udp"));
+        let all = ["turn:a:3478?transport=udp", "turn:a:3478?transport=tcp", "turns:a:5349?transport=tcp", "turn:a:443?transport=udp", "turn:a:80?transport=tcp"].map(String::from);
+        assert_eq!(udp_urls(&all), ["turn:a:3478?transport=udp", "turn:a:443?transport=udp"]);
         assert!(matches!(ice_creds(&json!({ "iceServers": [] }), "manydesk", "md.noTurn"), Err((k, _)) if k == "md.noTurn"));
     }
 

@@ -483,7 +483,12 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
             eprintln!("[turn] permission: {e}");
         }
     }
-    let (path, relayed) = net::punch(&sock, &peers, &token, me.host, timeout, relay.as_ref()).await.ok_or("noroute")?;
+    let Some((path, relayed)) = net::punch(&sock, &peers, &token, me.host, timeout, relay.as_ref()).await else {
+        if let Some(r) = &relay {
+            r.release(&sock).await;
+        }
+        return Err("noroute".into());
+    };
     *me.path.lock().unwrap() = Some(path);
     me.relayed.store(relayed, Ordering::Relaxed);
     let runtime = Arc::new(quinn::TokioRuntime);
@@ -493,8 +498,11 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
             turn::RelaySocket::new(sock, r, path)
         }
         other => {
-            // Direct path: the allocation is not needed any more (it times out on its own).
-            drop(other);
+            // Direct path: the allocation is not needed any more. Released, so the server
+            // does not hold this port (a later socket may get it: 437 Allocation Mismatch).
+            if let Some(r) = other {
+                r.release(&sock).await;
+            }
             quinn::Runtime::wrap_udp_socket(&*runtime, sock.into_std().map_err(err)?).map_err(err)?
         }
     };
@@ -598,17 +606,29 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
 impl Session {
     /// Binds the socket and gathers candidates. Returns (session, {cands, fp, token}).
     pub async fn prepare(host: bool, stun: Vec<String>, turn: Option<turn::Server>, events: OnEvent, media: OnMedia) -> Result<(Arc<Session>, Value), String> {
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
+        let mut sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
         let mut cands = net::gather(&sock, &stun).await;
         let mut relay = None;
         if let Some(t) = turn {
-            match tokio::time::timeout(Duration::from_secs(6), turn::Relay::allocate(&sock, &t)).await {
-                Ok(Ok(r)) => {
-                    cands.push(r.relayed);
-                    relay = Some(r);
+            for attempt in 0..3 {
+                match turn::Relay::allocate_any(&sock, &t).await {
+                    Ok((url, r)) => {
+                        eprintln!("[turn] relay {} via {url}", r.relayed);
+                        cands.push(r.relayed);
+                        relay = Some(r);
+                    }
+                    // 437: the server still holds an allocation for this port (an earlier
+                    // session's socket had it, the system gave the port out again). A new port.
+                    Err(e) if e.ends_with(" 437") && attempt < 2 => {
+                        eprintln!("[turn] {e}: the port is still taken there, another one");
+                        sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.map_err(err)?;
+                        cands = net::gather(&sock, &stun).await;
+                        continue;
+                    }
+                    Err(e) if e.is_empty() => eprintln!("[turn] no address of {} answered", t.url),
+                    Err(e) => eprintln!("[turn] {e}"),
                 }
-                Ok(Err(e)) => eprintln!("[turn] {e}"),
-                Err(_) => eprintln!("[turn] no answer from {}", t.url),
+                break;
             }
         }
         let identity = tls::Identity::new()?;
