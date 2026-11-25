@@ -58,12 +58,17 @@ fn routable(ip: IpAddr) -> bool {
     !(super::net::is_private(ip) || reserved)
 }
 
+const NO_ANSWER: &str = "TURN server did not answer";
+
 /// A TURN server with static (long-term) credentials, as configured or fetched.
 #[derive(Clone, Debug)]
 pub struct Server {
     pub url: String,
     pub username: String,
     pub credential: String,
+    /// further UDP addresses of the same server, tried in turn when `url` does not answer
+    /// (a network that blocks UDP 3478 may let 443 or 53 through)
+    pub more: Vec<String>,
 }
 
 // ---- STUN messages ----
@@ -250,7 +255,7 @@ async fn transact<'b>(
                 }
             }
         }
-        let n = answer.ok_or("TURN server did not answer")?;
+        let n = answer.ok_or(NO_ANSWER)?;
         let p = parse(&buf[..n]).unwrap();
         if p.kind & 0x0110 == SUCCESS {
             return Ok(n);
@@ -299,6 +304,22 @@ impl Relay {
         let relayed = p.get(A_RELAYED).and_then(parse_xor_addr).ok_or("TURN: no relayed address")?;
         let _mapped = p.get(A_MAPPED).and_then(parse_xor_addr);
         Ok(Relay { server: addr, relayed, auth: Mutex::new(auth.ok_or("TURN: no auth")?) })
+    }
+
+    /// Allocates through the first of the server's addresses that answers (`url`, then
+    /// `more`), 6 s each. Returns the address used. Only silence moves on to the next
+    /// address; an answer that refuses (credentials, 437) is the result. "" = none answered.
+    pub async fn allocate_any(sock: &UdpSocket, server: &Server) -> Result<(String, Relay), String> {
+        for url in std::iter::once(&server.url).chain(&server.more) {
+            let one = Server { url: url.clone(), more: vec![], ..server.clone() };
+            match tokio::time::timeout(Duration::from_secs(6), Relay::allocate(sock, &one)).await {
+                Ok(Ok(r)) => return Ok((url.clone(), r)),
+                Ok(Err(e)) if e == NO_ANSWER => eprintln!("[turn] no answer from {url}"),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => eprintln!("[turn] no answer from {url}"),
+            }
+        }
+        Err(String::new())
     }
 
     async fn request(&self, sock: &UdpSocket, kind: u16, attrs: &[(u16, Vec<u8>)]) -> Result<(), String> {
@@ -389,7 +410,12 @@ impl Relay {
         vec![r.auth(&a), b.auth(&a)]
     }
 
-    fn release(&self) -> Vec<u8> {
+    /// Gives the allocation back (a Refresh with lifetime 0), when it is not used.
+    pub async fn release(&self, sock: &UdpSocket) {
+        let _ = sock.send_to(&self.release_msg(), self.server).await;
+    }
+
+    fn release_msg(&self) -> Vec<u8> {
         let a = self.auth.lock().unwrap().clone();
         let mut r = Msg::new(REFRESH, &rand::random());
         r.attr(A_LIFETIME, &0u32.to_be_bytes());
@@ -458,7 +484,7 @@ impl RelaySocket {
 impl Drop for RelaySocket {
     fn drop(&mut self) {
         // Free the allocation right away instead of letting it time out.
-        let _ = self.io.try_send_to(&self.relay.release(), self.relay.server);
+        let _ = self.io.try_send_to(&self.relay.release_msg(), self.relay.server);
     }
 }
 
@@ -537,7 +563,7 @@ mod tests {
     fn turn_allocates() {
         let spec = std::env::var("MANYDESK_TEST_TURN").unwrap();
         let p: Vec<&str> = spec.split('|').collect();
-        let server = Server { url: p[0].into(), username: p[1].into(), credential: p[2].into() };
+        let server = Server { url: p[0].into(), username: p[1].into(), credential: p[2].into(), more: vec![] };
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let sock = UdpSocket::bind("0.0.0.0:0").await.unwrap();
