@@ -88,6 +88,11 @@ pub struct Session {
     closed: AtomicBool,
     /// host: the viewer may open TCP tunnels (the Tunnel permission)
     tunnel_ok: AtomicBool,
+    /// host: wakes open tunnels when the Tunnel permission is taken back, so they end too
+    tunnel_revoked: tokio::sync::Notify,
+    /// host: the viewer is admitted (password proven or accepted); until then its audio
+    /// datagrams are dropped, not played on this computer's speakers
+    audio_ok: AtomicBool,
     /// tunnel connections open now (both sides)
     pub tunnels: AtomicUsize,
     /// host: when the keyframe now on its way started (requests meanwhile are ignored)
@@ -166,11 +171,16 @@ async fn serve_tunnel(me: Arc<Session>, mut tx: quinn::SendStream, mut rx: quinn
     if tx.write_all(&[0]).await.is_err() {
         return;
     }
-    pipe(&me, tcp, tx, rx).await;
+    pipe_until(&me, tcp, tx, rx, Some(&me.tunnel_revoked)).await;
 }
 
 /// Copies between a TCP connection and a tunnel stream until either side closes.
-pub async fn pipe(me: &Session, tcp: tokio::net::TcpStream, mut tx: quinn::SendStream, mut rx: quinn::RecvStream) {
+pub async fn pipe(me: &Session, tcp: tokio::net::TcpStream, tx: quinn::SendStream, rx: quinn::RecvStream) {
+    pipe_until(me, tcp, tx, rx, None).await;
+}
+
+/// The same, and on the host until the Tunnel permission is taken back (`stop`).
+async fn pipe_until(me: &Session, tcp: tokio::net::TcpStream, mut tx: quinn::SendStream, mut rx: quinn::RecvStream, stop: Option<&tokio::sync::Notify>) {
     me.tunnels.fetch_add(1, Ordering::SeqCst);
     let _ = tcp.set_nodelay(true);
     let (mut r, mut w) = tcp.into_split();
@@ -182,7 +192,18 @@ pub async fn pipe(me: &Session, tcp: tokio::net::TcpStream, mut tx: quinn::SendS
         let _ = tokio::io::copy(&mut rx, &mut w).await;
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut w).await;
     };
-    tokio::join!(up, down);
+    let both = async {
+        tokio::join!(up, down);
+    };
+    match stop {
+        Some(stop) => {
+            tokio::select! {
+                _ = both => {}
+                _ = stop.notified() => {}
+            }
+        }
+        None => both.await,
+    }
     me.tunnels.fetch_sub(1, Ordering::SeqCst);
 }
 
@@ -388,6 +409,12 @@ fn start_uni_receiver(me: Arc<Session>, conn: quinn::Connection, video: Option<F
                     return;
                 }
                 let camera = head[0] & UNI_CAMERA != 0;
+                // Refuse what this side would only throw away before buffering it: screen
+                // frames on the host, camera frames the host has not allowed.
+                if (!camera && tx.is_none()) || (camera && me.host && !me.camera_ok.load(Ordering::SeqCst)) {
+                    let _ = s.stop(0u32.into());
+                    return;
+                }
                 let Ok(data) = s.read_to_end(if camera { 4 << 20 } else { 32 << 20 }).await else { return };
                 let ts = u32::from_be_bytes(head[1..5].try_into().unwrap());
                 let seq = u32::from_be_bytes(head[5..9].try_into().unwrap());
@@ -469,12 +496,27 @@ fn start_video_receiver(me: Arc<Session>, conn: quinn::Connection) {
     });
 }
 
+/// The most hole-punch candidates taken from the other side.
+const MAX_CANDS: usize = 16;
+
 // ---- connection setup ----
 
 async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
     let sock = me.sock.lock().unwrap().take().ok_or("already connecting")?;
     let token: [u8; 16] = hex::decode(&peer.token).ok().and_then(|t| t.try_into().ok()).ok_or("bad token")?;
-    let peers: Vec<SocketAddr> = peer.cands.iter().filter_map(|c| c.parse().ok()).collect();
+    // The other side's candidates: at most a few distinct usable addresses (it chooses
+    // them, and every one gets a punch every 80 ms, directly and through the relay).
+    let mut peers: Vec<SocketAddr> = vec![];
+    for c in peer.cands.iter().filter_map(|c| c.parse::<SocketAddr>().ok()) {
+        let ip = c.ip();
+        let bad = c.port() == 0 || ip.is_unspecified() || ip.is_multicast() || matches!(ip, std::net::IpAddr::V4(v) if v.is_broadcast());
+        if !bad && !peers.contains(&c) {
+            peers.push(c);
+        }
+        if peers.len() == MAX_CANDS {
+            break;
+        }
+    }
     // Short: on failure the viewer falls back to WebRTC (which can relay through TURN).
     let timeout = if me.host { Duration::from_secs(12) } else { Duration::from_secs(20) };
     let relay = me.relay.lock().unwrap().take();
@@ -576,7 +618,7 @@ async fn establish(me: Arc<Session>, peer: Peer) -> Result<(), String> {
                         }
                     }
                 }
-                Some(&DGRAM_AUDIO) => (rx_me.media)(Media::Audio(d[1..].to_vec())),
+                Some(&DGRAM_AUDIO) if !rx_me.host || rx_me.audio_ok.load(Ordering::Relaxed) => (rx_me.media)(Media::Audio(d[1..].to_vec())),
                 Some(&DGRAM_CAM_KEY) => rx_me.cam_key.store(true, Ordering::Relaxed),
                 _ => {}
             }
@@ -659,6 +701,8 @@ impl Session {
             relayed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             tunnel_ok: AtomicBool::new(false),
+            tunnel_revoked: tokio::sync::Notify::new(),
+            audio_ok: AtomicBool::new(false),
             tunnels: AtomicUsize::new(0),
             key_in_flight: Mutex::new(None),
             frames_in: AtomicU64::new(0),
@@ -826,6 +870,14 @@ impl Session {
     /// Host: whether the viewer may open TCP tunnels.
     pub fn allow_tunnels(&self, on: bool) {
         self.tunnel_ok.store(on, Ordering::SeqCst);
+        if !on {
+            self.tunnel_revoked.notify_waiters();
+        }
+    }
+
+    /// Host: the viewer is admitted, so its microphone may be heard here.
+    pub fn allow_audio(&self) {
+        self.audio_ok.store(true, Ordering::Relaxed);
     }
 
     /// Viewer: one TCP connection to `host:port` as seen from the host computer.

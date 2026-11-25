@@ -127,7 +127,11 @@ impl Core {
             }
             "drawclear" => self.hosts[i].strokes.clear(),
             "switch" => {
-                // The viewer offers its own computer: connect back with its token.
+                // The viewer offers its own computer: connect back with its token. Only a
+                // viewer that controls this computer may make it connect out.
+                if !self.hosts[i].perms.control || self.hosts[i].req.mode != SessMode::Desktop {
+                    return true;
+                }
                 let (Some(token), from) = (m["token"].as_str().filter(|s| s.len() == 32), self.hosts[i].req.from.clone()) else { return true };
                 if from.len() != 9 {
                     return true;

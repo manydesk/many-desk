@@ -1,5 +1,5 @@
 // Persistent settings and the recent-sessions list (JSON in the user's config folder).
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -215,11 +215,82 @@ fn path() -> PathBuf {
         let _ = std::fs::create_dir_all(&dir);
         return dir.join("settings.json");
     }
-    let dir = directories::ProjectDirs::from("az", "manydesk", "ManyDesk")
-        .map(|d| d.config_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join("manydesk"));
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = match directories::ProjectDirs::from("az", "manydesk", "ManyDesk") {
+        Some(d) => {
+            let dir = d.config_dir().to_path_buf();
+            owner_only(&dir);
+            dir
+        }
+        // No home folder: a folder of our own in the temp dir (not one another user made)
+        None => {
+            let dir = std::env::temp_dir().join("manydesk");
+            if owner_only(&dir) {
+                dir
+            } else {
+                fresh_private_dir("manydesk")
+            }
+        }
+    };
     dir.join("settings.json")
+}
+
+/// Makes `dir` (creating it) a folder only this user can use: the settings hold the
+/// unattended key, which works like the password. False when it is not ours (another
+/// user made it first, or it is a link).
+fn owner_only(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        let Ok(m) = std::fs::symlink_metadata(dir) else { return false };
+        if !m.is_dir() {
+            return false;
+        }
+        // ours: a file we create in it gets our uid, the same as the folder's
+        let probe = dir.join(".owner-check");
+        let _ = std::fs::remove_file(&probe);
+        let mine = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).and_then(|f| f.metadata()).map(|f| f.uid());
+        let _ = std::fs::remove_file(&probe);
+        if mine.ok() != Some(m.uid()) {
+            return false;
+        }
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).is_ok()
+    }
+}
+
+/// A new folder in the temp dir that nobody else can have made (created exclusively).
+fn fresh_private_dir(name: &str) -> PathBuf {
+    loop {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", hex::encode(rand::random::<[u8; 8]>())));
+        #[cfg(unix)]
+        let made = {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let made = std::fs::create_dir(&dir);
+        match made {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return dir,
+        }
+    }
+}
+
+/// A folder of ManyDesk's own for working files (clipboard pictures, updates), only this
+/// user can use: never a fixed name in the shared temp dir.
+pub fn private_dir(name: &str) -> PathBuf {
+    let dir = config_dir().join(name);
+    if owner_only(&dir) {
+        dir
+    } else {
+        fresh_private_dir(&format!("manydesk-{name}"))
+    }
 }
 
 impl Store {
@@ -259,7 +330,14 @@ impl Store {
         if let Ok(b) = serde_json::to_vec_pretty(self) {
             let p = path();
             let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, b).is_ok() {
+            let _ = std::fs::remove_file(&tmp);
+            // only this user may read it: the unattended key works like the password
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            let written = o.open(&tmp).and_then(|mut f| std::io::Write::write_all(&mut f, &b));
+            if written.is_ok() {
                 let _ = std::fs::rename(tmp, p);
             }
         }
@@ -313,7 +391,36 @@ pub fn downloads() -> PathBuf {
         return dir;
     }
     #[allow(unreachable_code)]
+    // no Downloads folder set up (XDG): ~/Downloads, not the shared temp dir
     directories::UserDirs::new()
-        .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
-        .unwrap_or_else(std::env::temp_dir)
+        .and_then(|u| u.download_dir().map(|d| d.to_path_buf()).or_else(|| Some(u.home_dir().join("Downloads"))))
+        .map(|d| {
+            let _ = std::fs::create_dir_all(&d);
+            d
+        })
+        .unwrap_or_else(|| private_dir("received"))
+}
+
+#[cfg(all(test, unix))]
+mod perm_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_folders_are_owner_only() {
+        let dir = std::env::temp_dir().join(format!("md-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(owner_only(&dir));
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        // a link is not taken as our folder
+        let link = std::env::temp_dir().join(format!("md-private-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!owner_only(&link));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+        let f = fresh_private_dir("md-fresh");
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(&f);
+    }
 }

@@ -403,6 +403,12 @@ impl Rendezvous {
                         inc = stream.next() => match inc {
                             Some(Ok(Message::Binary(b))) => {
                                 buf.extend_from_slice(&b);
+                                // Nothing we accept is bigger than an event (64 KiB) plus its
+                                // topic: a broker sending more is dropped (and reconnected to)
+                                // instead of being buffered up to the 256 MiB MQTT allows.
+                                if buf.len() > MQTT_MAX_PACKET + 5 && mqtt_packet_len(&buf).is_none_or(|n| n > MQTT_MAX_PACKET) {
+                                    break;
+                                }
                                 while let Some((ptype, body)) = mqtt_take_packet(&mut buf) {
                                     match ptype >> 4 {
                                         2 => {
@@ -507,6 +513,22 @@ fn mqtt_publish(topic: &str, payload: &[u8]) -> Vec<u8> {
     mqtt_packet(0x30, body)
 }
 
+const MQTT_MAX_PACKET: usize = 64 * 1024 + 1024;
+
+/// The declared length of the first MQTT packet in `buf`, once its header is complete.
+fn mqtt_packet_len(buf: &[u8]) -> Option<usize> {
+    let (mut len, mut mult) = (0usize, 1usize);
+    for i in 1..5 {
+        let b = *buf.get(i)?;
+        len += (b & 0x7f) as usize * mult;
+        mult *= 128;
+        if b & 0x80 == 0 {
+            return Some(len);
+        }
+    }
+    None
+}
+
 // WebSocket frames may carry partial or several MQTT packets.
 fn mqtt_take_packet(buf: &mut Vec<u8>) -> Option<(u8, Vec<u8>)> {
     if buf.len() < 2 {
@@ -589,4 +611,17 @@ fn parse_http_date(s: &str) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     Some((days * 86400 + hms[0] * 3600 + hms[1] * 60 + hms[2]) * 1000)
+}
+
+#[cfg(test)]
+mod mqtt_tests {
+    use super::*;
+
+    #[test]
+    fn packet_length_is_read_from_the_header() {
+        assert_eq!(mqtt_packet_len(&[0x30, 0x05]), Some(5));
+        assert_eq!(mqtt_packet_len(&[0x30, 0xff, 0xff, 0xff, 0x7f]), Some(268_435_455));
+        assert_eq!(mqtt_packet_len(&[0x30, 0xff]), None);
+        assert!(mqtt_packet_len(&[0x30, 0xff, 0xff, 0xff, 0x7f]).unwrap() > MQTT_MAX_PACKET);
+    }
 }

@@ -238,17 +238,33 @@ async fn send_items(s: &Session, items: Vec<(PathBuf, String, bool)>, batch: &st
     Ok(true)
 }
 
-/// Where a received entry goes: `rel` under `base` (None if it tries to leave it); files
-/// get a free name when one is taken, folders are merged.
+/// Where a received entry goes: `rel` under `base` (None if it tries to leave it).
+/// Folders are merged; for files the caller creates a new one with `create_unique`.
 pub fn target(base: &Path, rel: &str, dir: bool) -> Option<PathBuf> {
     let p = safe_join(base, rel)?;
-    if dir {
-        return Some(p);
+    if !dir {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
     }
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).ok()?;
+    Some(p)
+}
+
+/// A new file at `p`, or at "a (2).txt" … when the name is taken. Never opens an existing
+/// file (created exclusively, so a name taken in the meantime or a link planted there is
+/// not written through); an error when no free name is left.
+pub fn create_unique(p: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for i in 1..10_000 {
+        let c = if i == 1 { p.to_path_buf() } else { p.with_file_name(format!("{stem} ({i}){ext}")) };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&c) {
+            Ok(f) => return Ok((c, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    Some(unique(p))
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free file name"))
 }
 
 /// Delete (folders with their contents).
@@ -383,22 +399,6 @@ pub fn walk(paths: &[PathBuf]) -> Vec<(PathBuf, String, bool)> {
     out
 }
 
-/// A free name: "a.txt" → "a (2).txt" when taken.
-pub fn unique(p: PathBuf) -> PathBuf {
-    if !p.exists() {
-        return p;
-    }
-    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    for i in 2..10_000 {
-        let c = p.with_file_name(format!("{stem} ({i}){ext}"));
-        if !c.exists() {
-            return c;
-        }
-    }
-    p
-}
-
 pub fn human_size(n: u64) -> String {
     let f = n as f64;
     if f < 1024.0 {
@@ -415,6 +415,21 @@ pub fn human_size(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_unique_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("md-unique-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, "ORIGINAL").unwrap();
+        let (q, _) = create_unique(&p).unwrap();
+        assert_eq!(q, dir.join("a (2).txt"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "ORIGINAL");
+        let (r, _) = create_unique(&dir.join("b.txt")).unwrap();
+        assert_eq!(r, dir.join("b.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn safe_join_stays_inside() {

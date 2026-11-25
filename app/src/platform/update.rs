@@ -189,8 +189,10 @@ pub async fn download(u: &Update, dir: &std::path::Path) -> Result<std::path::Pa
 }
 
 /// Where updates are downloaded and staged.
+/// A folder only this user can write: on Linux the package is installed from here as root
+/// (pkexec apt-get), so another user must not be able to swap it after it was checked.
 fn work_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("manydesk-update")
+    crate::store::private_dir("update")
 }
 
 /// What an install led to.
