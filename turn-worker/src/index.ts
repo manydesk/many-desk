@@ -4,6 +4,7 @@ interface Env {
   TURN_KEY_ID: string;
   TURN_KEY_SECRET: string;
   LIMIT: RateLimit;
+  ALL: RateLimit;
 }
 
 const TTL = 86_400;
@@ -18,9 +19,16 @@ export default {
     if (url.pathname !== "/v1/ice") return json({ error: "not found" }, 404);
     if (req.method !== "POST") return json({ error: "use POST" }, 405);
 
-    const ip = req.headers.get("cf-connecting-ip") ?? "unknown";
+    // Cloudflare's edge always sets it; without it there is no caller to count, so no
+    // credentials (rather than one shared bucket for every such caller).
+    const ip = req.headers.get("cf-connecting-ip");
+    if (!ip) return json({ error: "no client address" }, 400);
     const { success } = await env.LIMIT.limit({ key: ip });
     if (!success) return json({ error: "too many requests" }, 429);
+    // All callers together (per Cloudflare location): rotating addresses must not turn the
+    // relay into an unbounded source of credentials on the operator's TURN key.
+    const all = await env.ALL.limit({ key: "all" });
+    if (!all.success) return json({ error: "relay busy" }, 429);
 
     const res = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`, {
       method: "POST",

@@ -47,6 +47,14 @@ pub fn version() -> String {
 /// permission, running a given setup as the service. It exists only in builds made with
 /// `--features test-hooks`: in a released ManyDesk an environment variable must not be
 /// able to open the computer to whoever connects.
+/// The copy the Windows service runs as SYSTEM at the sign-in screen (--signin): only
+/// the owner's unattended password lets anyone in, with input only (no Accept prompt for
+/// whoever sits there, no terminal, files, tunnels or settings).
+pub fn signin() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::args().any(|a| a == "--signin"))
+}
+
 pub(crate) fn unsafe_hook(name: &str) -> Option<String> {
     if cfg!(feature = "test-hooks") {
         std::env::var(name).ok()
@@ -77,6 +85,12 @@ pub fn run() -> eframe::Result<()> {
     // Service control (Windows). These return before any window is created.
     #[cfg_attr(not(windows), allow(unused_variables))]
     let args: Vec<String> = std::env::args().collect();
+    // the sign-in-screen copy reads the owner's settings (--config-dir, from the service)
+    if signin() {
+        if let Some(dir) = args.iter().position(|a| a == "--config-dir").and_then(|i| args.get(i + 1)) {
+            std::env::set_var("MANYDESK_CONFIG_DIR", dir);
+        }
+    }
     #[cfg(windows)]
     {
         if args.iter().any(|a| a == "--service") {

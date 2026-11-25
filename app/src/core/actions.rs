@@ -129,7 +129,7 @@ impl Core {
             "switch" => {
                 // The viewer offers its own computer: connect back with its token. Only a
                 // viewer that controls this computer may make it connect out.
-                if !self.hosts[i].perms.control || self.hosts[i].req.mode != SessMode::Desktop {
+                if !self.hosts[i].perms.control || self.hosts[i].req.mode != SessMode::Desktop || crate::signin() {
                     return true;
                 }
                 let (Some(token), from) = (m["token"].as_str().filter(|s| s.len() == 32), self.hosts[i].req.from.clone()) else { return true };

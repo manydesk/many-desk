@@ -401,6 +401,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     });
 
     let mut child: Option<HANDLE> = None;
+    // the child is the sign-in-screen copy (SYSTEM): it ends once someone signs in
+    let mut child_signin = false;
     let mut last_session = 0xFFFF_FFFFu32;
     // the signed-in user runs ManyDesk already (autostart, the Start menu): our copy left
     // at once; look again only now and then, less often while that goes on (5 s up to 15 s)
@@ -420,6 +422,15 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         }
         // Keep an app running in the active console session.
         let session = WTSGetActiveConsoleSessionId();
+        // Someone signed in: the SYSTEM copy gives way to one running as that user (it
+        // must not stay on behind the user's session with SYSTEM rights).
+        if child_signin && session != 0xFFFF_FFFF && user_signed_in(session) {
+            if let Some(h) = child {
+                TerminateProcess(h, 0);
+                WaitForSingleObject(h, 5000);
+            }
+            child_signin = false;
+        }
         let alive = child.map(|h| WaitForSingleObject(h, 0) != WAIT_OBJECT_0).unwrap_or(false);
         if !alive {
             if let Some(h) = child.take() {
@@ -439,8 +450,9 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
             if let Some(h) = child.take() {
                 CloseHandle(h);
             }
-            if let Some(h) = launch_in_session(session) {
+            if let Some((h, signin)) = launch_in_session(session) {
                 child = Some(h);
+                child_signin = signin;
                 last_session = session;
             }
         }
@@ -466,14 +478,68 @@ unsafe fn send_sas() {
     }
 }
 
-/// Starts manydesk --background in `session` as the signed-in user (or SYSTEM on the
-/// sign-in screen) so it can capture and control that desktop.
-unsafe fn launch_in_session(session: u32) -> Option<HANDLE> {
+/// A user is signed in to `session`.
+unsafe fn user_signed_in(session: u32) -> bool {
+    let mut token: HANDLE = std::ptr::null_mut();
+    if WTSQueryUserToken(session, &mut token) == 0 {
+        return false;
+    }
+    CloseHandle(token);
+    true
+}
+
+/// HKLM\SOFTWARE\ManyDesk: only administrators (and this service) can change it.
+const REG_KEY: &str = r"SOFTWARE\ManyDesk";
+/// The signed-in owner's settings folder, which the sign-in-screen copy reads.
+const REG_OWNER: &str = "SigninConfigDir";
+
+unsafe fn reg_set(name: &str, value: &str) {
+    use windows_sys::Win32::System::Registry::*;
+    let mut key: HKEY = std::ptr::null_mut();
+    if RegCreateKeyExW(HKEY_LOCAL_MACHINE, wide(REG_KEY).as_ptr(), 0, std::ptr::null(), 0, KEY_SET_VALUE, std::ptr::null(), &mut key, std::ptr::null_mut()) != 0 {
+        return;
+    }
+    let v = wide(value);
+    RegSetValueExW(key, wide(name).as_ptr(), 0, REG_SZ, v.as_ptr() as *const u8, (v.len() * 2) as u32);
+    RegCloseKey(key);
+}
+
+unsafe fn reg_get(name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::*;
+    let mut buf = vec![0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    if RegGetValueW(HKEY_LOCAL_MACHINE, wide(REG_KEY).as_ptr(), wide(name).as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut size) != 0 {
+        return None;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    Some(String::from_utf16_lossy(&buf[..n])).filter(|s| !s.is_empty())
+}
+
+/// Remembers where the signed-in user keeps ManyDesk's settings ({RoamingAppData}\
+/// manydesk\ManyDesk\config, as `directories` places them): at the sign-in screen the
+/// service's copy uses that user's unattended password and ID.
+unsafe fn remember_owner(token: HANDLE) {
+    use windows_sys::Win32::UI::Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath};
+    let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+    if SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, token, &mut p) != 0 || p.is_null() {
+        return;
+    }
+    let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+    let base = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+    windows::Win32::System::Com::CoTaskMemFree(Some(p as *const std::ffi::c_void));
+    reg_set(REG_OWNER, &format!(r"{base}\manydesk\ManyDesk\config"));
+}
+
+/// Starts manydesk --background in `session` as the signed-in user (or, on the sign-in
+/// screen, the restricted SYSTEM copy: the second value is true) so it can capture and
+/// control that desktop.
+unsafe fn launch_in_session(session: u32) -> Option<(HANDLE, bool)> {
     let mut token: HANDLE = std::ptr::null_mut();
     if WTSQueryUserToken(session, &mut token) == 0 {
         // No user yet (sign-in screen): run as SYSTEM on the Winlogon desktop.
-        return launch_system(session);
+        return launch_system(session).map(|h| (h, true));
     }
+    remember_owner(token);
     let exe = std::env::current_exe().ok()?;
     let mut cmd = wide(&format!("\"{}\" --background", exe.display()));
     let mut env: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -502,14 +568,16 @@ unsafe fn launch_in_session(session: u32) -> Option<HANDLE> {
     CloseHandle(token);
     if ok != 0 {
         CloseHandle(pi.hThread);
-        Some(pi.hProcess)
+        Some((pi.hProcess, false))
     } else {
         None
     }
 }
 
 /// Sign-in screen: a SYSTEM process on the Winlogon desktop (best effort — enough for
-/// input; capturing the secure desktop depends on the Windows build's policy).
+/// input; capturing the secure desktop depends on the Windows build's policy). It runs
+/// restricted (--signin, lib.rs): only the owner's unattended password admits a viewer,
+/// with input only; nobody at the screen can accept, change settings or open a shell.
 unsafe fn launch_system(session: u32) -> Option<HANDLE> {
     let proc = GetCurrentProcess();
     let mut tok: HANDLE = std::ptr::null_mut();
@@ -524,7 +592,8 @@ unsafe fn launch_system(session: u32) -> Option<HANDLE> {
     }
     SetTokenInformation(dup, TokenSessionId, &session as *const _ as *const _, std::mem::size_of::<u32>() as u32);
     let exe = std::env::current_exe().ok()?;
-    let mut cmd = wide(&format!("\"{}\" --background", exe.display()));
+    let config = reg_get(REG_OWNER).map(|d| format!(" --config-dir \"{d}\"")).unwrap_or_default();
+    let mut cmd = wide(&format!("\"{}\" --background --signin{config}", exe.display()));
     let mut si: STARTUPINFOW = std::mem::zeroed();
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut desktop = wide(r"winsta0\winlogon");

@@ -146,9 +146,13 @@ jobs:
         # The same "ManyDesk Local Signing" certificate as local builds: macOS keys the Screen
         # Recording / Accessibility grants to it, so they survive an update. Without the
         # secret: an ad hoc signature (grants are asked for again after each update).
+        # Signing keys only for pushes to main and release tags, never for pull requests:
+        # their code runs here before review. (The PR's own copy of this file decides on
+        # pull_request, so the lasting control is the protected "release" environment and
+        # the tag ruleset on GitHub; this keeps the default path from handing the keys out.)
         env:
-          P12: ${{ secrets.MACOS_SIGN_P12_B64 }}
-          P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          P12: ${{ github.event_name == 'push' && secrets.MACOS_SIGN_P12_B64 || '' }}
+          P12_PASSWORD: ${{ github.event_name == 'push' && secrets.MACOS_SIGN_P12_PASSWORD || '' }}
         run: |
           if [ -z "$P12" ]; then echo "MANYDESK_SIGN_ID=-" >> "$GITHUB_ENV"; exit 0; fi
           KC="$RUNNER_TEMP/sign.keychain-db"; KCPW="$(openssl rand -hex 16)"
@@ -188,7 +192,9 @@ jobs:
         env:
           # every ABI for a release, the common one for the everyday build
           ABIS: ${{ needs.version.outputs.release == 'true' && 'arm64-v8a armeabi-v7a x86_64' || 'arm64-v8a' }}
-          MANYDESK_ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          # release keystore only for pushes (see the macOS signing step); a pull request
+          # gets a throwaway one
+          MANYDESK_ANDROID_KEYSTORE_B64: ${{ github.event_name == 'push' && secrets.ANDROID_KEYSTORE_B64 || '' }}
         run: bash scripts/build-android.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
