@@ -102,12 +102,20 @@ pub fn encode_code(obj: &Value) -> String {
     format!("{CODE_PREFIX}{}", URL_SAFE_NO_PAD.encode(z.finish().unwrap_or_default()))
 }
 
+/// The largest inflated invite/offer/answer code accepted.
+const MAX_CODE_JSON: u64 = 256 * 1024;
+
 pub fn decode_code(code: &str) -> Option<Value> {
     let clean: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     let body = clean.strip_prefix(CODE_PREFIX)?;
     let packed = URL_SAFE_NO_PAD.decode(body.trim_end_matches('=')).ok()?;
+    // Inflated size is capped (a real code is a few KiB): a small deflate bomb would
+    // otherwise grow to many MB of JSON before any check.
     let mut json = String::new();
-    flate2::read::DeflateDecoder::new(&packed[..]).read_to_string(&mut json).ok()?;
+    flate2::read::DeflateDecoder::new(&packed[..]).take(MAX_CODE_JSON + 1).read_to_string(&mut json).ok()?;
+    if json.len() as u64 > MAX_CODE_JSON {
+        return None;
+    }
     let v: Value = serde_json::from_str(&json).ok()?;
     (v["v"] == 1 && (v.get("sdp").is_some() || v.get("mdp").is_some())).then_some(v)
 }
@@ -129,6 +137,15 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_inflation_is_capped() {
+        // a few KiB that inflate to megabytes are refused, not parsed
+        let big = serde_json::json!({ "v": 1, "mdp": { "cands": vec![0; 2_000_000] } });
+        let code = encode_code(&big);
+        assert!(code.len() < 64 * 1024, "{}", code.len());
+        assert!(decode_code(&code).is_none());
+    }
 
     #[test]
     fn code_roundtrip() {

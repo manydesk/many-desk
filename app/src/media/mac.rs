@@ -453,8 +453,10 @@ extern "C" fn on_encoded(refcon: *mut c_void, src: *mut c_void, status: i32, fla
 // ---- ScreenCaptureKit output delegate ----
 
 struct Ivars {
-    out: Arc<Out>,
+    // Declared first, so dropped first: the encoder session is invalidated (Encoder::drop)
+    // while `out`, which its callbacks reach through a raw pointer (the refcon), still lives.
     enc: Mutex<Encoder>,
+    out: Arc<Out>,
 }
 
 define_class!(

@@ -189,14 +189,14 @@ impl Core {
                 }
             }
             #[cfg(not(mobile))]
-            Some("in") => {
+            Some("in") if self.hosts[i].perms.terminal => {
                 if let (Some(term), Ok(d)) = (self.hosts[i].terms.get_mut(&id), B64.decode(m["d"].as_str().unwrap_or(""))) {
                     let _ = term.writer.write_all(&d);
                     let _ = term.writer.flush();
                 }
             }
             #[cfg(not(mobile))]
-            Some("size") => {
+            Some("size") if self.hosts[i].perms.terminal => {
                 if let Some(term) = self.hosts[i].terms.get(&id) {
                     let (rows, cols) = size(m);
                     let _ = term.master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });

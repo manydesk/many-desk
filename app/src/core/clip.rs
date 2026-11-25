@@ -139,7 +139,7 @@ fn html_fragment(h: &str) -> String {
 
 /// Where received clipboard batches live (the newest few are kept for pasting).
 fn clip_root() -> PathBuf {
-    std::env::temp_dir().join("manydesk-clip")
+    crate::store::private_dir("clip")
 }
 
 pub fn clip_dir(batch: &str) -> Option<PathBuf> {
@@ -267,7 +267,7 @@ pub fn start_watch() {
                 if quiet || img.bytes.len() > MAX_IMAGE_BYTES {
                     continue;
                 }
-                let path = std::env::temp_dir().join(format!("manydesk-clip-out-{}.png", std::process::id()));
+                let path = crate::store::private_dir("clip-out").join(format!("{}.png", std::process::id()));
                 let ok = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()).is_some_and(|i| i.save(&path).is_ok());
                 if ok {
                     bus::emit("clip:image", json!({ "path": path }));

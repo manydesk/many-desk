@@ -62,13 +62,20 @@ impl Input {
         #[cfg(windows)]
         {
             static HELPER: &[u8] = include_bytes!("../../build/bin-win/manydesk-input.exe");
-            let dir = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir).join("ManyDesk");
+            // This user's own folder (LOCALAPPDATA, else ManyDesk's settings folder): never
+            // the temp dir, which the SYSTEM copy at the sign-in screen would share with
+            // other users. What is there runs only if it is exactly the shipped helper.
+            let dir = match std::env::var_os("LOCALAPPDATA") {
+                Some(d) => std::path::PathBuf::from(d).join("ManyDesk"),
+                None => crate::store::private_dir("bin"),
+            };
             let path = dir.join("manydesk-input.exe");
-            if std::fs::metadata(&path).map(|m| m.len() != HELPER.len() as u64).unwrap_or(true) {
+            if std::fs::read(&path).ok().as_deref() != Some(HELPER) {
                 let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::remove_file(&path);
                 let _ = std::fs::write(&path, HELPER);
             }
-            if path.exists() {
+            if std::fs::read(&path).ok().as_deref() == Some(HELPER) {
                 return Some(path);
             }
         }

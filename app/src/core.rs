@@ -35,6 +35,9 @@ use crate::video::Feed;
 use crate::media::camera::Camera;
 
 pub const MAX_HOST: usize = 5;
+/// Unattended password: at most this many wrong proofs within the window, across sessions.
+const AUTH_FAIL_MAX: usize = 10;
+const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const REQUEST_SECS: u64 = 60;
 const PRESENCE_EVERY: Duration = Duration::from_secs(45);
 const PRESENCE_FRESH: Duration = Duration::from_secs(100);
@@ -459,6 +462,9 @@ pub struct Core {
     /// switch sides: our offer (token, tab, when), and the tab to close once reversed
     switch_offer: Option<(String, u32, Instant)>,
     switch_close_tab: Option<u32>,
+    /// failed unattended password proofs (when), across sessions: the 3 tries of one
+    /// session must not reset by simply asking again
+    auth_fails: VecDeque<Instant>,
     /// While the session view is drawn, closes wait here: the view holds the tab's index,
     /// and removing the tab under it panicked (index out of bounds) on Disconnect.
     hold_close: Option<Vec<u32>>,
@@ -528,6 +534,7 @@ impl Core {
             privacy_on: false,
             switch_offer: None,
             switch_close_tab: None,
+            auth_fails: VecDeque::new(),
             hold_close: None,
             tunnels: Vec::new(),
             next_tunnel: 0,
@@ -1382,9 +1389,11 @@ impl Core {
         match msg["t"].as_str() {
             Some("ping") => self.answer_ping(&msg),
             Some("cancel") => {
+                // only the requester itself (the key that signed its request) may cancel it:
+                // anyone who knows our ID can read the request and its reply topic
                 let reply = msg["reply"].as_str().unwrap_or("");
-                self.queue.retain(|r| r.reply != reply);
-                if self.pending.as_ref().is_some_and(|r| r.reply == reply) {
+                self.queue.retain(|r| r.reply != reply || r.peer != pubkey);
+                if self.pending.as_ref().is_some_and(|r| r.reply == reply && r.peer == pubkey) {
                     self.pending = None;
                     self.show_next();
                 }
@@ -1429,7 +1438,7 @@ impl Core {
                 // Unattended access: start the session right away; it waits for the password
                 // while the prompt still lets someone at this computer accept.
                 let un = &self.store.unattended;
-                if native && un.enabled && !un.key.is_empty() {
+                if native && un.enabled && !un.key.is_empty() && !self.auth_locked() {
                     let req = self.queue.back().unwrap().clone();
                     let hk = self.start_host(req, Permissions::NONE, true);
                     self.queue.back_mut().unwrap().host_key = Some(hk);
@@ -1438,6 +1447,15 @@ impl Core {
             }
             _ => {}
         }
+    }
+
+    /// Too many wrong unattended passwords lately (from any requester): no more sessions
+    /// wait for a password for a while; requests still reach the Accept prompt.
+    fn auth_locked(&mut self) -> bool {
+        while self.auth_fails.front().is_some_and(|t| t.elapsed() > AUTH_FAIL_WINDOW) {
+            self.auth_fails.pop_front();
+        }
+        self.auth_fails.len() >= AUTH_FAIL_MAX
     }
 
     fn show_next(&mut self) {
@@ -1647,6 +1665,10 @@ impl Core {
     pub fn set_host_perms(&mut self, key: u32, perms: Permissions) {
         let Some(i) = self.hosts.iter().position(|h| h.key == key && h.auth.is_none()) else { return };
         self.hosts[i].perms = self.hosts[i].req.mode.mask(perms);
+        // Terminal taken back: the shells already open end too (dropping one kills it)
+        if !self.hosts[i].perms.terminal {
+            self.hosts[i].terms.clear();
+        }
         self.send_perms(i);
         self.update_host_input();
     }
@@ -1656,6 +1678,7 @@ impl Core {
         if let Some(s) = self.session(sid) {
             s.allow_tunnels(p.tunnel);
             s.allow_camera(p.camera);
+            s.allow_audio();
         }
         if !p.camera {
             self.hosts[i].cams.remote_off();
@@ -2132,7 +2155,8 @@ impl Core {
                     // a trusted device proves its token instead of the TOTP code
                     let trusted = !un.totp.is_empty() && m["tt"].as_str().is_some_and(|tt| un.trusted.iter().any(|d| d.id == from && crate::auth::trust_ok(&d.token, &nonce, &hfp, &vfp, tt)));
                     let totp = if trusted { "" } else { un.totp.as_str() };
-                    let ok = crate::auth::verify(&un.key, totp, &nonce, &hfp, &vfp, m["proof"].as_str().unwrap_or(""));
+                    // unattended access turned off since the session started: no password admits it
+                    let ok = un.enabled && !un.key.is_empty() && crate::auth::verify(&un.key, totp, &nonce, &hfp, &vfp, m["proof"].as_str().unwrap_or(""));
                     if ok {
                         let perms = un.perms;
                         if !trusted && !un.totp.is_empty() && m["trust"].as_bool() == Some(true) && !from.is_empty() {
@@ -2150,6 +2174,7 @@ impl Core {
                         self.authorize(key, perms, true);
                         return;
                     }
+                    self.auth_fails.push_back(Instant::now());
                     let a = self.hosts[i].auth.as_mut().unwrap();
                     a.tries += 1;
                     let left = 3u8.saturating_sub(a.tries);
@@ -2315,8 +2340,7 @@ impl Core {
             match m["t"].as_str() {
                 Some("fstart") => {
                     let name = sanitize(m["name"].as_str().unwrap_or("file"));
-                    let path = unique(store::downloads().join(&name));
-                    if let Ok(file) = std::fs::File::create(&path) {
+                    if let Ok((path, file)) = fm::create_unique(&store::downloads().join(&name)) {
                         *slot = Some(Incoming { id: m["id"].as_str().unwrap_or("").into(), name, file, path, batch: None });
                     }
                 }
@@ -2376,8 +2400,8 @@ impl Core {
                 if empty_dir {
                     let _ = std::fs::create_dir_all(&path);
                 } else {
-                    match std::fs::File::create(&path) {
-                        Ok(file) => {
+                    match fm::create_unique(&path) {
+                        Ok((path, file)) => {
                             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                             *slot = Some(Incoming { id: batch, name, file, path, batch: Some(m["fm"].as_str().unwrap_or("").into()) });
                         }
@@ -3031,15 +3055,6 @@ fn sanitize(name: &str) -> String {
     let n: String = name.chars().map(|c| if "/\\:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect();
     let n = n.trim_start_matches('.').chars().take(200).collect::<String>();
     if n.is_empty() { "file".into() } else { n }
-}
-
-fn unique(p: PathBuf) -> PathBuf {
-    if !p.exists() {
-        return p;
-    }
-    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    (1..1000).map(|i| p.with_file_name(format!("{stem} ({i}){ext}"))).find(|c| !c.exists()).unwrap_or(p)
 }
 
 /// An address typed where an ID goes: "192.168.1.20", "fe80::1", "[::1]" (direct IP).
