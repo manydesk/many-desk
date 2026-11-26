@@ -147,6 +147,10 @@ const CAP_FPS: [f64; 6] = [30.0, 20.0, 15.0, 10.0, 7.0, 5.0];
 /// how many ticks (of ~2 s) of motion or stillness switch that.
 const MOTION_FPS: f64 = 20.0;
 const MOTION_TICKS: u32 = 3;
+/// A frame counts as motion only when it carries at least this many bits a pixel: a video
+/// or a scroll changes much of the picture (0.03–0.04 measured), while a spinner or a
+/// blinking caret offers just as many frames that are nearly empty (about 0.001).
+const MOTION_BPP: f64 = 0.004;
 
 const CALM: Duration = Duration::from_secs(10);
 const CPU_SCALE_MAX: f64 = 2.5;
@@ -273,7 +277,7 @@ impl Quality {
             }
         }
         let cap_changed = self.tick_cap(reason, goodput);
-        let motion_changed = self.tick_motion(video);
+        let motion_changed = self.tick_motion(video, goodput);
         // the path's capacity: recompute the bitrate when it moved by a third
         let mut link_changed = false;
         if rtt_ms > 0.0 && cwnd > 0.0 {
@@ -378,13 +382,17 @@ impl Quality {
     /// Whether the picture keeps moving: most of the frame rate offered for three ticks in
     /// a row (the capture itself runs at the current rate), still again after three of
     /// little. True when that changed.
-    fn tick_motion(&mut self, video: &Value) -> bool {
+    fn tick_motion(&mut self, video: &Value, goodput: f64) -> bool {
         let Some(offered) = video["framesOffered"].as_f64() else { return false };
         let fps = self.applied.map(|a| a.1).unwrap_or(CPU_FPS[0]);
-        if offered >= (fps * 0.7).max(4.0) {
+        // how much of the picture the frames change, from what reached the viewer (not
+        // known, as from an older viewer: the frames are only counted)
+        let px = video["frameWidth"].as_f64().unwrap_or(0.0) * video["frameHeight"].as_f64().unwrap_or(0.0);
+        let big = px <= 0.0 || goodput <= 0.0 || goodput / offered.max(1.0) / px >= MOTION_BPP;
+        if offered >= (fps * 0.7).max(4.0) && big {
             self.motion_ticks += 1;
             self.still_ticks = 0;
-        } else if offered < fps * 0.3 {
+        } else if offered < fps * 0.3 || !big {
             self.still_ticks += 1;
             self.motion_ticks = 0;
         }
@@ -675,6 +683,34 @@ mod tests {
         assert!(!q.moving);
         let (scale, fps, _) = q.params((1920, 1080)).unwrap_or(q.applied.unwrap());
         assert!(fps < MOTION_FPS && scale == 1.0, "still: {fps} fps, scale {scale}");
+    }
+
+    #[test]
+    fn a_spinner_is_not_motion() {
+        // the screen offers 57 frames a second, but they are nearly empty (a spinner in a
+        // corner: 180 kbit/s at 2044x1328, as measured): text must keep its size
+        let spin = |frames: u64| json!({ "framesEncoded": frames, "framesOffered": 57.0, "frameWidth": 2044, "frameHeight": 1328, "qualityLimitationReason": "none" });
+        let mut q = Quality::new();
+        q.set_view(1920.0, 1080.0);
+        q.params((1920, 1080));
+        let mut frames = 0;
+        for _ in 0..6 {
+            frames += 114;
+            q.tick(&spin(frames), 40.0, 1e4, 1.8e5);
+        }
+        assert!(!q.moving);
+        // a video at that size and rate: 5 Mbit/s
+        for _ in 0..3 {
+            frames += 114;
+            q.tick(&spin(frames), 40.0, 1e4, 5e6);
+        }
+        assert!(q.moving);
+        // and back to the spinner: still again
+        for _ in 0..3 {
+            frames += 114;
+            q.tick(&spin(frames), 40.0, 1e4, 1.8e5);
+        }
+        assert!(!q.moving);
     }
 
     #[test]
