@@ -3,7 +3,8 @@
 A Cloudflare Worker that hands ManyDesk short-lived Cloudflare Realtime TURN credentials. The TURN key's secret stays in the Worker, so it never ships inside the app.
 
 - `POST /v1/ice` returns `{"iceServers": [...], "ttl": 86400}`, the answer of Cloudflare's `generate-ice-servers`. The app caches it for 24 hours.
-- Each IP may ask 10 times a minute per Cloudflare location; after that it gets `429`.
+- Each IP may ask 10 times a minute per Cloudflare location, and all callers together 1,200 times a minute per location; past either limit the answer is `429`. Requests without `cf-connecting-ip` get `400`.
+- Credentials still last 24 hours: a relayed session renews its TURN allocation with them, so a shorter lifetime would cut long sessions. Bound the spend on the account instead: set a usage notification for Realtime TURN in the Cloudflare dashboard (Notifications → Billing / usage).
 - The app's address for it is `RELAY` in `app/src/turncfg.rs`.
 
 ## Deploy

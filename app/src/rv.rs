@@ -69,6 +69,17 @@ pub fn new_session_key() -> (Key, String) {
     (k, STANDARD.encode(k))
 }
 
+/// A key of its own for each label (here: each pinged ID) from one secret, and its base64
+/// form: whoever learns one cannot use it to speak for another.
+pub fn derive_key(base: &Key, label: &str) -> (Key, String) {
+    let mut h = Sha256::new();
+    h.update(b"manydesk-derive-v1\0");
+    h.update(base);
+    h.update(label.as_bytes());
+    let k: Key = h.finalize().into();
+    (k, STANDARD.encode(k))
+}
+
 pub fn import_session_key(b64: &str) -> Option<Key> {
     STANDARD.decode(b64).ok()?.try_into().ok()
 }
@@ -137,6 +148,16 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derived_keys_differ_per_label() {
+        let (base, _) = new_session_key();
+        let (a, a64) = derive_key(&base, "111111111");
+        let (b, _) = derive_key(&base, "222222222");
+        assert_ne!(a, b);
+        assert_eq!(import_session_key(&a64), Some(a));
+        assert_eq!(derive_key(&base, "111111111").0, a);
+    }
 
     #[test]
     fn code_inflation_is_capped() {

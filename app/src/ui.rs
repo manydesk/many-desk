@@ -2069,6 +2069,13 @@ impl App {
         if !compact(ui.ctx()) {
             self.page_title(ui, "nav.settings");
         }
+        // the sign-in-screen copy runs as SYSTEM: its settings are the owner's, read only
+        if crate::signin() {
+            th::panel(ui, |ui| {
+                ui.label(t("set.signin"));
+            });
+            return;
+        }
         th::panel(ui, |ui| {
             th::h3(ui, &t("set.lang"));
             let mut choice = self.core.store.lang.clone();

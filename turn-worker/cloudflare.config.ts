@@ -14,6 +14,8 @@ export default defineConfig({
       TURN_KEY_SECRET: bindings.secret(),
       // per IP, per Cloudflare location; the app asks about once a day
       LIMIT: bindings.rateLimit({ namespace: "4701", simple: { limit: 10, period: 60 } }),
+      // all callers together, per location: about 20 new credentials a second at most
+      ALL: bindings.rateLimit({ namespace: "4702", simple: { limit: 1200, period: 60 } }),
     },
   },
 });

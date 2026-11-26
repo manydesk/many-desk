@@ -445,7 +445,6 @@ pub struct Core {
     presence: HashMap<String, (Instant, bool)>,
     presence_topic: String,
     presence_key: Key,
-    presence_raw: String,
     last_poll: Option<Instant>,
     pong_log: HashMap<String, Instant>,
     pong_window: (Instant, u32),
@@ -491,7 +490,7 @@ impl Core {
         rv.start();
         let my_topic = rv::topic_for_id(&store.my_id);
         rv.subscribe(&my_topic, true);
-        let (presence_key, presence_raw) = rv::new_session_key();
+        let (presence_key, _) = rv::new_session_key();
         let presence_topic = rv::random_topic();
         rv.subscribe(&presence_topic, false);
         // The ID keys are slow to derive (PBKDF2): warm them up off the UI thread.
@@ -519,7 +518,6 @@ impl Core {
             presence: HashMap::new(),
             presence_topic,
             presence_key,
-            presence_raw,
             last_poll: None,
             pong_log: HashMap::new(),
             pong_window: (Instant::now(), 0),
@@ -805,8 +803,10 @@ impl Core {
                 self.on_my_topic(msg, pubkey);
             }
         } else if topic == self.presence_topic {
-            if let Some(msg) = rv::open(&self.presence_key, content) {
-                self.on_pong(msg);
+            // the key that opens it says which computer answered (not what the answer claims)
+            let ids: Vec<String> = self.store.recent.iter().map(|r| r.id.clone()).collect();
+            if let Some((id, msg)) = ids.into_iter().find_map(|id| rv::open(&rv::derive_key(&self.presence_key, &id).0, content).map(|m| (id, m))) {
+                self.on_pong(&id, msg);
             }
         } else if let Some(i) = self.hosts.iter().position(|h| h.hs_topic.as_deref() == Some(&topic)) {
             if pubkey != self.hosts[i].req.peer {
@@ -929,6 +929,7 @@ impl Core {
                 self.end_handshake(i);
                 let reason = match msg["reason"].as_str() {
                     Some("acl") => format!(" ({})", t("err.acl")),
+                    Some("signin") => format!(" ({})", t("err.signin")),
                     Some(r) => format!(" ({})", r.chars().take(120).collect::<String>()),
                     None => String::new(),
                 };
@@ -1422,7 +1423,7 @@ impl Core {
                     self.send(&reply, &key, json!({ "t": "reject", "reason": "acl" }));
                     return;
                 }
-                self.queue.push_back(Request {
+                let req = Request {
                     reply,
                     key,
                     peer: pubkey,
@@ -1434,7 +1435,20 @@ impl Core {
                     mode: SessMode::parse(msg["mode"].as_str().unwrap_or("")),
                     at: Instant::now(),
                     host_key: None,
-                });
+                };
+                // Sign-in screen: nobody there may let anyone in, only the owner's unattended
+                // password can (the session waits for it, with no prompt).
+                if crate::signin() {
+                    let un = &self.store.unattended;
+                    if native && un.enabled && !un.key.is_empty() && !self.auth_locked() {
+                        self.start_host(req, Permissions::NONE, true);
+                    } else {
+                        let (reply, key) = (req.reply.clone(), req.key);
+                        self.send(&reply, &key, json!({ "t": "reject", "reason": "signin" }));
+                    }
+                    return;
+                }
+                self.queue.push_back(req);
                 // Unattended access: start the session right away; it waits for the password
                 // while the prompt still lets someone at this computer accept.
                 let un = &self.store.unattended;
@@ -1664,6 +1678,7 @@ impl Core {
 
     pub fn set_host_perms(&mut self, key: u32, perms: Permissions) {
         let Some(i) = self.hosts.iter().position(|h| h.key == key && h.auth.is_none()) else { return };
+        let perms = if crate::signin() { Permissions { control: perms.control, ..Permissions::NONE } } else { perms };
         self.hosts[i].perms = self.hosts[i].req.mode.mask(perms);
         // Terminal taken back: the shells already open end too (dropping one kills it)
         if !self.hosts[i].perms.terminal {
@@ -1694,6 +1709,8 @@ impl Core {
             return;
         }
         let mode = self.hosts[i].req.mode;
+        // sign-in screen: input only (the person at the screen could do no more)
+        let perms = if crate::signin() { Permissions { control: perms.control, ..Permissions::NONE } } else { perms };
         self.hosts[i].perms = mode.mask(perms);
         self.hosts[i].unattended = by_password;
         // The prompt for this request is no longer needed.
@@ -2792,9 +2809,12 @@ impl Core {
 
     /// Asks these computers whether they are online (answers arrive as "pong").
     fn ping_ids(&mut self, ids: Vec<String>) {
-        let (rv, topic, key) = (self.rv.clone(), self.presence_topic.clone(), self.presence_raw.clone());
+        let (rv, topic, base) = (self.rv.clone(), self.presence_topic.clone(), self.presence_key);
         crate::rt::spawn_blocking(move || {
             for id in ids {
+                // each computer gets a reply key of its own, so its answer can speak only for
+                // itself (with one shared key, any pinged computer could rename the others)
+                let (_, key) = rv::derive_key(&base, &id);
                 let obj = json!({ "t": "ping", "reply": topic, "k": key, "ts": rv::now_ms() });
                 let content = rv::seal(&rv::key_for_id(&id), &obj);
                 let (rv, t) = (rv.clone(), rv::topic_for_id(&id));
@@ -2805,13 +2825,12 @@ impl Core {
         });
     }
 
-    fn on_pong(&mut self, msg: Value) {
+    fn on_pong(&mut self, id: &str, msg: Value) {
         if msg["t"] != "pong" {
             return;
         }
-        let id = msg["id"].as_str().map(String::from).or_else(|| msg["id"].as_u64().map(|n| n.to_string())).unwrap_or_default();
         let Some(r) = self.store.recent.iter_mut().find(|r| r.id == id) else { return };
-        self.presence.insert(id, (Instant::now(), msg["busy"].as_bool().unwrap_or(false)));
+        self.presence.insert(id.to_string(), (Instant::now(), msg["busy"].as_bool().unwrap_or(false)));
         if let Some(n) = msg["name"].as_str().filter(|n| !n.is_empty() && *n != r.name) {
             r.name = n.chars().take(60).collect();
             self.store.save();

@@ -327,6 +327,10 @@ impl Store {
     }
 
     pub fn save(&self) {
+        // the sign-in-screen copy (SYSTEM) only reads the owner's settings
+        if crate::signin() {
+            return;
+        }
         if let Ok(b) = serde_json::to_vec_pretty(self) {
             let p = path();
             let tmp = p.with_extension("tmp");
