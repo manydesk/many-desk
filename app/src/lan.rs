@@ -119,7 +119,11 @@ impl Lan {
             if !me.visible || me.id.is_empty() {
                 return;
             }
-            json!({ "k": "hi", "id": me.id, "name": me.name, "os": me.os, "macs": macs(), "q": q })
+            // signed (ident.rs): with our own addresses in it, so a copy sent from elsewhere
+            // does not move where others look for us
+            let (macs, ips, ts) = (macs(), own_ips(), crate::rv::now_ms());
+            let sig = crate::ident::sign(HI_CTX, &[&me.id, &macs.join(","), &ips.join(","), &ts.to_string()]);
+            json!({ "k": "hi", "id": me.id, "name": me.name, "os": me.os, "macs": macs, "q": q, "ips": ips, "ts": ts, "idk": crate::ident::public(), "sig": sig })
         };
         match to {
             Some(a) => self.send(&msg, a),
@@ -141,13 +145,28 @@ impl Lan {
                 if id.len() != 9 || !id.chars().all(|c| c.is_ascii_digit()) || id == self.me.lock().unwrap().id {
                     return;
                 }
+                // Who signed it (ident.rs): None from ManyDesk before 0.26. A signature that
+                // does not check out, or one sent from an address it does not name, is not
+                // that computer's.
+                let strs = |k: &str| v[k].as_array().map(|a| a.iter().take(16).filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+                let idk = match v["idk"].as_str() {
+                    None => None,
+                    Some(k) => {
+                        let (ips, ts) = (strs("ips"), v["ts"].as_i64().unwrap_or(0));
+                        let parts = [id.as_str(), &strs("macs").join(","), &ips.join(","), &ts.to_string()];
+                        if !crate::ident::is_key(k) || !crate::ident::fresh(ts) || !ips.contains(&from.ip().to_string()) || !crate::ident::verify(k, HI_CTX, &parts, v["sig"].as_str().unwrap_or("")) {
+                            return;
+                        }
+                        Some(k.to_ascii_lowercase())
+                    }
+                };
                 let s = |k: &str, n: usize| v[k].as_str().unwrap_or("").chars().take(n).collect::<String>();
                 let macs: Vec<String> = v["macs"].as_array().map(|a| a.iter().filter_map(|m| m.as_str()).filter(|m| parse_mac(m).is_some()).take(8).map(String::from).collect()).unwrap_or_default();
                 let peer = Peer { id: id.clone(), name: s("name", 60), os: s("os", 20), ip: from.ip(), seen: Instant::now() };
                 if self.peers.lock().unwrap().insert(id.clone(), peer).is_none() {
                     eprintln!("[lan] {id} at {}", from.ip());
                 }
-                bus::emit("lan:peer", json!({ "id": id, "name": s("name", 60), "os": s("os", 20), "macs": macs, "ip": from.ip().to_string(), "q": s("q", 32) }));
+                bus::emit("lan:peer", json!({ "id": id, "name": s("name", 60), "os": s("os", 20), "macs": macs, "ip": from.ip().to_string(), "q": s("q", 32), "idk": idk }));
             }
             Some("ev") => self.rv.on_event(&v["ev"]),
             _ => {}
@@ -243,6 +262,24 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 }
 
 /// The broadcast address of every IPv4 network here, and 255.255.255.255.
+/// What the identity key signs in a LAN hello (ident.rs).
+const HI_CTX: &str = "manydesk-hi-v1";
+
+/// This computer's own IPv4 addresses (signed into each hello).
+fn own_ips() -> Vec<String> {
+    let mut out: Vec<String> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some(v4.ip.to_string()),
+            _ => None,
+        })
+        .collect();
+    out.dedup();
+    out.truncate(16);
+    out
+}
+
 fn broadcast_addrs() -> Vec<Ipv4Addr> {
     let mut out = vec![Ipv4Addr::BROADCAST];
     for i in if_addrs::get_if_addrs().unwrap_or_default() {

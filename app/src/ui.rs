@@ -1569,6 +1569,12 @@ impl App {
                 }
                 th::hint(ui, &t("share.newIdHint"));
             });
+            // what others know this computer by (ident.rs), to compare when they are warned
+            ui.add_space(12.0);
+            ui.label(text(t("set.identity"), 12.5, W::Medium, th::MUTED));
+            ui.add_space(4.0);
+            ui.label(mono(crate::ident::code(&crate::ident::public()), 15.0, W::Semibold, th::TEXT, 1.0));
+            th::hint(ui, &t("set.identityHint"));
         });
     }
 
@@ -1697,6 +1703,8 @@ impl App {
             if th::btn(ui, &t("btn.save"), Btn::Primary).clicked() {
                 let ids: Vec<String> = self.acl_text.lines().map(rv::normalize_id).filter(|i| i.len() == 9).collect();
                 self.acl_text = ids.iter().map(|i| rv::format_id(i)).collect::<Vec<_>>().join("\n");
+                // an ID taken off the list loses the key it was held to (ident.rs)
+                self.core.store.acl_keys.retain(|id, _| ids.contains(id));
                 self.core.store.acl = ids;
                 self.core.store.save();
                 self.core.toast(t("turn.saved"), false);
@@ -2483,8 +2491,11 @@ impl App {
             _ => (t("req.accepted"), false),
         };
         let (title, sas) = (rv::format_id(&tab.peer_id), tab.sas.clone());
+        // the identity key changed (ident.rs): its new code, and a way to accept it
+        let mismatch = tab.ident == Some(crate::ident::Check::Mismatch);
+        let new_code = tab.host_idk.as_deref().map(crate::ident::code);
         let card_w = 380.0_f32.min(stage.width() - 32.0);
-        let mut close = false;
+        let (mut close, mut forget) = (false, false);
         egui::Area::new(Id::unique(("conn", key))).order(egui::Order::Middle).fixed_pos(Pos2::new(stage.center().x - card_w / 2.0, stage.center().y - 130.0)).show(ui.ctx(), |ui| {
             egui::Frame::new()
                 .fill(th::SURFACE)
@@ -2506,14 +2517,30 @@ impl App {
                             ui.label(text(t("sas"), 12.5, W::Regular, th::MUTED));
                             ui.label(mono(&sas, 18.0, W::Semibold, th::OK, 1.5));
                         }
+                        if mismatch {
+                            ui.add_space(10.0);
+                            let hint = match &new_code {
+                                Some(c) => tf("ident.new", &[("code", c)]),
+                                None => t("ident.unsigned"),
+                            };
+                            ui.label(text(hint, 12.5, W::Regular, th::MUTED));
+                        }
                         ui.add_space(20.0);
+                        if mismatch {
+                            if th::btn(ui, &t("ident.forget"), Btn::Normal).on_hover_text(t("tt.forget")).clicked() {
+                                forget = true;
+                            }
+                            ui.add_space(8.0);
+                        }
                         if th::btn(ui, &t(if err { "btn.close" } else { "btn.cancel" }), Btn::Normal).clicked() {
                             close = true;
                         }
                     });
                 });
         });
-        if close {
+        if forget {
+            self.core.forget_identity(key);
+        } else if close {
             self.core.close_tab(key);
         }
     }
@@ -2600,6 +2627,7 @@ impl App {
         let Some(tab) = self.core.tabs.iter().find(|t| t.key == key) else { return };
         let (label, sas, stats, os, control, quality, live) =
             (tab.label.clone(), tab.sas.clone(), tab.stats.clone(), crate::core::os_name(&tab.os).to_string(), tab.remote.control, tab.quality, tab.state == TabState::Live);
+        let (ident, idcode) = (tab.ident, tab.host_idk.as_deref().map(crate::ident::code).unwrap_or_default());
         let (mic_on, remote_mic, unread, chat_open) = (tab.mic.is_some(), tab.remote_mic, tab.chat.unread, tab.chat.open);
         let cam_on = tab.cams.mine.is_some();
         let (screens, cur_screen, view) = (tab.screens.clone(), tab.screen, tab.view);
@@ -2623,7 +2651,13 @@ impl App {
                 ui.label(text(&label, 13.5, W::Semibold, th::TEXT));
             }
             if !sas.is_empty() {
-                pill(ui, th::mono(12.5, W::Semibold), 1.0, &sas, th::OK, th::OK_SOFT).on_hover_text(t("tt.sas"));
+                // green: the identity key checked out (ident.rs); amber: an older ManyDesk
+                // that does not sign, so only the code above tells it is the right one
+                let (fg, bg, tip) = match ident {
+                    Some(crate::ident::Check::Unverified) => (th::WARN, th::mix(th::WARN, th::SURFACE, 0.12), t("tt.unverified")),
+                    _ => (th::OK, th::OK_SOFT, format!("{}\n{}", t("tt.sas"), tf("tt.verified", &[("code", &idcode)]))),
+                };
+                pill(ui, th::mono(12.5, W::Semibold), 1.0, &sas, fg, bg).on_hover_text(tip);
             }
             ui.spacing_mut().item_spacing.x = 4.0;
             // .tb-sep
