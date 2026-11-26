@@ -7,6 +7,7 @@ mod core;
 mod diag;
 mod fm;
 mod i18n;
+mod ident;
 mod input;
 mod lan;
 mod keymap;

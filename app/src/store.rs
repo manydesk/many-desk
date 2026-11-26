@@ -97,6 +97,9 @@ pub struct Trusted {
     pub ts: i64,
     /// hex: 32 random bytes the viewer keeps; it proves them per session (auth::trust_proof)
     pub token: String,
+    /// the device's identity key then (ident.rs); empty for trusts from before 0.26
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub idk: String,
 }
 
 /// At most this many trusted devices (the oldest goes).
@@ -132,6 +135,15 @@ pub struct Store {
     /// access control list: when on, only these IDs may connect
     pub acl_enabled: bool,
     pub acl: Vec<String>,
+    /// identity keys of the IDs on the list, remembered when each first got in: the ID
+    /// is what they say they are, the key proves it (ident.rs)
+    pub acl_keys: std::collections::BTreeMap<String, String>,
+    /// identity keys of computers we connected to, by ID, remembered the first time
+    /// (ident.rs): one answering for that ID with another key is not that computer.
+    /// Apart from `recent`, which keeps only the last few.
+    pub known_hosts: std::collections::BTreeMap<String, String>,
+    /// this install's identity secret key (hex, ident.rs); never leaves this file
+    pub identity: String,
     pub log: Vec<LogEntry>,
     pub stun: Vec<String>,
     pub recent: Vec<Recent>,
@@ -192,6 +204,9 @@ impl Default for Store {
             unattended: Unattended { perms: Permissions::FULL, ..Default::default() },
             acl_enabled: false,
             acl: Vec::new(),
+            acl_keys: Default::default(),
+            known_hosts: Default::default(),
+            identity: String::new(),
             log: Vec::new(),
             stun: DEFAULT_STUN.iter().map(|s| s.to_string()).collect(),
             recent: Vec::new(),
@@ -312,6 +327,11 @@ impl Store {
             s.my_id = crate::rv::random_id();
             s.save();
         }
+        if s.identity.is_empty() {
+            s.identity = crate::ident::generate();
+            s.save();
+        }
+        crate::ident::init(&s.identity);
         if s.stun.is_empty() {
             s.stun = Store::default().stun;
         }
@@ -344,6 +364,25 @@ impl Store {
             if written.is_ok() {
                 let _ = std::fs::rename(tmp, p);
             }
+        }
+    }
+
+    /// At most this many remembered identity keys (the list is cleared of the oldest
+    /// IDs only if it ever gets this long, which takes years of new computers).
+    pub const MAX_KNOWN: usize = 4096;
+
+    /// Remember a computer's identity key (first connection, or after Forget).
+    pub fn pin_host(&mut self, id: &str, idk: &str) {
+        if self.known_hosts.get(id).map(String::as_str) != Some(idk) {
+            if self.known_hosts.len() >= Self::MAX_KNOWN && !self.known_hosts.contains_key(id) {
+                let keep: std::collections::HashSet<&str> = self.recent.iter().map(|r| r.id.as_str()).collect();
+                let drop: Vec<String> = self.known_hosts.keys().filter(|k| !keep.contains(k.as_str())).take(256).cloned().collect();
+                for k in drop {
+                    self.known_hosts.remove(&k);
+                }
+            }
+            self.known_hosts.insert(id.to_string(), idk.to_string());
+            self.save();
         }
     }
 

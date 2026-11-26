@@ -196,6 +196,9 @@ pub struct Tab {
     pub state: TabState,
     pub sas: String,
     hs: Option<ViewerHs>,
+    /// what the host's identity key says (ident.rs), once its offer came; and the key
+    pub ident: Option<crate::ident::Check>,
+    pub host_idk: Option<String>,
     /// the request, until a rendezvous channel is up to carry it
     outbox: Option<Value>,
     pub sid: Option<u32>,
@@ -338,6 +341,10 @@ pub struct RemoteScreen {
 
 // ------------------------------------------------------------------ host side ---
 
+/// What the viewer's and the host's identity keys sign (ident.rs).
+const REQ_CTX: &str = "manydesk-req-v1";
+const OFFER_CTX: &str = "manydesk-offer-v1";
+
 #[derive(Clone)]
 pub struct Request {
     reply: String,
@@ -355,6 +362,9 @@ pub struct Request {
     /// either the password or the Accept button)
     host_key: Option<u32>,
     pub at: Instant,
+    /// the viewer's identity key, when it signed the request (ident.rs); None from
+    /// ManyDesk before 0.26
+    pub idk: Option<String>,
 }
 
 impl Host {
@@ -863,8 +873,13 @@ impl Core {
         let (session_key, raw) = rv::new_session_key();
         let topic = rv::random_topic();
         self.rv.subscribe(&topic, false);
+        // signed with our identity key (ident.rs): the host knows it is us, not someone
+        // using our ID ("sts": send() sets "ts" again as it goes)
+        let ts = rv::now_ms();
+        let sig = crate::ident::sign(REQ_CTX, &[&id, &topic, &raw, &self.store.my_id, mode.as_str(), &ts.to_string()]);
         let req = json!({
             "t": "req", "reply": topic, "k": raw, "name": self.name, "os": platform(), "from": self.store.my_id, "caps": ["mdp1", "cam1"], "mode": mode.as_str(),
+            "idk": crate::ident::public(), "sts": ts, "sig": sig,
         });
         self.tabs.push(Tab {
             outbox: Some(req),
@@ -876,6 +891,8 @@ impl Core {
             os: String::new(),
             state: TabState::Requesting,
             sas: String::new(),
+            ident: None,
+            host_idk: None,
             hs: Some(ViewerHs { topic, key: session_key, host_peer: None, deadline: Instant::now() + Duration::from_secs(75) }),
             sid: None,
             feed: None,
@@ -917,6 +934,18 @@ impl Core {
         self.active = Some(key);
     }
 
+    /// The computer behind this ID got a new identity key and the person says it is
+    /// still theirs (set up again): forget the old key and connect again.
+    pub fn forget_identity(&mut self, key: u32) {
+        let Some(tab) = self.tabs.iter().find(|t| t.key == key) else { return };
+        let (id, mode) = (tab.peer_id.clone(), tab.mode);
+        if self.store.known_hosts.remove(&id).is_some() {
+            self.store.save();
+        }
+        self.close_tab(key);
+        self.connect_mode(&id, mode);
+    }
+
     fn end_handshake(&mut self, i: usize) {
         if let Some(hs) = self.tabs[i].hs.take() {
             self.rv.unsubscribe(&hs.topic);
@@ -930,6 +959,7 @@ impl Core {
                 let reason = match msg["reason"].as_str() {
                     Some("acl") => format!(" ({})", t("err.acl")),
                     Some("signin") => format!(" ({})", t("err.signin")),
+                    Some("clock") => format!(" ({})", t("err.clock")),
                     Some(r) => format!(" ({})", r.chars().take(120).collect::<String>()),
                     None => String::new(),
                 };
@@ -945,8 +975,36 @@ impl Core {
                 if !is_hex64(&reply) {
                     return;
                 }
+                // Is it that computer? Its identity key signs this certificate for our
+                // request (ident.rs); a key other than the one we know is someone else.
+                let offer = rv::decode_code(code).filter(|o| o.get("mdp").is_some());
+                let fp = offer.as_ref().and_then(|o| o["mdp"]["fp"].as_str()).unwrap_or("").to_string();
+                let my_topic = self.tabs[i].hs.as_ref().map(|h| h.topic.clone()).unwrap_or_default();
+                let peer_id = self.tabs[i].peer_id.clone();
+                let got = match msg["idk"].as_str() {
+                    None => Ok(None),
+                    Some(k) if crate::ident::is_key(k) && crate::ident::verify(k, OFFER_CTX, &[&peer_id, &my_topic, &reply, &fp], msg["sig"].as_str().unwrap_or("")) => Ok(Some(k.to_ascii_lowercase())),
+                    Some(_) => Err(()),
+                };
+                let pinned = self.store.known_hosts.get(&peer_id).cloned().unwrap_or_default();
+                let check = crate::ident::check(&pinned, got.as_ref().map(|k| k.as_deref()).map_err(|_| ()));
+                if std::env::var_os("MANYDESK_DEBUG").is_some() {
+                    eprintln!("[ident] {peer_id}: {check:?} (key {:?}, pinned {:?})", got.as_ref().ok().and_then(|k| k.as_deref()).map(crate::ident::code), (!pinned.is_empty()).then(|| crate::ident::code(&pinned)));
+                }
+                if check == crate::ident::Check::Mismatch {
+                    // Not the one we know: someone answering for that ID, or the computer
+                    // was set up again. Nothing more goes to it; the person decides.
+                    self.end_handshake(i);
+                    let tab = &mut self.tabs[i];
+                    tab.ident = Some(check);
+                    tab.host_idk = got.ok().flatten();
+                    tab.state = TabState::Failed(t("err.identity"));
+                    return;
+                }
                 let renamed = self.store.recent.iter().any(|r| r.id == self.tabs[i].peer_id && !r.alias.is_empty());
                 let tab = &mut self.tabs[i];
+                tab.ident = Some(check);
+                tab.host_idk = got.ok().flatten();
                 if let Some(hs) = tab.hs.as_mut() {
                     hs.host_peer = Some(pubkey);
                 }
@@ -958,7 +1016,7 @@ impl Core {
                     tab.remote_name = name;
                 }
                 tab.os = msg["os"].as_str().unwrap_or("").to_string();
-                let Some(offer) = rv::decode_code(code).filter(|o| o.get("mdp").is_some()) else {
+                let Some(offer) = offer else {
                     // An older version on the other side (WebRTC only).
                     tab.state = TabState::Failed(t("err.oldPeer"));
                     self.end_handshake(i);
@@ -1412,14 +1470,41 @@ impl Core {
                 let native = msg["caps"].as_array().is_some_and(|c| c.iter().any(|x| x == "mdp1"));
                 let cam = msg["caps"].as_array().is_some_and(|c| c.iter().any(|x| x == "cam1"));
                 let from = msg["from"].as_str().filter(|f| f.len() == 9 && f.chars().all(|c| c.is_ascii_digit())).unwrap_or("").to_string();
+                // The identity key that signed it (ident.rs). A signature that does not
+                // check out is someone else's request in that viewer's name: dropped.
+                let idk = match msg["idk"].as_str() {
+                    None => None,
+                    Some(k) => {
+                        let ts = msg["sts"].as_i64().unwrap_or(0);
+                        let parts = [self.store.my_id.as_str(), reply.as_str(), msg["k"].as_str().unwrap_or(""), msg["from"].as_str().unwrap_or(""), msg["mode"].as_str().unwrap_or(""), &ts.to_string()];
+                        if !crate::ident::is_key(k) || !crate::ident::verify(k, REQ_CTX, &parts, msg["sig"].as_str().unwrap_or("")) {
+                            if std::env::var_os("MANYDESK_DEBUG").is_some() {
+                                eprintln!("[ident] bad request signature from {from}: {parts:?}");
+                            }
+                            return;
+                        }
+                        if !crate::ident::fresh(ts) {
+                            self.send(&reply, &key, json!({ "t": "reject", "reason": "clock" }));
+                            return;
+                        }
+                        Some(k.to_ascii_lowercase())
+                    }
+                };
+                if std::env::var_os("MANYDESK_DEBUG").is_some() {
+                    eprintln!("[ident] request from {from}: {:?}", idk.as_deref().map(crate::ident::code));
+                }
                 // Switch sides: the computer we offered ours to connects back; no prompt.
-                if native && self.is_switch_request(&msg) {
-                    let req = Request { reply, key, peer: pubkey, name: msg["name"].as_str().map(|n| n.chars().take(60).collect()).unwrap_or_else(|| t("host.unknown")), os: os_name(msg["os"].as_str().unwrap_or("")).to_string(), from, native, cam, mode: SessMode::Desktop, host_key: None, at: Instant::now() };
+                // It is held to the identity key we know it by.
+                let known_ok = self.store.known_hosts.get(&from).is_none_or(|k| idk.as_deref() == Some(k.as_str()));
+                if native && known_ok && self.is_switch_request(&msg) {
+                    let req = Request { reply, key, peer: pubkey, name: msg["name"].as_str().map(|n| n.chars().take(60).collect()).unwrap_or_else(|| t("host.unknown")), os: os_name(msg["os"].as_str().unwrap_or("")).to_string(), from, native, cam, mode: SessMode::Desktop, host_key: None, at: Instant::now(), idk };
                     self.start_host(req, Permissions { restart: false, privacy: false, tunnel: false, ..Permissions::default() }, false);
                     return;
                 }
                 // Access control list: only listed IDs get as far as the prompt.
-                if self.store.acl_enabled && !self.store.acl.iter().any(|a| rv::normalize_id(a) == from) {
+                // An ID that got in before is held to the key it had then (ident.rs).
+                let key_ok = self.store.acl_keys.get(&from).is_none_or(|k| idk.as_deref() == Some(k.as_str()));
+                if self.store.acl_enabled && (!self.store.acl.iter().any(|a| rv::normalize_id(a) == from) || !key_ok) {
                     self.send(&reply, &key, json!({ "t": "reject", "reason": "acl" }));
                     return;
                 }
@@ -1435,6 +1520,7 @@ impl Core {
                     mode: SessMode::parse(msg["mode"].as_str().unwrap_or("")),
                     at: Instant::now(),
                     host_key: None,
+                    idk,
                 };
                 // Sign-in screen: nobody there may let anyone in, only the owner's unattended
                 // password can (the session waits for it, with no prompt).
@@ -1524,6 +1610,7 @@ impl Core {
         let stun = self.store.stun.clone();
         let turn_cfg = self.store.turn.clone();
         let (reg, rv, name) = (self.sessions.clone(), self.rv.clone(), self.name.clone());
+        let my_id = self.store.my_id.clone();
         let r = req.clone();
         let player = Arc::new(Player::start());
         let pl = player.clone();
@@ -1572,7 +1659,10 @@ impl Core {
             // Register the answer topic before sending: the viewer can answer before the
             // relays have even acknowledged the offer.
             bus::emit("host:offered", json!({ "host": key, "sid": sid, "topic": topic, "w": w, "h": h }));
-            let obj = json!({ "t": "offer", "code": code, "reply": topic, "name": name, "os": platform(), "ts": rv::now_ms() });
+            // signed: this ID's identity key vouches for this certificate (ident.rs), so a
+            // viewer that knows the key cannot be answered by anyone else
+            let sig = crate::ident::sign(OFFER_CTX, &[&my_id, &r.reply, &topic, prep["fp"].as_str().unwrap_or("")]);
+            let obj = json!({ "t": "offer", "code": code, "reply": topic, "name": name, "os": platform(), "ts": rv::now_ms(), "idk": crate::ident::public(), "sig": sig });
             rv.publish(&r.reply, &rv::seal(&r.key, &obj)).await;
         });
         self.hosts.push(Host {
@@ -1732,6 +1822,12 @@ impl Core {
     /// The viewer is in: permissions, displays, quality, input.
     fn host_live(&mut self, i: usize) {
         self.hosts[i].live_since = Some(Instant::now());
+        // An ID on the access list is held to the key it first got in with (ident.rs).
+        let (from, idk) = (self.hosts[i].req.from.clone(), self.hosts[i].req.idk.clone());
+        if let Some(k) = idk.filter(|_| self.store.acl.iter().any(|a| rv::normalize_id(a) == from) && !self.store.acl_keys.contains_key(&from)) {
+            self.store.acl_keys.insert(from, k);
+            self.store.save();
+        }
         self.switch_live();
         // Accept may have come before the session existed (then authorize() could not
         // reach it): release the picture now. Harmless when it is already flowing.
@@ -1796,8 +1892,13 @@ impl Core {
                     tab.state = TabState::Live;
                     tab.live_since = Some(Instant::now());
                     let (id, name, os) = (tab.peer_id.clone(), tab.remote_name.clone(), tab.os.clone());
+                    let idk = tab.host_idk.clone();
                     self.end_handshake(i);
                     self.store.remember(&id, &name, &os);
+                    // first connection: from now on this ID is held to this key (ident.rs)
+                    if let Some(k) = idk {
+                        self.store.pin_host(&id, &k);
+                    }
                     self.presence.insert(id, (Instant::now(), false));
                     // We draw the host's pointer ourselves when it can send it apart (sharper,
                     // and a pointer move costs no video frame). Older hosts ignore this.
@@ -2170,7 +2271,7 @@ impl Core {
                     let nonce = self.hosts[i].auth.as_ref().map(|a| a.nonce.clone()).unwrap_or_default();
                     let (hfp, vfp, from) = (s.fingerprint().to_string(), s.peer_fingerprint(), self.hosts[i].req.from.clone());
                     // a trusted device proves its token instead of the TOTP code
-                    let trusted = !un.totp.is_empty() && m["tt"].as_str().is_some_and(|tt| un.trusted.iter().any(|d| d.id == from && crate::auth::trust_ok(&d.token, &nonce, &hfp, &vfp, tt)));
+                    let trusted = !un.totp.is_empty() && m["tt"].as_str().is_some_and(|tt| un.trusted.iter().any(|d| d.id == from && (d.idk.is_empty() || Some(&d.idk) == self.hosts[i].req.idk.as_ref()) && crate::auth::trust_ok(&d.token, &nonce, &hfp, &vfp, tt)));
                     let totp = if trusted { "" } else { un.totp.as_str() };
                     // unattended access turned off since the session started: no password admits it
                     let ok = un.enabled && !un.key.is_empty() && crate::auth::verify(&un.key, totp, &nonce, &hfp, &vfp, m["proof"].as_str().unwrap_or(""));
@@ -2179,9 +2280,10 @@ impl Core {
                         if !trusted && !un.totp.is_empty() && m["trust"].as_bool() == Some(true) && !from.is_empty() {
                             let token = crate::auth::new_trust_token();
                             let name = self.hosts[i].req.name.clone();
+                            let idk = self.hosts[i].req.idk.clone().unwrap_or_default();
                             let list = &mut self.store.unattended.trusted;
                             list.retain(|d| d.id != from);
-                            list.push(crate::store::Trusted { id: from, name, ts: rv::now_ms(), token: token.clone() });
+                            list.push(crate::store::Trusted { id: from, name, ts: rv::now_ms(), token: token.clone(), idk });
                             if list.len() > crate::store::MAX_TRUSTED {
                                 list.remove(0);
                             }
@@ -2759,6 +2861,12 @@ impl Core {
     fn on_lan_peer(&mut self, v: &Value) {
         let id = v["id"].as_str().unwrap_or("").to_string();
         let ip = v["ip"].as_str().unwrap_or("").to_string();
+        // A computer we know by its identity key must say so with it (ident.rs): another
+        // one using its ID does not get to change where we reach it.
+        let pinned = self.store.known_hosts.get(&id).cloned().unwrap_or_default();
+        if crate::ident::check(&pinned, Ok(v["idk"].as_str())) == crate::ident::Check::Mismatch {
+            return;
+        }
         if let Some(r) = self.store.recent.iter_mut().find(|r| r.id == id) {
             let macs: Vec<String> = v["macs"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect()).unwrap_or_default();
             if (!macs.is_empty() && r.macs != macs) || r.ip != ip {

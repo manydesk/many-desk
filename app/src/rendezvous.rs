@@ -109,6 +109,18 @@ fn rand_hex(n: usize) -> String {
 }
 
 // Same serialisation as the JS side: JSON.stringify([0, pubkey, created_at, kind, tags, content]).
+/// The event's author signed its id (BIP-340).
+fn sig_ok(ev: &Value, id: &str) -> bool {
+    (|| -> Option<bool> {
+        let pk = VerifyingKey::from_bytes(&hex::decode(ev["pubkey"].as_str()?).ok()?).ok()?;
+        // k256 panics on a signature that is not 64 bytes: anyone could send one
+        let sig = hex::decode(ev["sig"].as_str()?).ok().filter(|b| b.len() == 64)?;
+        let sig = Signature::try_from(sig.as_slice()).ok()?;
+        Some(pk.verify_raw(&hex::decode(id).ok()?, &sig).is_ok())
+    })()
+    .unwrap_or(false)
+}
+
 fn event_id(ev: &Value) -> String {
     let arr = json!([0, ev["pubkey"], ev["created_at"], ev["kind"], ev["tags"], ev["content"]]);
     hex::encode(Sha256::digest(serde_json::to_string(&arr).unwrap_or_default().as_bytes()))
@@ -285,13 +297,7 @@ impl Rendezvous {
         if event_id(ev) != id {
             return;
         }
-        let ok = (|| -> Option<bool> {
-            let pk = VerifyingKey::from_bytes(&hex::decode(ev["pubkey"].as_str()?).ok()?).ok()?;
-            let sig = Signature::try_from(hex::decode(ev["sig"].as_str()?).ok()?.as_slice()).ok()?;
-            Some(pk.verify_raw(&hex::decode(id).ok()?, &sig).is_ok())
-        })()
-        .unwrap_or(false);
-        if !ok {
+        if !sig_ok(ev, &id) {
             return;
         }
         let created = ev["created_at"].as_i64().unwrap_or(0);
@@ -623,5 +629,22 @@ mod mqtt_tests {
         assert_eq!(mqtt_packet_len(&[0x30, 0xff, 0xff, 0xff, 0x7f]), Some(268_435_455));
         assert_eq!(mqtt_packet_len(&[0x30, 0xff]), None);
         assert!(mqtt_packet_len(&[0x30, 0xff, 0xff, 0xff, 0x7f]).unwrap() > MQTT_MAX_PACKET);
+    }
+}
+
+#[cfg(test)]
+mod sig_tests {
+    use super::*;
+
+    #[test]
+    fn odd_signatures_are_refused_not_fatal() {
+        let sk = SigningKey::random(&mut rand::thread_rng());
+        let pubkey = hex::encode(sk.verifying_key().to_bytes());
+        let id = "11".repeat(32);
+        for sig in ["", "00", &"ab".repeat(31), &"ab".repeat(33), &"zz".repeat(64)] {
+            assert!(!sig_ok(&json!({ "pubkey": pubkey, "sig": sig }), &id));
+        }
+        let good = hex::encode(sk.sign_raw(&hex::decode(&id).unwrap(), &[0u8; 32]).unwrap().to_bytes());
+        assert!(sig_ok(&json!({ "pubkey": pubkey, "sig": good }), &id));
     }
 }
