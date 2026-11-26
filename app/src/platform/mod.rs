@@ -111,3 +111,68 @@ pub fn keep_responsive() {
 /// the logic keeps running there (see eframe's native run loop).
 #[cfg(not(target_os = "macos"))]
 pub fn keep_responsive() {}
+
+/// While someone is connected here, the display stays on (as AnyDesk does). Left to its
+/// idle timer it went dark in the middle of a session: on macOS the capture then stops,
+/// the viewer sees a frozen picture, and the fresh stream when it woke was read as a slow
+/// link (resolution and frame rate fell for minutes). Called every frame; acts on changes.
+pub fn hold_display(on: bool) {
+    use std::cell::Cell;
+    thread_local! { static HELD: Cell<bool> = const { Cell::new(false) }; }
+    if HELD.with(|h| h.replace(on)) == on {
+        return;
+    }
+    display_hold(on);
+}
+
+#[cfg(target_os = "macos")]
+fn display_hold(on: bool) {
+    use objc2::rc::Retained;
+    use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    use std::cell::RefCell;
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOPMAssertionDeclareUserActivity(name: *const objc2_core_foundation::CFString, user_type: u32, id: *mut u32) -> i32;
+        fn IOPMAssertionRelease(id: u32) -> i32;
+    }
+    thread_local! {
+        static TOKEN: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>> = const { RefCell::new(None) };
+        static ACTIVITY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let info = NSProcessInfo::processInfo();
+    TOKEN.with(|t| {
+        if let Some(token) = t.borrow_mut().take() {
+            unsafe { info.endActivity(&token) };
+        }
+        if on {
+            let reason = NSString::from_str("Someone is connected to this computer with ManyDesk");
+            let opts = NSActivityOptions::UserInitiated | NSActivityOptions::IdleDisplaySleepDisabled;
+            *t.borrow_mut() = Some(info.beginActivityWithOptions_reason(opts, &reason));
+        }
+    });
+    // A display that went dark before anyone connected is woken (as a key press would):
+    // keeping it on does not turn it back on, and with it off there is nothing to capture.
+    let old = ACTIVITY.with(|a| a.replace(0));
+    if old != 0 {
+        unsafe { IOPMAssertionRelease(old) };
+    }
+    if on {
+        let name = objc2_core_foundation::CFString::from_str("ManyDesk: a remote session started");
+        let mut id = 0u32;
+        // kIOPMUserActiveLocal
+        if unsafe { IOPMAssertionDeclareUserActivity(&*name, 0, &mut id) } == 0 {
+            ACTIVITY.with(|a| a.set(id));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn display_hold(on: bool) {
+    use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+    // per thread: this one (the UI's) lives as long as the app
+    unsafe { SetThreadExecutionState(if on { ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS }) };
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn display_hold(_on: bool) {}

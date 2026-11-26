@@ -646,6 +646,8 @@ impl Core {
             }
         }
         let now = Instant::now();
+        // someone is in: the display stays on (platform::hold_display)
+        crate::platform::hold_display(self.hosts.iter().any(|h| h.live_since.is_some()));
         // Requests wait for the first rendezvous channel (e.g. right after start), or go
         // over the LAN alone to a computer that is there.
         for i in 0..self.tabs.len() {
