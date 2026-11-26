@@ -105,6 +105,11 @@ pub struct Quality {
     choked_at: f64,
     /// ticks since the cap was last cut
     since_cut: u32,
+    /// ticks in a row with no frame encoded (the screen went away: display asleep, locked,
+    /// capture restarting), and ticks left in which a fresh stream's first keyframe backing
+    /// up the path does not count as a slow link
+    no_frames: u32,
+    restart_grace: u32,
 }
 
 const CAP_WAIT: u32 = 3;
@@ -141,7 +146,7 @@ const CALM_MAX: Duration = Duration::from_secs(60);
 
 impl Quality {
     pub fn new() -> Self {
-        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0, cap_bad: 0, cap_idle: 0, choked_at: 0.0, since_cut: u32::MAX }
+        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0, cap_bad: 0, cap_idle: 0, choked_at: 0.0, since_cut: u32::MAX, no_frames: 0, restart_grace: 0 }
     }
 
     pub fn set_mode(&mut self, m: Mode) {
@@ -235,7 +240,25 @@ impl Quality {
         if prev.is_none() {
             return false;
         }
-        let reason = video["qualityLimitationReason"].as_str().unwrap_or("none");
+        let mut reason = video["qualityLimitationReason"].as_str().unwrap_or("none");
+        // The picture comes back after a gap (a Mac's display slept or locked, and capture
+        // restarted): its first keyframe, at full size, backs the path up for a moment. That
+        // is not a slow link; read as one it cut a 15 Mbit/s relay to 0.9 Mbit/s and 10 fps.
+        let sent = frames.saturating_sub(prev.map(|p| p.0).unwrap_or(frames));
+        if sent == 0 {
+            self.no_frames += 1;
+        } else {
+            if self.no_frames >= 2 {
+                self.restart_grace = 3;
+            }
+            self.no_frames = 0;
+        }
+        if self.restart_grace > 0 {
+            self.restart_grace -= 1;
+            if reason == "bandwidth" {
+                reason = "settling";
+            }
+        }
         let cap_changed = self.tick_cap(reason, goodput);
         // the path's capacity: recompute the bitrate when it moved by a third
         let mut link_changed = false;
@@ -292,7 +315,7 @@ impl Quality {
                 self.bad += 1;
                 self.good = 0;
             }
-            "cpu" => self.good = 0,
+            "cpu" | "settling" => self.good = 0,
             _ => {
                 self.good += 1;
                 self.bad = 0;
@@ -315,20 +338,37 @@ impl Quality {
                 self.last_up = Some(now);
             }
         }
-        if level != self.level {
+        let level_changed = level != self.level;
+        if level_changed {
             self.level = level;
             self.bad = 0;
             self.good = 0;
-            return true;
         }
-        cpu_changed || link_changed || cap_changed
+        let changed = level_changed || cpu_changed || link_changed || cap_changed;
+        // why it moved (MANYDESK_PERF): the encoder's limit, the CPU steps, the link and its cap
+        if changed && std::env::var_os("MANYDESK_PERF").is_some() {
+            eprintln!(
+                "[quality] why: reason {reason}, level {}, cpu {} fps / scale {:.2}, link {:.1} Mbit/s, cap {}, fast {:.2}",
+                self.level,
+                self.cpu_fps,
+                self.cpu_scale,
+                self.link.unwrap_or(0.0) / 1e6,
+                self.cap.map(|c| format!("{:.1} Mbit/s", c / 1e6)).unwrap_or_else(|| "none".into()),
+                video["fastShare"].as_f64().unwrap_or(1.0),
+            );
+        }
+        changed
     }
 
     /// The link's cap: down at once to what it carried when it was the limit, back up by
     /// half every second calm tick, gone once it is above anything the presets ask for.
     fn tick_cap(&mut self, reason: &str, goodput: f64) -> bool {
         let before = self.cap;
-        if goodput > 0.0 {
+        // Only a tick that tried to send says how much the link carries: one that sent
+        // little (a still screen, or none at all while the display slept) would read the
+        // link far too low, and a choke right after it cut the cap down to that.
+        let target = self.applied.map(|a| a.2 as f64).unwrap_or(0.0);
+        if goodput > 0.0 && (reason == "bandwidth" || goodput >= target * 0.5) {
             self.carried.push_back(goodput);
             if self.carried.len() > CARRIED_TICKS {
                 self.carried.pop_front();
@@ -509,8 +549,8 @@ mod tests {
         q.tick(&stats(61, "bandwidth"), 80.0, 1e5, 2e5);
         assert!(q.params((1920, 1080)).is_none());
         // calm: a try upward after CAP_WAIT ticks, an eighth more
-        for _ in 0..CAP_WAIT {
-            q.tick(&stats(90, "none"), 80.0, 1e5, 8e5);
+        for i in 0..CAP_WAIT as u64 {
+            q.tick(&stats(70 + i * 5, "none"), 80.0, 1e5, 8e5);
         }
         let (_, _, later) = q.params((1920, 1080)).unwrap();
         assert_eq!(later, 900_000);
@@ -563,6 +603,36 @@ mod tests {
         let c = q.cap.unwrap();
         assert!(c > low * 1.3, "{low} → {c}");
         assert!(c <= 5.8e5 * CAP_IDLE_MAX, "{c}");
+    }
+
+    #[test]
+    fn a_gap_in_the_picture_does_not_cut_the_link() {
+        // 15 Mbit/s carried while the screen moved, then half a minute with no frame at all
+        // (the Mac's display slept), then the fresh stream's keyframe backs the path up
+        let mut q = Quality::new();
+        q.set_view(1920.0, 1080.0);
+        q.params((1920, 1080));
+        let mut frames = 0;
+        for _ in 0..5 {
+            frames += 60;
+            q.tick(&stats(frames, "none"), 30.0, 6e4, 1.5e7);
+        }
+        q.params((1920, 1080));
+        for _ in 0..15 {
+            q.tick(&stats(frames, "none"), 30.0, 6e4, 1e3);
+        }
+        for _ in 0..3 {
+            frames += 10;
+            q.tick(&stats(frames, "bandwidth"), 30.0, 6e4, 9e5);
+        }
+        assert!(q.cap.is_none(), "the restart's keyframe set a cap: {:?}", q.cap);
+        // a slow link after that is still a slow link, cut to what it carried before
+        for _ in 0..2 {
+            frames += 10;
+            q.tick(&stats(frames, "bandwidth"), 30.0, 6e4, 9e5);
+        }
+        let cap = q.cap.expect("a cap once the link stays limited");
+        assert!(cap >= 1e7, "cut to the idle gap's throughput: {cap}");
     }
 
     #[test]
