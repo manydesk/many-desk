@@ -140,7 +140,9 @@ impl Video {
         };
         json!({
             "framesEncoded": s.frames, "frameWidth": s.width, "frameHeight": s.height,
-            "framesPerSecond": s.window.len() as f64 / 2.0, "encoderImplementation": s.implementation,
+            "framesPerSecond": s.window.len() as f64 / 2.0,
+            // what the screen offered (encoded or skipped on a backed-up path): how much it moves
+            "framesOffered": (s.window.len() + s.skips.len()) as f64 / 2.0, "encoderImplementation": s.implementation,
             "powerEfficientEncoder": s.hardware, "qualityLimitationReason": reason, "fastShare": fast_share,
         })
     }

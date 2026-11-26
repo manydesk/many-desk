@@ -110,6 +110,13 @@ pub struct Quality {
     /// up the path does not count as a slow link
     no_frames: u32,
     restart_grace: u32,
+    /// The picture keeps moving (a video, a game): under a cap it keeps its frame rate and
+    /// gives up pixels instead — a video at 5 fps is a slide show, while text stays
+    /// readable at a lower size only while it moves. Ticks of motion and of stillness in a
+    /// row decide it, so a scroll or two does not resize the picture.
+    moving: bool,
+    motion_ticks: u32,
+    still_ticks: u32,
 }
 
 const CAP_WAIT: u32 = 3;
@@ -136,6 +143,10 @@ const KEY_BYTES_PER_PIXEL: f64 = 0.1;
 const KEY_SECS: f64 = 3.0;
 /// Frame rates tried, in order, to fit a capped bitrate before the picture shrinks further.
 const CAP_FPS: [f64; 6] = [30.0, 20.0, 15.0, 10.0, 7.0, 5.0];
+/// Moving content under a cap keeps at least this frame rate (pixels go instead), and
+/// how many ticks (of ~2 s) of motion or stillness switch that.
+const MOTION_FPS: f64 = 20.0;
+const MOTION_TICKS: u32 = 3;
 
 const CALM: Duration = Duration::from_secs(10);
 const CPU_SCALE_MAX: f64 = 2.5;
@@ -146,7 +157,7 @@ const CALM_MAX: Duration = Duration::from_secs(60);
 
 impl Quality {
     pub fn new() -> Self {
-        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0, cap_bad: 0, cap_idle: 0, choked_at: 0.0, since_cut: u32::MAX, no_frames: 0, restart_grace: 0 }
+        Quality { mode: Mode::Auto, level: START, view: None, bad: 0, good: 0, calm_until: None, calm: CALM, last_up: None, cpu_fps: CPU_FPS[0], cpu_scale: 1.0, link: None, link_used: None, cpu_bad: 0, cpu_good: 0, prev: None, applied: None, cap: None, cap_good: 0, carried: Default::default(), cap_wait: CAP_WAIT, since_raise: u32::MAX, cap_steps: 0.0, cap_grow_at: 0.0, cap_bad: 0, cap_idle: 0, choked_at: 0.0, since_cut: u32::MAX, no_frames: 0, restart_grace: 0, moving: false, motion_ticks: 0, still_ticks: 0 }
     }
 
     pub fn set_mode(&mut self, m: Mode) {
@@ -184,10 +195,12 @@ impl Quality {
         let (mut scale, mut fps, mut bitrate) = (scale, fps, bitrate);
         if let Some(cap) = self.cap.filter(|c| (bitrate as f64) > *c) {
             let need = |f: f64, sc: f64| (sw / sc) * (sh / sc) * f * q.bpp * 0.5;
-            match CAP_FPS.iter().copied().filter(|f| *f <= fps).find(|f| need(*f, scale) <= cap) {
+            // (moving content stops at MOTION_FPS and shrinks below that instead)
+            let floor = if self.moving { MOTION_FPS.min(fps) } else { 0.0 };
+            match CAP_FPS.iter().copied().filter(|f| *f <= fps && *f >= floor).find(|f| need(*f, scale) <= cap) {
                 Some(f) => fps = f,
                 None => {
-                    fps = CAP_FPS[CAP_FPS.len() - 1].min(fps);
+                    fps = if self.moving { floor } else { CAP_FPS[CAP_FPS.len() - 1].min(fps) };
                     scale *= (need(fps, scale) / cap).sqrt().clamp(1.0, 4.0);
                 }
             }
@@ -260,6 +273,7 @@ impl Quality {
             }
         }
         let cap_changed = self.tick_cap(reason, goodput);
+        let motion_changed = self.tick_motion(video);
         // the path's capacity: recompute the bitrate when it moved by a third
         let mut link_changed = false;
         if rtt_ms > 0.0 && cwnd > 0.0 {
@@ -344,20 +358,45 @@ impl Quality {
             self.bad = 0;
             self.good = 0;
         }
-        let changed = level_changed || cpu_changed || link_changed || cap_changed;
+        let changed = level_changed || cpu_changed || link_changed || cap_changed || motion_changed;
         // why it moved (MANYDESK_PERF): the encoder's limit, the CPU steps, the link and its cap
         if changed && std::env::var_os("MANYDESK_PERF").is_some() {
             eprintln!(
-                "[quality] why: reason {reason}, level {}, cpu {} fps / scale {:.2}, link {:.1} Mbit/s, cap {}, fast {:.2}",
+                "[quality] why: reason {reason}, level {}, cpu {} fps / scale {:.2}, link {:.1} Mbit/s, cap {}, fast {:.2}, moving {}",
                 self.level,
                 self.cpu_fps,
                 self.cpu_scale,
                 self.link.unwrap_or(0.0) / 1e6,
                 self.cap.map(|c| format!("{:.1} Mbit/s", c / 1e6)).unwrap_or_else(|| "none".into()),
                 video["fastShare"].as_f64().unwrap_or(1.0),
+                self.moving,
             );
         }
         changed
+    }
+
+    /// Whether the picture keeps moving: most of the frame rate offered for three ticks in
+    /// a row (the capture itself runs at the current rate), still again after three of
+    /// little. True when that changed.
+    fn tick_motion(&mut self, video: &Value) -> bool {
+        let Some(offered) = video["framesOffered"].as_f64() else { return false };
+        let fps = self.applied.map(|a| a.1).unwrap_or(CPU_FPS[0]);
+        if offered >= (fps * 0.7).max(4.0) {
+            self.motion_ticks += 1;
+            self.still_ticks = 0;
+        } else if offered < fps * 0.3 {
+            self.still_ticks += 1;
+            self.motion_ticks = 0;
+        }
+        let was = self.moving;
+        if !self.moving && self.motion_ticks >= MOTION_TICKS {
+            self.moving = true;
+        } else if self.moving && self.still_ticks >= MOTION_TICKS {
+            self.moving = false;
+            // the size given up for the motion comes back now, not only once the cap grows
+            self.cap_steps = 0.0;
+        }
+        was != self.moving
     }
 
     /// The link's cap: down at once to what it carried when it was the limit, back up by
@@ -603,6 +642,39 @@ mod tests {
         let c = q.cap.unwrap();
         assert!(c > low * 1.3, "{low} → {c}");
         assert!(c <= 5.8e5 * CAP_IDLE_MAX, "{c}");
+    }
+
+    #[test]
+    fn moving_content_keeps_its_frame_rate_under_a_cap() {
+        let moving = |frames: u64, offered: f64, reason: &str| json!({ "framesEncoded": frames, "framesOffered": offered, "qualityLimitationReason": reason });
+        let mut q = Quality::new();
+        q.set_view(1920.0, 1080.0);
+        q.params((1920, 1080));
+        // a 1 Mbit/s link: the cap (20 fps of the full size would need about 1.7)
+        let mut frames = 0;
+        for _ in 0..3 {
+            frames += 40;
+            q.tick(&moving(frames, 30.0, "bandwidth"), 40.0, 1e4, 1e6);
+        }
+        let (scale, fps, _) = q.params((1920, 1080)).unwrap_or(q.applied.unwrap());
+        assert!(q.cap.is_some());
+        assert!(fps < 20.0 && scale == 1.0, "before the motion is known, frames go first: {fps} fps, scale {scale}");
+        // a video keeps playing: the capture offers all it may (that low rate) for three ticks
+        for _ in 0..3 {
+            frames += 2 * fps as u64;
+            q.tick(&moving(frames, fps, "none"), 40.0, 1e4, 7e5);
+        }
+        assert!(q.moving);
+        let (scale, fps, _) = q.params((1920, 1080)).unwrap_or(q.applied.unwrap());
+        assert!(fps >= MOTION_FPS && scale > 1.0, "moving: {fps} fps, scale {scale}");
+        // the video stops: after three still ticks, the full size again at fewer frames
+        for _ in 0..3 {
+            frames += 1;
+            q.tick(&moving(frames, 0.5, "none"), 40.0, 1e4, 3e5);
+        }
+        assert!(!q.moving);
+        let (scale, fps, _) = q.params((1920, 1080)).unwrap_or(q.applied.unwrap());
+        assert!(fps < MOTION_FPS && scale == 1.0, "still: {fps} fps, scale {scale}");
     }
 
     #[test]
