@@ -401,8 +401,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     });
 
     let mut child: Option<HANDLE> = None;
-    // the child is the sign-in-screen copy (SYSTEM): it ends once someone signs in
-    let mut child_signin = false;
+    // Some while the child is the sign-in-screen copy (SYSTEM): the job holds it and every
+    // process it starts (its opaque restart, lib.rs), and all of them end once someone
+    // signs in, or when the service goes
+    let mut child_job: Option<HANDLE> = None;
     let mut last_session = 0xFFFF_FFFFu32;
     // the signed-in user runs ManyDesk already (autostart, the Start menu): our copy left
     // at once; look again only now and then, less often while that goes on (5 s up to 15 s)
@@ -424,12 +426,15 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         let session = WTSGetActiveConsoleSessionId();
         // Someone signed in: the SYSTEM copy gives way to one running as that user (it
         // must not stay on behind the user's session with SYSTEM rights).
-        if child_signin && session != 0xFFFF_FFFF && user_signed_in(session) {
-            if let Some(h) = child {
-                TerminateProcess(h, 0);
-                WaitForSingleObject(h, 5000);
+        if child_job.is_some() && session != 0xFFFF_FFFF && user_signed_in(session) {
+            if let Some(job) = child_job.take() {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 0);
+                if let Some(h) = child {
+                    TerminateProcess(h, 0);
+                    WaitForSingleObject(h, 5000);
+                }
+                CloseHandle(job);
             }
-            child_signin = false;
         }
         let alive = child.map(|h| WaitForSingleObject(h, 0) != WAIT_OBJECT_0).unwrap_or(false);
         if !alive {
@@ -443,6 +448,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
                 }
                 CloseHandle(h);
             }
+            // whatever the sign-in copy left running goes with it
+            if let Some(job) = child_job.take() {
+                CloseHandle(job);
+            }
         }
         let waiting = wait_until.is_some_and(|t| std::time::Instant::now() < t) && session == last_session;
         if session != 0xFFFF_FFFF && (!alive || session != last_session) && !waiting {
@@ -450,9 +459,12 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
             if let Some(h) = child.take() {
                 CloseHandle(h);
             }
-            if let Some((h, signin)) = launch_in_session(session) {
+            if let Some(job) = child_job.take() {
+                CloseHandle(job);
+            }
+            if let Some((h, job)) = launch_in_session(session) {
                 child = Some(h);
-                child_signin = signin;
+                child_job = job;
                 last_session = session;
             }
         }
@@ -460,6 +472,9 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     }
     if let Some(h) = child.take() {
         CloseHandle(h);
+    }
+    if let Some(job) = child_job.take() {
+        CloseHandle(job);
     }
     set_state(SERVICE_STOPPED);
 }
@@ -533,11 +548,12 @@ unsafe fn remember_owner(token: HANDLE) {
 /// Starts manydesk --background in `session` as the signed-in user (or, on the sign-in
 /// screen, the restricted SYSTEM copy: the second value is true) so it can capture and
 /// control that desktop.
-unsafe fn launch_in_session(session: u32) -> Option<(HANDLE, bool)> {
+/// The process, and for the sign-in-screen copy the job that holds it and its children.
+unsafe fn launch_in_session(session: u32) -> Option<(HANDLE, Option<HANDLE>)> {
     let mut token: HANDLE = std::ptr::null_mut();
     if WTSQueryUserToken(session, &mut token) == 0 {
         // No user yet (sign-in screen): run as SYSTEM on the Winlogon desktop.
-        return launch_system(session).map(|h| (h, true));
+        return launch_system(session).map(|(h, job)| (h, Some(job)));
     }
     remember_owner(token);
     let exe = std::env::current_exe().ok()?;
@@ -568,7 +584,7 @@ unsafe fn launch_in_session(session: u32) -> Option<(HANDLE, bool)> {
     CloseHandle(token);
     if ok != 0 {
         CloseHandle(pi.hThread);
-        Some((pi.hProcess, false))
+        Some((pi.hProcess, None))
     } else {
         None
     }
@@ -578,7 +594,8 @@ unsafe fn launch_in_session(session: u32) -> Option<(HANDLE, bool)> {
 /// input; capturing the secure desktop depends on the Windows build's policy). It runs
 /// restricted (--signin, lib.rs): only the owner's unattended password admits a viewer,
 /// with input only; nobody at the screen can accept, change settings or open a shell.
-unsafe fn launch_system(session: u32) -> Option<HANDLE> {
+unsafe fn launch_system(session: u32) -> Option<(HANDLE, HANDLE)> {
+    use windows_sys::Win32::System::JobObjects::*;
     let proc = GetCurrentProcess();
     let mut tok: HANDLE = std::ptr::null_mut();
     if OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &mut tok) == 0 {
@@ -599,12 +616,31 @@ unsafe fn launch_system(session: u32) -> Option<HANDLE> {
     let mut desktop = wide(r"winsta0\winlogon");
     si.lpDesktop = desktop.as_mut_ptr();
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-    let ok = CreateProcessAsUserW(dup, std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 0, CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, std::ptr::null_mut(), std::ptr::null(), &si, &mut pi);
-    CloseHandle(dup);
-    if ok != 0 {
-        CloseHandle(pi.hThread);
-        Some(pi.hProcess)
-    } else {
-        None
+    // A job, so that ending it ends the processes this copy starts too: its opaque restart
+    // (lib.rs) is the one that runs, and it stayed on as SYSTEM behind the user's session.
+    let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+    if job.is_null() {
+        CloseHandle(dup);
+        return None;
     }
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits as *const _ as *const _, std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32);
+    let ok = CreateProcessAsUserW(dup, std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 0, CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED, std::ptr::null_mut(), std::ptr::null(), &si, &mut pi);
+    CloseHandle(dup);
+    if ok == 0 {
+        CloseHandle(job);
+        return None;
+    }
+    // in the job before it runs a single instruction, so nothing it starts escapes
+    if AssignProcessToJobObject(job, pi.hProcess) == 0 {
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(job);
+        return None;
+    }
+    ResumeThread(pi.hThread);
+    CloseHandle(pi.hThread);
+    Some((pi.hProcess, job))
 }

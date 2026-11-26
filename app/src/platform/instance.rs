@@ -26,6 +26,9 @@ fn names() -> (String, String) {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     crate::store::config_dir().to_string_lossy().to_lowercase().hash(&mut h);
+    // The sign-in-screen copy (SYSTEM, the owner's settings folder) keeps names of its own:
+    // a user's copy cannot open a mutex SYSTEM made, so it ran as a second copy beside it.
+    crate::signin().hash(&mut h);
     let id = format!("{:016x}", h.finish());
     (format!("Local\\ManyDesk-{id}"), format!("Local\\ManyDeskShow-{id}"))
 }
